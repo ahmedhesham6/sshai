@@ -1,0 +1,628 @@
+openapi: 3.0.3
+info:
+  title: devm Control Plane API
+  version: 0.1.0
+  description: Public API used by the devm CLI and web application.
+servers:
+  - url: https://api.example.com/v1
+security:
+  - workosBearer: []
+paths:
+  /me:
+    get:
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: Current product user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        default:
+          $ref: '#/components/responses/Error'
+  /billing:
+    get:
+      operationId: getBillingSummary
+      responses:
+        '200':
+          description: Subscription and shared credit balance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSummary'
+        default:
+          $ref: '#/components/responses/Error'
+  /billing/portal:
+    post:
+      operationId: createBillingPortal
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Short-lived Polar portal URL.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url: { type: string, format: uri }
+        default:
+          $ref: '#/components/responses/Error'
+  /ssh-keys:
+    get:
+      operationId: listSSHKeys
+      responses:
+        '200':
+          description: Active SSH public keys.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SSHKey' }
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      operationId: createSSHKey
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label, publicKey]
+              properties:
+                label: { type: string, minLength: 1, maxLength: 80 }
+                publicKey: { type: string, minLength: 32, maxLength: 8192 }
+      responses:
+        '201':
+          description: Stored public key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSHKey' }
+        default:
+          $ref: '#/components/responses/Error'
+  /ssh-keys/{keyId}:
+    delete:
+      operationId: revokeSSHKey
+      parameters:
+        - $ref: '#/components/parameters/KeyID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Key revoked. }
+        default:
+          $ref: '#/components/responses/Error'
+  /profiles:
+    get:
+      operationId: listProfiles
+      responses:
+        '200':
+          description: Profiles owned by the user.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProfileSummary' }
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      operationId: createProfile
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+                forkedFromVersionId: { type: string, nullable: true }
+      responses:
+        '201':
+          description: Profile created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProfileSummary' }
+        default:
+          $ref: '#/components/responses/Error'
+  /profiles/{profileId}:
+    get:
+      operationId: getProfile
+      parameters:
+        - $ref: '#/components/parameters/ProfileID'
+      responses:
+        '200':
+          description: Profile and current head.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProfileSummary' }
+        default:
+          $ref: '#/components/responses/Error'
+  /profiles/{profileId}/versions:
+    post:
+      operationId: publishProfileVersion
+      parameters:
+        - $ref: '#/components/parameters/ProfileID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedHeadVersionId, artifacts]
+              properties:
+                expectedHeadVersionId: { type: string, nullable: true }
+                artifacts:
+                  type: array
+                  items: { $ref: '#/components/schemas/ProfileArtifactInput' }
+      responses:
+        '201':
+          description: Immutable Profile Version published.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProfileVersion' }
+        default:
+          $ref: '#/components/responses/Error'
+  /profile-versions/{versionId}:
+    get:
+      operationId: getProfileVersion
+      parameters:
+        - name: versionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Immutable Profile Version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProfileVersion' }
+        default:
+          $ref: '#/components/responses/Error'
+  /uploads:
+    post:
+      operationId: createUploadIntent
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, digest, sizeBytes]
+              properties:
+                kind: { type: string, enum: [profile_artifact, git_bundle, tracked_patch, untracked_bundle, seed_manifest] }
+                digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+                sizeBytes: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '201':
+          description: Scoped upload URL.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uploadId, url, expiresAt]
+                properties:
+                  uploadId: { type: string }
+                  url: { type: string, format: uri }
+                  expiresAt: { type: string, format: date-time }
+        default:
+          $ref: '#/components/responses/Error'
+  /project-seeds:
+    post:
+      operationId: createProjectSeed
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectSeedInput' }
+      responses:
+        '201':
+          description: Immutable Project Seed registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, digest]
+                properties:
+                  id: { type: string }
+                  digest: { type: string }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments:
+    get:
+      operationId: listEnvironments
+      responses:
+        '200':
+          description: Environments owned by the user.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Environment' }
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      operationId: createEnvironment
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEnvironmentInput' }
+      responses:
+        '202':
+          description: Environment creation accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentOperation' }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments/{environmentId}:
+    get:
+      operationId: getEnvironment
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+      responses:
+        '200':
+          description: Environment detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Environment' }
+        default:
+          $ref: '#/components/responses/Error'
+    delete:
+      operationId: deleteEnvironment
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirmName]
+              properties:
+                confirmName: { type: string }
+      responses:
+        '202':
+          description: Deletion accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentOperation' }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments/{environmentId}/start:
+    post:
+      operationId: startEnvironmentRuntime
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Runtime start accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentOperation' }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments/{environmentId}/stop:
+    post:
+      operationId: stopEnvironmentRuntime
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, enum: [manual] }
+      responses:
+        '202':
+          description: Runtime stop accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentOperation' }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments/{environmentId}/replace-runtime:
+    post:
+      operationId: replaceEnvironmentRuntime
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Runtime replacement accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentOperation' }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments/{environmentId}/apply-profile:
+    post:
+      operationId: applyEnvironmentProfile
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profileVersionId]
+              properties:
+                profileVersionId: { type: string }
+                approvedReviewItems:
+                  type: array
+                  items: { type: string }
+      responses:
+        '202':
+          description: Profile application accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentOperation' }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments/{environmentId}/auto-stop-policy:
+    put:
+      operationId: updateAutoStopPolicy
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AutoStopPolicy' }
+      responses:
+        '202':
+          description: Auto-stop policy update accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentOperation' }
+        default:
+          $ref: '#/components/responses/Error'
+  /environments/{environmentId}/connection-intents:
+    post:
+      operationId: createConnectionIntent
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Short-lived regional proxy route.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConnectionIntent' }
+        default:
+          $ref: '#/components/responses/Error'
+  /operations/{operationId}:
+    get:
+      operationId: getOperation
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Operation progress projection.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        default:
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    workosBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 16, maxLength: 128 }
+    EnvironmentID:
+      name: environmentId
+      in: path
+      required: true
+      schema: { type: string }
+    ProfileID:
+      name: profileId
+      in: path
+      required: true
+      schema: { type: string }
+    KeyID:
+      name: keyId
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Error:
+      description: Product-level error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    User:
+      type: object
+      required: [id, defaultRegion]
+      properties:
+        id: { type: string }
+        defaultRegion: { type: string }
+    BillingSummary:
+      type: object
+      required: [subscriptionStatus, creditBalance]
+      properties:
+        subscriptionStatus: { type: string }
+        creditBalance: { type: integer, format: int64 }
+        currentPeriodEnd: { type: string, format: date-time, nullable: true }
+    SSHKey:
+      type: object
+      required: [id, label, algorithm, fingerprint, publicKey, createdAt]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        algorithm: { type: string, enum: [ssh-ed25519] }
+        fingerprint: { type: string }
+        publicKey: { type: string }
+        createdAt: { type: string, format: date-time }
+    ProfileSummary:
+      type: object
+      required: [id, name, slug]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        slug: { type: string }
+        headVersionId: { type: string, nullable: true }
+    ProfileArtifactInput:
+      type: object
+      required: [kind, sourceLocator, sourceDigest, contentDigest, sensitivity, trust, containsExecutable]
+      properties:
+        kind: { type: string }
+        sourceLocator: { type: string }
+        sourceDigest: { type: string }
+        contentDigest: { type: string }
+        sensitivity: { type: string, enum: [public, private, credential, unknown] }
+        trust: { type: string, enum: [user_authored, trusted_source, third_party, unknown] }
+        containsExecutable: { type: boolean }
+    ProfileVersion:
+      type: object
+      required: [id, profileId, version, digest, artifacts, createdAt]
+      properties:
+        id: { type: string }
+        profileId: { type: string }
+        parentVersionId: { type: string, nullable: true }
+        version: { type: integer, format: int64 }
+        digest: { type: string }
+        artifacts:
+          type: array
+          items: { $ref: '#/components/schemas/ProfileArtifactInput' }
+        createdAt: { type: string, format: date-time }
+    ProjectSeedInput:
+      type: object
+      required: [repositoryUrl, baseRevision, manifestDigest]
+      properties:
+        repositoryUrl: { type: string, format: uri }
+        baseRevision: { type: string }
+        gitBundleDigest: { type: string, nullable: true }
+        trackedPatchDigest: { type: string, nullable: true }
+        untrackedBundleDigest: { type: string, nullable: true }
+        manifestDigest: { type: string }
+    AutoStopPolicy:
+      type: object
+      required: [mode, gracePeriodSeconds]
+      properties:
+        mode:
+          type: string
+          enum: [when_disconnected, when_agents_finish, when_fully_idle, manual]
+        gracePeriodSeconds: { type: integer, minimum: 0, maximum: 86400 }
+    CreateEnvironmentInput:
+      type: object
+      required: [name, region, runtimePreset, profileVersionId, projectSeedId, autoStopPolicy, sshKeyIds]
+      properties:
+        name: { type: string, minLength: 3, maxLength: 64 }
+        region: { type: string }
+        runtimePreset: { type: string }
+        profileVersionId: { type: string }
+        projectSeedId: { type: string }
+        autoStopPolicy: { $ref: '#/components/schemas/AutoStopPolicy' }
+        sshKeyIds:
+          type: array
+          minItems: 1
+          items: { type: string }
+    Runtime:
+      type: object
+      required: [id, status, runtimePreset, region, availabilityZone, imageVersion]
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [absent, provisioning, starting, ready, stopping, stopped, replacing, error]
+        runtimePreset: { type: string }
+        region: { type: string }
+        availabilityZone: { type: string }
+        imageVersion: { type: string }
+    Environment:
+      type: object
+      required: [id, name, slug, lifecycle, health, region, runtimePreset, pinnedProfileVersionId, autoStopPolicy, createdAt]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        slug: { type: string }
+        lifecycle: { type: string, enum: [creating, active, deleting, deleted] }
+        health: { type: string, enum: [healthy, degraded, blocked, unknown] }
+        region: { type: string }
+        runtimePreset: { type: string }
+        pinnedProfileVersionId: { type: string }
+        autoStopPolicy: { $ref: '#/components/schemas/AutoStopPolicy' }
+        runtime: { $ref: '#/components/schemas/Runtime' }
+        activeOperationId: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    EnvironmentOperation:
+      type: object
+      required: [environment, operation]
+      properties:
+        environment: { $ref: '#/components/schemas/Environment' }
+        operation: { $ref: '#/components/schemas/Operation' }
+    OperationStep:
+      type: object
+      required: [stepKey, status, summary]
+      properties:
+        stepKey: { type: string }
+        status: { type: string, enum: [pending, running, succeeded, failed, skipped, blocked] }
+        summary: { type: string }
+    Operation:
+      type: object
+      required: [id, environmentId, type, status, steps, createdAt]
+      properties:
+        id: { type: string }
+        environmentId: { type: string }
+        type: { type: string }
+        status: { type: string, enum: [queued, running, succeeded, failed, cancelled, blocked] }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStep' }
+        createdAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+    ConnectionIntent:
+      type: object
+      required: [id, environmentId, logicalHostname, proxyUrl, expiresAt]
+      properties:
+        id: { type: string }
+        environmentId: { type: string }
+        logicalHostname: { type: string }
+        proxyUrl: { type: string, format: uri }
+        operationId: { type: string, nullable: true }
+        expiresAt: { type: string, format: date-time }
+    ErrorResponse:
+      type: object
+      required: [requestId, error]
+      properties:
+        requestId: { type: string }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            operationId: { type: string, nullable: true }
+            safeState: { type: string, nullable: true }
+            nextAction: { type: string, nullable: true }
