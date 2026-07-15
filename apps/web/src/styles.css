@@ -1,0 +1,96 @@
+:root {
+  color: #18201d;
+  background: #f2f0e8;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  min-height: 100svh;
+  display: grid;
+  align-content: center;
+  gap: 1rem;
+  padding: clamp(2rem, 8vw, 8rem);
+  max-width: 68rem;
+}
+
+h1,
+p {
+  margin: 0;
+}
+
+h1 {
+  max-width: 16ch;
+  font-family: "Iowan Old Style", "Palatino Linotype", serif;
+  font-size: clamp(2.75rem, 8vw, 6.75rem);
+  font-weight: 500;
+  letter-spacing: -0.055em;
+  line-height: 0.95;
+}
+
+p {
+  max-width: 42rem;
+  font-size: clamp(1rem, 2vw, 1.25rem);
+  line-height: 1.55;
+}
+
+.eyebrow {
+  color: #7f3f22;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.primary-action {
+  justify-self: start;
+  margin-top: 1.25rem;
+  padding: 0.75rem 1.1rem;
+  color: #f2f0e8;
+  background: #263a31;
+  text-decoration: none;
+}
+
+.primary-action:focus-visible {
+  outline: 3px solid #b95d32;
+  outline-offset: 3px;
+}
+
+code {
+  justify-self: start;
+  padding: 0.4rem 0.65rem;
+  color: #f2f0e8;
+  background: #263a31;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .welcome > *,
+  .empty-state > * {
+    animation: arrive 400ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .welcome > :nth-child(2),
+  .empty-state > :nth-child(2) {
+    animation-delay: 60ms;
+  }
+
+  .welcome > :nth-child(n + 3),
+  .empty-state > :nth-child(n + 3) {
+    animation-delay: 120ms;
+  }
+}
+
+@keyframes arrive {
+  from {
+    opacity: 0;
+    transform: translateY(0.75rem);
+  }
+}

@@ -4,16 +4,19 @@ info:
   version: 0.1.0
   description: Public API used by the devm CLI and web application.
 servers:
-  - url: https://api.example.com/v1
+  - url: /v1
 security:
   - workosBearer: []
 paths:
   /me:
     get:
+      summary: Get the authenticated user
       operationId: getCurrentUser
       responses:
         '200':
           description: Current product user.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema:
@@ -22,10 +25,13 @@ paths:
           $ref: '#/components/responses/Error'
   /billing:
     get:
+      summary: Get the user's billing summary
       operationId: getBillingSummary
       responses:
         '200':
           description: Subscription and shared credit balance.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema:
@@ -34,12 +40,15 @@ paths:
           $ref: '#/components/responses/Error'
   /billing/portal:
     post:
+      summary: Create a billing portal session
       operationId: createBillingPortal
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '200':
           description: Short-lived Polar portal URL.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema:
@@ -51,18 +60,23 @@ paths:
           $ref: '#/components/responses/Error'
   /ssh-keys:
     get:
+      summary: List active SSH public keys
       operationId: listSSHKeys
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
       responses:
         '200':
           description: Active SSH public keys.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/SSHKey' }
+              schema: { $ref: '#/components/schemas/SSHKeyPage' }
         default:
           $ref: '#/components/responses/Error'
     post:
+      summary: Register an SSH public key
       operationId: createSSHKey
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -79,6 +93,8 @@ paths:
       responses:
         '201':
           description: Stored public key.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SSHKey' }
@@ -86,28 +102,37 @@ paths:
           $ref: '#/components/responses/Error'
   /ssh-keys/{keyId}:
     delete:
+      summary: Revoke an SSH public key
       operationId: revokeSSHKey
       parameters:
         - $ref: '#/components/parameters/KeyID'
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
-        '204': { description: Key revoked. }
+        '204':
+          description: Key revoked.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
         default:
           $ref: '#/components/responses/Error'
   /profiles:
     get:
+      summary: List Profiles
       operationId: listProfiles
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
       responses:
         '200':
           description: Profiles owned by the user.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/ProfileSummary' }
+              schema: { $ref: '#/components/schemas/ProfilePage' }
         default:
           $ref: '#/components/responses/Error'
     post:
+      summary: Create a Profile
       operationId: createProfile
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -124,6 +149,8 @@ paths:
       responses:
         '201':
           description: Profile created.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProfileSummary' }
@@ -131,12 +158,15 @@ paths:
           $ref: '#/components/responses/Error'
   /profiles/{profileId}:
     get:
+      summary: Get a Profile
       operationId: getProfile
       parameters:
         - $ref: '#/components/parameters/ProfileID'
       responses:
         '200':
           description: Profile and current head.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProfileSummary' }
@@ -144,6 +174,7 @@ paths:
           $ref: '#/components/responses/Error'
   /profiles/{profileId}/versions:
     post:
+      summary: Publish a Profile Version
       operationId: publishProfileVersion
       parameters:
         - $ref: '#/components/parameters/ProfileID'
@@ -154,15 +185,19 @@ paths:
           application/json:
             schema:
               type: object
-              required: [expectedHeadVersionId, artifacts]
+              required: [expectedHeadVersionId, digest, artifacts]
               properties:
                 expectedHeadVersionId: { type: string, nullable: true }
+                digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
                 artifacts:
                   type: array
+                  minItems: 1
                   items: { $ref: '#/components/schemas/ProfileArtifactInput' }
       responses:
         '201':
           description: Immutable Profile Version published.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProfileVersion' }
@@ -170,6 +205,7 @@ paths:
           $ref: '#/components/responses/Error'
   /profile-versions/{versionId}:
     get:
+      summary: Get a Profile Version
       operationId: getProfileVersion
       parameters:
         - name: versionId
@@ -179,6 +215,8 @@ paths:
       responses:
         '200':
           description: Immutable Profile Version.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProfileVersion' }
@@ -186,6 +224,7 @@ paths:
           $ref: '#/components/responses/Error'
   /uploads:
     post:
+      summary: Create an upload intent
       operationId: createUploadIntent
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -203,19 +242,27 @@ paths:
       responses:
         '201':
           description: Scoped upload URL.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema:
                 type: object
-                required: [uploadId, url, expiresAt]
+                required: [uploadId, url, expiresAt, requiredHeaders]
                 properties:
                   uploadId: { type: string }
                   url: { type: string, format: uri }
                   expiresAt: { type: string, format: date-time }
+                  requiredHeaders:
+                    type: object
+                    minProperties: 1
+                    maxProperties: 16
+                    additionalProperties: { type: string, maxLength: 8192 }
         default:
           $ref: '#/components/responses/Error'
   /project-seeds:
     post:
+      summary: Register a Project Seed
       operationId: createProjectSeed
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -227,6 +274,8 @@ paths:
       responses:
         '201':
           description: Immutable Project Seed registered.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema:
@@ -239,18 +288,23 @@ paths:
           $ref: '#/components/responses/Error'
   /environments:
     get:
+      summary: List Environments
       operationId: listEnvironments
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
       responses:
         '200':
           description: Environments owned by the user.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/Environment' }
+              schema: { $ref: '#/components/schemas/EnvironmentPage' }
         default:
           $ref: '#/components/responses/Error'
     post:
+      summary: Create an Environment
       operationId: createEnvironment
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -262,6 +316,8 @@ paths:
       responses:
         '202':
           description: Environment creation accepted.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EnvironmentOperation' }
@@ -269,18 +325,22 @@ paths:
           $ref: '#/components/responses/Error'
   /environments/{environmentId}:
     get:
+      summary: Get an Environment
       operationId: getEnvironment
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
       responses:
         '200':
           description: Environment detail.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Environment' }
         default:
           $ref: '#/components/responses/Error'
     delete:
+      summary: Delete an Environment
       operationId: deleteEnvironment
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
@@ -297,6 +357,8 @@ paths:
       responses:
         '202':
           description: Deletion accepted.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EnvironmentOperation' }
@@ -304,6 +366,7 @@ paths:
           $ref: '#/components/responses/Error'
   /environments/{environmentId}/start:
     post:
+      summary: Start an Environment Runtime
       operationId: startEnvironmentRuntime
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
@@ -311,6 +374,8 @@ paths:
       responses:
         '202':
           description: Runtime start accepted.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EnvironmentOperation' }
@@ -318,6 +383,7 @@ paths:
           $ref: '#/components/responses/Error'
   /environments/{environmentId}/stop:
     post:
+      summary: Stop an Environment Runtime
       operationId: stopEnvironmentRuntime
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
@@ -333,6 +399,8 @@ paths:
       responses:
         '202':
           description: Runtime stop accepted.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EnvironmentOperation' }
@@ -340,6 +408,7 @@ paths:
           $ref: '#/components/responses/Error'
   /environments/{environmentId}/replace-runtime:
     post:
+      summary: Replace an Environment Runtime
       operationId: replaceEnvironmentRuntime
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
@@ -347,6 +416,8 @@ paths:
       responses:
         '202':
           description: Runtime replacement accepted.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EnvironmentOperation' }
@@ -354,6 +425,7 @@ paths:
           $ref: '#/components/responses/Error'
   /environments/{environmentId}/apply-profile:
     post:
+      summary: Apply a Profile Version to an Environment
       operationId: applyEnvironmentProfile
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
@@ -373,6 +445,8 @@ paths:
       responses:
         '202':
           description: Profile application accepted.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EnvironmentOperation' }
@@ -380,6 +454,7 @@ paths:
           $ref: '#/components/responses/Error'
   /environments/{environmentId}/auto-stop-policy:
     put:
+      summary: Update an Environment's Auto-stop Policy
       operationId: updateAutoStopPolicy
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
@@ -392,6 +467,8 @@ paths:
       responses:
         '202':
           description: Auto-stop policy update accepted.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EnvironmentOperation' }
@@ -399,6 +476,7 @@ paths:
           $ref: '#/components/responses/Error'
   /environments/{environmentId}/connection-intents:
     post:
+      summary: Create a connection intent
       operationId: createConnectionIntent
       parameters:
         - $ref: '#/components/parameters/EnvironmentID'
@@ -406,13 +484,34 @@ paths:
       responses:
         '201':
           description: Short-lived regional proxy route.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ConnectionIntent' }
         default:
           $ref: '#/components/responses/Error'
+  /environments/{environmentId}/events:
+    get:
+      summary: List Environment events
+      operationId: listEnvironmentEvents
+      parameters:
+        - $ref: '#/components/parameters/EnvironmentID'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Environment event timeline.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnvironmentEventPage' }
+        default:
+          $ref: '#/components/responses/Error'
   /operations/{operationId}:
     get:
+      summary: Get an Operation
       operationId: getOperation
       parameters:
         - name: operationId
@@ -422,6 +521,8 @@ paths:
       responses:
         '200':
           description: Operation progress projection.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Operation' }
@@ -454,9 +555,26 @@ components:
       in: path
       required: true
       schema: { type: string }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 512 }
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+  headers:
+    RequestID:
+      description: Stable identifier for this API request.
+      required: true
+      schema: { type: string }
   responses:
     Error:
       description: Product-level error.
+      headers:
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -484,6 +602,14 @@ components:
         fingerprint: { type: string }
         publicKey: { type: string }
         createdAt: { type: string, format: date-time }
+    SSHKeyPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/SSHKey' }
+        nextCursor: { type: string, nullable: true }
     ProfileSummary:
       type: object
       required: [id, name, slug]
@@ -492,16 +618,44 @@ components:
         name: { type: string }
         slug: { type: string }
         headVersionId: { type: string, nullable: true }
+    ProfilePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ProfileSummary' }
+        nextCursor: { type: string, nullable: true }
     ProfileArtifactInput:
       type: object
-      required: [kind, sourceLocator, sourceDigest, contentDigest, sensitivity, trust, containsExecutable]
+      required: [kind, sourceLocator, sourceDigest, contentDigest, sizeBytes, mode, sensitivity, trust, containsExecutable]
       properties:
-        kind: { type: string }
+        kind:
+          type: string
+          enum: [agent_instruction, codex_settings, claude_settings, shell_preferences, git_preferences, agent_skill_instruction, agent_skill_executable]
         sourceLocator: { type: string }
-        sourceDigest: { type: string }
-        contentDigest: { type: string }
-        sensitivity: { type: string, enum: [public, private, credential, unknown] }
-        trust: { type: string, enum: [user_authored, trusted_source, third_party, unknown] }
+        sourceDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        contentDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        sizeBytes: { type: integer, format: int64, minimum: 0 }
+        mode: { type: integer, minimum: 0, maximum: 511 }
+        sensitivity: { type: string, enum: [public, private] }
+        trust: { type: string, enum: [user_authored, trusted_source, third_party] }
+        containsExecutable: { type: boolean }
+    ProfileArtifact:
+      type: object
+      required: [id, kind, sourceLocator, sourceDigest, contentDigest, sizeBytes, mode, sensitivity, trust, containsExecutable]
+      properties:
+        id: { type: string }
+        kind:
+          type: string
+          enum: [agent_instruction, codex_settings, claude_settings, shell_preferences, git_preferences, agent_skill_instruction, agent_skill_executable]
+        sourceLocator: { type: string }
+        sourceDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        contentDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        sizeBytes: { type: integer, format: int64, minimum: 0 }
+        mode: { type: integer, minimum: 0, maximum: 511 }
+        sensitivity: { type: string, enum: [public, private] }
+        trust: { type: string, enum: [user_authored, trusted_source, third_party] }
         containsExecutable: { type: boolean }
     ProfileVersion:
       type: object
@@ -511,21 +665,22 @@ components:
         profileId: { type: string }
         parentVersionId: { type: string, nullable: true }
         version: { type: integer, format: int64 }
-        digest: { type: string }
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
         artifacts:
           type: array
-          items: { $ref: '#/components/schemas/ProfileArtifactInput' }
+          items: { $ref: '#/components/schemas/ProfileArtifact' }
         createdAt: { type: string, format: date-time }
     ProjectSeedInput:
       type: object
-      required: [repositoryUrl, baseRevision, manifestDigest]
+      required: [repositoryUrl, baseRevision, digest, manifestDigest]
       properties:
         repositoryUrl: { type: string, format: uri }
         baseRevision: { type: string }
-        gitBundleDigest: { type: string, nullable: true }
-        trackedPatchDigest: { type: string, nullable: true }
-        untrackedBundleDigest: { type: string, nullable: true }
-        manifestDigest: { type: string }
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        gitBundleDigest: { type: string, nullable: true, pattern: '^sha256:[a-f0-9]{64}$' }
+        trackedPatchDigest: { type: string, nullable: true, pattern: '^sha256:[a-f0-9]{64}$' }
+        untrackedBundleDigest: { type: string, nullable: true, pattern: '^sha256:[a-f0-9]{64}$' }
+        manifestDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
     AutoStopPolicy:
       type: object
       required: [mode, gracePeriodSeconds]
@@ -582,6 +737,32 @@ components:
       properties:
         environment: { $ref: '#/components/schemas/Environment' }
         operation: { $ref: '#/components/schemas/Operation' }
+    EnvironmentPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Environment' }
+        nextCursor: { type: string, nullable: true }
+    EnvironmentEvent:
+      type: object
+      required: [id, environmentId, type, summary, createdAt]
+      properties:
+        id: { type: string }
+        environmentId: { type: string }
+        operationId: { type: string, nullable: true }
+        type: { type: string }
+        summary: { type: string }
+        createdAt: { type: string, format: date-time }
+    EnvironmentEventPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/EnvironmentEvent' }
+        nextCursor: { type: string, nullable: true }
     OperationStep:
       type: object
       required: [stepKey, status, summary]

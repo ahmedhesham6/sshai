@@ -1,0 +1,252 @@
+package controlplane
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/ahmedhesham6/sshai/libs/application"
+	"github.com/ahmedhesham6/sshai/libs/auth"
+	"github.com/ahmedhesham6/sshai/libs/contracts"
+	"github.com/ahmedhesham6/sshai/libs/db"
+	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/getkin/kin-openapi/openapi3filter"
+	"github.com/go-chi/chi/v5"
+	nethttpmiddleware "github.com/oapi-codegen/nethttp-middleware"
+)
+
+type TokenVerifier interface {
+	Verify(context.Context, string) (auth.Subject, error)
+}
+
+type UserProjection interface {
+	EnsureUser(context.Context, db.EnsureUserInput) (domain.User, error)
+}
+
+type Config struct {
+	CreateEnvironment   *application.CreateEnvironmentService
+	RegisterProjectSeed *application.RegisterProjectSeedService
+	Profiles            *application.ProfileService
+	Uploads             *application.UploadIntentService
+	SSHKeys             *application.SSHKeyService
+	Verifier            TokenVerifier
+	Users               UserProjection
+	UserIDs             application.IDGenerator
+	RequestIDs          application.IDGenerator
+	DefaultRegion       string
+	Now                 func() time.Time
+}
+
+type server struct {
+	contracts.Unimplemented
+	createEnvironment   *application.CreateEnvironmentService
+	registerProjectSeed *application.RegisterProjectSeedService
+	profiles            *application.ProfileService
+	uploads             *application.UploadIntentService
+	sshKeys             *application.SSHKeyService
+}
+
+func NewHandler(config Config) http.Handler {
+	api := &server{createEnvironment: config.CreateEnvironment, registerProjectSeed: config.RegisterProjectSeed, profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys}
+	router := chi.NewRouter()
+	router.Use(requestIDMiddleware(config.RequestIDs))
+	router.Use(authenticationMiddleware(config.Verifier, config.Users, config.UserIDs, config.DefaultRegion, config.Now))
+	specification, err := contracts.GetSwagger()
+	if err != nil {
+		panic("load embedded OpenAPI contract: " + err.Error())
+	}
+	router.Use(nethttpmiddleware.OapiRequestValidatorWithOptions(specification, &nethttpmiddleware.Options{
+		Options: openapi3filter.Options{
+			AuthenticationFunc: func(ctx context.Context, _ *openapi3filter.AuthenticationInput) error {
+				if _, present := userFromContext(ctx); !present {
+					return errors.New("authenticated User is missing")
+				}
+				return nil
+			},
+		},
+		ErrorHandlerWithOpts: func(_ context.Context, _ error, response http.ResponseWriter, request *http.Request, options nethttpmiddleware.ErrorHandlerOpts) {
+			writeError(response, request, options.StatusCode, "INVALID_REQUEST", "The request does not match the API contract.")
+		},
+		SilenceServersWarning: true,
+	}))
+	return contracts.HandlerFromMuxWithBaseURL(api, router, "/v1")
+}
+
+func (server *server) CreateProjectSeed(response http.ResponseWriter, request *http.Request, params contracts.CreateProjectSeedParams) {
+	var body contracts.CreateProjectSeedJSONRequestBody
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", "The request body is not valid JSON.")
+		return
+	}
+	user, present := userFromContext(request.Context())
+	if !present {
+		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
+		return
+	}
+	seed, err := server.registerProjectSeed.RegisterProjectSeed(request.Context(), application.RegisterProjectSeedInput{
+		OwnerUserID: user.ID, IdempotencyKey: params.IdempotencyKey,
+		RepositoryURL: body.RepositoryUrl, BaseRevision: body.BaseRevision, Digest: body.Digest,
+		GitBundleDigest:       valueOrEmpty(body.GitBundleDigest),
+		TrackedPatchDigest:    valueOrEmpty(body.TrackedPatchDigest),
+		UntrackedBundleDigest: valueOrEmpty(body.UntrackedBundleDigest), ManifestDigest: body.ManifestDigest,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, application.ErrUploadNotVerified):
+			writeError(response, request, http.StatusBadRequest, "INVALID_UPLOAD", "A Project Seed upload is not valid.")
+		case errors.Is(err, application.ErrUploadObjectNotFound), errors.Is(err, db.ErrReferenceNotOwned):
+			writeError(response, request, http.StatusNotFound, "UPLOAD_NOT_FOUND", "A Project Seed upload was not found.")
+		case errors.Is(err, application.ErrInvalidProjectSeed):
+			writeError(response, request, http.StatusBadRequest, "INVALID_PROJECT_SEED", "The Project Seed metadata is invalid.")
+		case errors.Is(err, db.ErrIdempotencyConflict):
+			writeError(response, request, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "The idempotency key was already used with different input.")
+		default:
+			writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The Project Seed could not be registered safely.")
+		}
+		return
+	}
+	snapshot := seed.Snapshot()
+	result := contracts.CreateProjectSeed201JSONResponse{
+		Headers: contracts.CreateProjectSeed201ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
+	}
+	result.Body.Id, result.Body.Digest = snapshot.ID, snapshot.Digest
+	if err := result.VisitCreateProjectSeedResponse(response); err != nil {
+		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
+	}
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func (server *server) CreateEnvironment(response http.ResponseWriter, request *http.Request, params contracts.CreateEnvironmentParams) {
+	var body contracts.CreateEnvironmentJSONRequestBody
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", "The request body is not valid JSON.")
+		return
+	}
+	user, present := userFromContext(request.Context())
+	if !present {
+		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
+		return
+	}
+	creation, err := server.createEnvironment.CreateEnvironment(request.Context(), application.CreateEnvironmentInput{
+		OwnerUserID: user.ID, Name: body.Name, Region: body.Region, RuntimePreset: body.RuntimePreset,
+		ProfileVersionID: body.ProfileVersionId, ProjectSeedID: body.ProjectSeedId,
+		SSHKeyIDs: body.SshKeyIds, AutoStopMode: domain.AutoStopMode(body.AutoStopPolicy.Mode),
+		GracePeriod: body.AutoStopPolicy.GracePeriodSeconds, IdempotencyKey: params.IdempotencyKey,
+	})
+	if err != nil {
+		server.writeCreateError(response, request, err)
+		return
+	}
+	environment, operation, policy := creation.Environment().Snapshot(), creation.Operation().Snapshot(), creation.Policy().Snapshot()
+	activeOperationID := operation.ID
+	result := contracts.CreateEnvironment202JSONResponse{
+		Headers: contracts.CreateEnvironment202ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
+		Body: contracts.EnvironmentOperation{
+			Environment: contracts.Environment{
+				Id: environment.ID, Name: environment.Name, Slug: environment.Slug,
+				Lifecycle: contracts.EnvironmentLifecycle(environment.Lifecycle), Health: contracts.EnvironmentHealth(environment.Health),
+				Region: environment.Region, RuntimePreset: environment.RuntimePreset,
+				PinnedProfileVersionId: environment.PinnedProfileVersionID,
+				AutoStopPolicy: contracts.AutoStopPolicy{
+					Mode: contracts.AutoStopPolicyMode(policy.Mode), GracePeriodSeconds: policy.GracePeriodSeconds,
+				},
+				ActiveOperationId: &activeOperationID, CreatedAt: environment.CreatedAt,
+			},
+			Operation: contracts.Operation{
+				Id: operation.ID, EnvironmentId: operation.EnvironmentID, Type: string(operation.Type),
+				Status: contracts.OperationStatus(operation.Status), Steps: []contracts.OperationStep{}, CreatedAt: operation.CreatedAt,
+			},
+		},
+	}
+	if err := result.VisitCreateEnvironmentResponse(response); err != nil {
+		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
+	}
+}
+
+func (server *server) writeCreateError(response http.ResponseWriter, request *http.Request, err error) {
+	switch {
+	case errors.Is(err, application.ErrRegionUnavailable):
+		writeError(response, request, http.StatusUnprocessableEntity, "REGION_UNAVAILABLE", "The selected region is unavailable.")
+	case errors.Is(err, db.ErrIdempotencyConflict):
+		writeError(response, request, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "The idempotency key was already used with different input.")
+	case errors.Is(err, db.ErrReferenceNotOwned):
+		writeError(response, request, http.StatusNotFound, "REFERENCE_NOT_FOUND", "A referenced resource was not found.")
+	default:
+		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The command could not be accepted safely.")
+	}
+}
+
+type contextKey string
+
+const (
+	requestIDKey contextKey = "request-id"
+	userKey      contextKey = "user"
+)
+
+func requestIDMiddleware(ids application.IDGenerator) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			requestID := ids.NewID()
+			response.Header().Set("X-Request-ID", requestID)
+			next.ServeHTTP(response, request.WithContext(context.WithValue(request.Context(), requestIDKey, requestID)))
+		})
+	}
+}
+
+func authenticationMiddleware(verifier TokenVerifier, users UserProjection, ids application.IDGenerator, defaultRegion string, now func() time.Time) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			token, present := bearerToken(request.Header.Get("Authorization"))
+			if !present {
+				writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "A valid bearer token is required.")
+				return
+			}
+			subject, err := verifier.Verify(request.Context(), token)
+			if err != nil {
+				writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "A valid bearer token is required.")
+				return
+			}
+			user, err := users.EnsureUser(request.Context(), db.EnsureUserInput{
+				ID: ids.NewID(), WorkOSUserID: subject.WorkOSUserID, DefaultRegion: defaultRegion, ObservedAt: now(),
+			})
+			if err != nil {
+				writeError(response, request, http.StatusServiceUnavailable, "AUTHENTICATION_UNAVAILABLE", "Authentication could not be completed.")
+				return
+			}
+			next.ServeHTTP(response, request.WithContext(context.WithValue(request.Context(), userKey, user)))
+		})
+	}
+}
+
+func bearerToken(authorization string) (string, bool) {
+	scheme, token, present := strings.Cut(strings.TrimSpace(authorization), " ")
+	return token, present && strings.EqualFold(scheme, "Bearer") && token != ""
+}
+
+func writeError(response http.ResponseWriter, request *http.Request, status int, code, message string) {
+	body := contracts.ErrorResponse{RequestId: requestIDFromContext(request.Context())}
+	body.Error.Code, body.Error.Message = code, message
+	response.Header().Set("Content-Type", "application/json")
+	response.Header().Set("X-Request-ID", body.RequestId)
+	response.WriteHeader(status)
+	_ = json.NewEncoder(response).Encode(body)
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	requestID, _ := ctx.Value(requestIDKey).(string)
+	return requestID
+}
+
+func userFromContext(ctx context.Context) (domain.User, bool) {
+	user, present := ctx.Value(userKey).(domain.User)
+	return user, present
+}

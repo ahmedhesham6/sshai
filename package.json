@@ -1,0 +1,23 @@
+{
+  "name": "sshai",
+  "private": true,
+  "packageManager": "pnpm@11.10.0",
+  "engines": {
+    "node": ">=24.14.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "check": "pnpm contract:lint && pnpm format:check && pnpm lint && pnpm test",
+    "contract:lint": "redocly lint api/openapi.yaml",
+    "format:check": "turbo run format:check",
+    "generate": "turbo run generate",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "test:race": "turbo run test:race",
+    "typecheck": "turbo run typecheck"
+  },
+  "devDependencies": {
+    "@redocly/cli": "2.38.0",
+    "turbo": "2.10.4"
+  }
+}

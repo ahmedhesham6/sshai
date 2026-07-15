@@ -1,0 +1,25 @@
+{
+  "name": "@sshai/contracts",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "go test -run '^$' ./... && tsc --noEmit",
+    "format:check": "test -z \"$(gofmt -l .)\"",
+    "generate": "go generate ./... && openapi-ts -i ../../api/openapi.yaml -o src/generated",
+    "lint": "go vet ./...",
+    "test": "go test ./...",
+    "test:race": "go test -race ./...",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "0.99.0",
+    "typescript": "6.0.3"
+  }
+}

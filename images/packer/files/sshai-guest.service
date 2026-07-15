@@ -1,0 +1,14 @@
+[Unit]
+Description=sshai Runtime guest supervisor
+Wants=network-online.target
+After=network-online.target
+ConditionFileIsExecutable=/usr/local/bin/sshai-guest
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sshai-guest
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
