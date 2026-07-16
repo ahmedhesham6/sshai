@@ -9,10 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -31,25 +32,67 @@ const (
 type MaterializationRoot string
 
 const (
-	MaterializationHome             MaterializationRoot = "home"
-	MaterializationWorkspace        MaterializationRoot = "workspace"
-	materializationFileAdapter                          = "file"
-	materializationReferenceAdapter                     = "reference"
-	materializationAdapterVersion                       = "v1"
+	MaterializationHome      MaterializationRoot = "home"
+	MaterializationWorkspace MaterializationRoot = "workspace"
 )
 
+const (
+	materializationFileAdapter      = "file"
+	materializationReferenceAdapter = "reference"
+	materializationAdapterVersion   = "v1"
+)
+
+// MaterializationFile is one regular file in a native directory plan. Path is
+// relative to the plan's Target and is never an absolute filesystem path.
+type MaterializationFile struct {
+	Path    string
+	Content []byte
+	Mode    os.FileMode
+}
+
+// ProfileMaterialization is the canonical Component-to-native plan consumed
+// by the generic safety engine. It contains no legacy profile artifact.
 type ProfileMaterialization struct {
-	ID                string
-	ArtifactID        string
-	Artifact          *profile.Artifact
-	ContentSize       int64
-	Mode              MaterializationMode
-	Root              MaterializationRoot
-	Target            string
-	Selector          string
+	ID                       string
+	LockID                   string
+	LockDigest               string
+	CapsuleDigest            string
+	ComponentID              string
+	ComponentDigest          string
+	AdapterID                string
+	AdapterVersion           string
+	TargetAgentVersion       string
+	Scope                    domain.ComponentScope
+	NonSecretOverridesDigest string
+	SecretVersionIdentifiers []string
+	EffectiveCacheKey        string
+	EffectiveCacheKeyChanged bool
+
+	Kind         domain.ComponentType
+	TrustClass   domain.TrustClass
+	Requirements domain.ComponentRequirements
+
+	Mode   MaterializationMode
+	Root   MaterializationRoot
+	Target string
+	// Selector is retained for JSON key ownership. "$" means the whole file.
+	Selector string
+
+	Content       []byte
+	ContentSize   int64
+	ContentDigest string
+	FileMode      os.FileMode
+	Files         []MaterializationFile
+	Directory     bool
+	FilePaths     []string
+
 	LastAppliedDigest string
 	ObservedDigest    string
 	RequirementState  profile.RequirementState
+
+	CredentialRequirementDigest string
+	ApprovalRequired            bool
+	ApprovalReason              string
 }
 
 type ProfileMaterializationBatch struct {
@@ -57,22 +100,97 @@ type ProfileMaterializationBatch struct {
 	WorkspaceRoot string
 	Intent        profile.PlanIntent
 	Items         []ProfileMaterialization
+	Approvals     map[string]ApprovalMarker
+	Metrics       domain.Metrics
+}
+
+// ApprovalMarker is an explicit user decision for one exact Component
+// digest. A marker never authorizes a different digest.
+type ApprovalMarker struct {
+	ComponentID     string
+	ComponentDigest string
+	LockID          string
+	LockDigest      string
 }
 
 type ProfileMaterializationResult struct {
-	ID                string
-	ArtifactID        string
-	Mode              MaterializationMode
-	Adapter           string
-	AdapterVersion    string
-	Root              MaterializationRoot
-	Target            string
-	Selector          string
-	DesiredDigest     string
-	LastAppliedDigest string
-	ObservedDigest    string
-	Operation         profile.PlanOperation
-	RequirementState  profile.RequirementState
+	ID                          string
+	LockID                      string
+	LockDigest                  string
+	CapsuleDigest               string
+	ComponentID                 string
+	ComponentDigest             string
+	Adapter                     string
+	AdapterID                   string
+	AdapterVersion              string
+	TargetAgentVersion          string
+	Scope                       domain.ComponentScope
+	NonSecretOverridesDigest    string
+	SecretVersionIdentifiers    []string
+	EffectiveCacheKey           string
+	Mode                        MaterializationMode
+	Root                        MaterializationRoot
+	Target                      string
+	Selector                    string
+	Directory                   bool
+	FilePaths                   []string
+	DesiredDigest               string
+	LastAppliedDigest           string
+	ObservedDigest              string
+	Operation                   profile.PlanOperation
+	RequirementState            profile.RequirementState
+	ApprovalRequired            bool
+	ApprovalReason              string
+	CredentialRequirementDigest string
+}
+
+// InstalledMaterialization is the durable state needed to plan the next
+// lock. It deliberately stores cache-key fields, never resolved secret values.
+type InstalledMaterialization struct {
+	ID                          string
+	LockID                      string
+	LockDigest                  string
+	CapsuleDigest               string
+	ComponentID                 string
+	ComponentDigest             string
+	AdapterID                   string
+	AdapterVersion              string
+	TargetAgentVersion          string
+	Scope                       domain.ComponentScope
+	NonSecretOverridesDigest    string
+	SecretVersionIdentifiers    []string
+	EffectiveCacheKey           string
+	Mode                        MaterializationMode
+	Root                        MaterializationRoot
+	Target                      string
+	Selector                    string
+	Directory                   bool
+	FilePaths                   []string
+	LastAppliedDigest           string
+	ObservedDigest              string
+	CredentialRequirementDigest string
+}
+
+// InstalledMaterializationsFromResults is a small state bridge for callers
+// that persist the guest result in their Environment state store.
+func InstalledMaterializationsFromResults(results []ProfileMaterializationResult) []InstalledMaterialization {
+	installed := make([]InstalledMaterialization, 0, len(results))
+	for _, result := range results {
+		installed = append(installed, InstalledMaterialization{
+			ID: result.ID, LockID: result.LockID, LockDigest: result.LockDigest, CapsuleDigest: result.CapsuleDigest,
+			ComponentID: result.ComponentID, ComponentDigest: result.ComponentDigest,
+			AdapterID: result.Adapter, AdapterVersion: result.AdapterVersion,
+			TargetAgentVersion: result.TargetAgentVersion, Scope: result.Scope,
+			NonSecretOverridesDigest: result.NonSecretOverridesDigest,
+			SecretVersionIdentifiers: append([]string(nil), result.SecretVersionIdentifiers...),
+			EffectiveCacheKey:        result.EffectiveCacheKey,
+			Mode:                     result.Mode, Root: result.Root, Target: result.Target, Selector: result.Selector,
+			Directory: result.Directory, FilePaths: append([]string(nil), result.FilePaths...),
+			LastAppliedDigest: result.LastAppliedDigest, ObservedDigest: result.ObservedDigest,
+			CredentialRequirementDigest: result.CredentialRequirementDigest,
+		})
+	}
+	return installed
 }
 
 var profileSHA256 = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -80,10 +198,23 @@ var profileSHA256 = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var ErrProfileMaterializationBlocked = errors.New("Profile Materialization is blocked")
 
 type plannedProfileMaterialization struct {
-	result  ProfileMaterializationResult
-	root    *os.Root
-	content []byte
-	mode    os.FileMode
+	result    ProfileMaterializationResult
+	root      *os.Root
+	content   []byte
+	mode      os.FileMode
+	files     []MaterializationFile
+	directory bool
+}
+
+type materializationBackup struct {
+	root      *os.Root
+	target    string
+	selector  string
+	directory bool
+	existed   bool
+	mode      os.FileMode
+	content   []byte
+	files     []MaterializationFile
 }
 
 func ApplyProfileMaterializations(batch ProfileMaterializationBatch) ([]ProfileMaterializationResult, error) {
@@ -97,13 +228,33 @@ func ApplyProfileMaterializations(batch ProfileMaterializationBatch) ([]ProfileM
 		}
 	}()
 	seen := make(map[string]struct{}, len(batch.Items))
+	seenComponents := make(map[string]struct{}, len(batch.Items))
 	ownedTargets := make(map[string][]string, len(batch.Items))
 	plans := make([]plannedProfileMaterialization, 0, len(batch.Items))
 	for _, item := range batch.Items {
+		if item.ComponentID == "" {
+			item.ComponentID = item.ID
+		}
+		if item.ID == "" {
+			item.ID = item.ComponentID
+		}
+		if item.ID != item.ComponentID {
+			return nil, fmt.Errorf("apply Profile Materializations: identity %q does not match Component ID %q", item.ID, item.ComponentID)
+		}
+		if required, reason := materializationApprovalPolicy(item); required {
+			item.ApprovalRequired = true
+			if item.ApprovalReason == "" {
+				item.ApprovalReason = reason
+			}
+		}
 		if _, duplicate := seen[item.ID]; duplicate {
 			return nil, fmt.Errorf("apply Profile Materializations: duplicate identity %q", item.ID)
 		}
+		if _, duplicate := seenComponents[item.ComponentID]; duplicate {
+			return nil, fmt.Errorf("apply Profile Materializations: duplicate Component ID %q", item.ComponentID)
+		}
 		seen[item.ID] = struct{}{}
+		seenComponents[item.ComponentID] = struct{}{}
 		if err := recordMaterializationOwnership(ownedTargets, item); err != nil {
 			return nil, fmt.Errorf("apply Profile Materializations: %w", err)
 		}
@@ -111,42 +262,212 @@ func ApplyProfileMaterializations(batch ProfileMaterializationBatch) ([]ProfileM
 		if err != nil {
 			return nil, fmt.Errorf("apply Profile Materializations: plan %q: %w", item.ID, err)
 		}
+		if item.ApprovalRequired && !approvalGranted(batch.Approvals, item) && plan.result.Operation != profile.OperationOrphan && plan.result.Operation != profile.OperationSkip {
+			plan.result.Operation = profile.OperationRequiresInput
+		}
 		plans = append(plans, plan)
 	}
 	results := materializationResults(plans)
+	recordMaterializationConflictMetrics(batch.Metrics, results)
 	for _, plan := range plans {
 		if plan.blocked() {
 			return results, fmt.Errorf("apply Profile Materializations: %w: %q requires %s resolution", ErrProfileMaterializationBlocked, plan.result.ID, plan.result.Operation)
 		}
 	}
+	backups, err := snapshotMaterializationPlans(plans)
+	if err != nil {
+		return results, fmt.Errorf("apply Profile Materializations: prepare rollback: %w", err)
+	}
 	for index := range plans {
 		if err := plans[index].apply(); err != nil {
+			if rollbackErr := rollbackMaterializations(backups); rollbackErr != nil {
+				return materializationResults(plans), fmt.Errorf("apply Profile Materializations: %w; rollback: %w", err, rollbackErr)
+			}
 			return materializationResults(plans), fmt.Errorf("apply Profile Materializations: %w", err)
 		}
 	}
-	return materializationResults(plans), nil
+	results = materializationResults(plans)
+	if batch.Metrics != nil {
+		for _, result := range results {
+			if result.Operation != profile.OperationSkip {
+				batch.Metrics.AddCounter(domain.MetricComponentMaterializationsTotal, 1)
+			}
+		}
+	}
+	return results, nil
 }
 
-func prepareProfileMaterialization(
-	batch ProfileMaterializationBatch,
-	roots map[MaterializationRoot]*os.Root,
-	item ProfileMaterialization,
-) (plannedProfileMaterialization, error) {
-	if item.Artifact == nil {
+func recordMaterializationConflictMetrics(metrics domain.Metrics, results []ProfileMaterializationResult) {
+	if metrics == nil {
+		return
+	}
+	for _, result := range results {
+		if result.Operation == profile.OperationConflict {
+			metrics.AddCounter(domain.MetricComponentConflictsTotal, 1)
+		}
+	}
+}
+
+func snapshotMaterializationPlans(plans []plannedProfileMaterialization) ([]materializationBackup, error) {
+	backups := make([]materializationBackup, 0, len(plans))
+	for _, plan := range plans {
+		if plan.result.Operation == profile.OperationSkip || plan.result.Operation == profile.OperationOrphan || plan.result.Adapter == materializationReferenceAdapter {
+			continue
+		}
+		backup, err := snapshotMaterialization(plan.root, plan.result.Target, plan.result.Selector, plan.directory)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot %q: %w", plan.result.ID, err)
+		}
+		backups = append(backups, backup)
+	}
+	return backups, nil
+}
+
+func snapshotMaterialization(root *os.Root, target, selector string, directory bool) (materializationBackup, error) {
+	backup := materializationBackup{root: root, target: target, selector: selector, directory: directory}
+	info, err := root.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return backup, nil
+	}
+	if err != nil {
+		return materializationBackup{}, err
+	}
+	backup.existed = true
+	backup.mode = info.Mode().Perm()
+	if directory {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return materializationBackup{}, errors.New("directory target is not a real directory")
+		}
+		files := make([]MaterializationFile, 0)
+		err = fs.WalkDir(root.FS(), target, func(name string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if name == target || entry.IsDir() {
+				return nil
+			}
+			if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
+				return errors.New("directory target contains an unsafe entry")
+			}
+			content, readErr := root.ReadFile(name)
+			if readErr != nil {
+				return readErr
+			}
+			fileInfo, infoErr := entry.Info()
+			if infoErr != nil {
+				return infoErr
+			}
+			files = append(files, MaterializationFile{Path: strings.TrimPrefix(name, target+"/"), Content: content, Mode: fileInfo.Mode().Perm()})
+			return nil
+		})
+		if err != nil {
+			return materializationBackup{}, err
+		}
+		backup.files = files
+		return backup, nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return materializationBackup{}, errors.New("target is not a regular file")
+	}
+	backup.content, err = root.ReadFile(target)
+	return backup, err
+}
+
+func rollbackMaterializations(backups []materializationBackup) error {
+	var rollbackErr error
+	for index := len(backups) - 1; index >= 0; index-- {
+		if err := backups[index].restore(); err != nil {
+			rollbackErr = errors.Join(rollbackErr, err)
+		}
+	}
+	return rollbackErr
+}
+
+func (backup materializationBackup) restore() error {
+	if err := removeMaterializationTarget(backup.root, backup.target); err != nil {
+		return fmt.Errorf("remove current %q: %w", backup.target, err)
+	}
+	if !backup.existed {
+		return nil
+	}
+	if backup.directory {
+		if err := backup.root.MkdirAll(backup.target, backup.mode); err != nil {
+			return fmt.Errorf("restore directory %q: %w", backup.target, err)
+		}
+		if err := backup.root.Chmod(backup.target, backup.mode); err != nil {
+			return fmt.Errorf("restore directory mode %q: %w", backup.target, err)
+		}
+		if len(backup.files) == 0 {
+			return nil
+		}
+		if err := writeMaterializedDirectory(backup.root, backup.target, backup.files); err != nil {
+			return fmt.Errorf("restore directory contents %q: %w", backup.target, err)
+		}
+		return backup.root.Chmod(backup.target, backup.mode)
+	}
+	if err := writeMaterializedFile(backup.root, backup.target, backup.content, backup.mode, true); err != nil {
+		return fmt.Errorf("restore file %q: %w", backup.target, err)
+	}
+	return nil
+}
+
+func removeMaterializationTarget(root *os.Root, target string) error {
+	info, err := root.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.IsDir() {
+		return root.RemoveAll(target)
+	}
+	return root.Remove(target)
+}
+
+func materializationApprovalPolicy(item ProfileMaterialization) (bool, string) {
+	switch item.Kind {
+	case domain.ComponentHook, domain.ComponentExtension:
+		return true, "hook and extension Components require explicit consent"
+	case domain.ComponentPermissionPolicy:
+		return true, "permission-policy Component requires explicit consent"
+	case domain.ComponentIntegration:
+		return true, "integration Component requires explicit consent"
+	}
+	if item.TrustClass == domain.TrustPermission {
+		return true, "permission Component requires explicit consent"
+	}
+	return false, ""
+}
+
+func approvalGranted(markers map[string]ApprovalMarker, item ProfileMaterialization) bool {
+	marker, ok := markers[item.ComponentID]
+	if !ok || marker.ComponentID != item.ComponentID || marker.ComponentDigest != item.ComponentDigest {
+		return false
+	}
+	if marker.LockID != "" && marker.LockID != item.LockID {
+		return false
+	}
+	if marker.LockDigest != "" && marker.LockDigest != item.LockDigest {
+		return false
+	}
+	return marker.LockID != "" || marker.LockDigest != ""
+}
+
+func prepareProfileMaterialization(batch ProfileMaterializationBatch, roots map[MaterializationRoot]*os.Root, item ProfileMaterialization) (plannedProfileMaterialization, error) {
+	if item.ContentDigest == "" {
 		operation, observed, err := planRemovedMaterialization(batch, roots, item)
-		return plannedProfileMaterialization{
-			result: materializationResult(item, operation, item.LastAppliedDigest, observed),
-			root:   roots[item.Root],
-		}, err
+		return plannedProfileMaterialization{result: materializationResult(item, operation, item.LastAppliedDigest, observed), root: roots[item.Root], directory: materializationIsDirectory(item)}, err
 	}
 	if item.Mode == MaterializationReferenced {
 		operation, err := planReferencedMaterialization(item, batch.Intent)
-		return plannedProfileMaterialization{
-			result: materializationResult(item, operation, item.LastAppliedDigest, item.ObservedDigest),
-		}, err
+		return plannedProfileMaterialization{result: materializationResult(item, operation, item.LastAppliedDigest, item.ObservedDigest)}, err
 	}
 	if item.Mode != MaterializationManaged && item.Mode != MaterializationSeeded {
 		return plannedProfileMaterialization{}, fmt.Errorf("unsupported mode %q", item.Mode)
+	}
+	if item.Scope == domain.ScopeProject && item.Mode != MaterializationSeeded {
+		return plannedProfileMaterialization{}, errors.New("project-scope materialization must be seeded")
 	}
 	if err := validateDesiredMaterialization(item); err != nil {
 		return plannedProfileMaterialization{}, err
@@ -155,7 +476,12 @@ func prepareProfileMaterialization(
 	if err != nil {
 		return plannedProfileMaterialization{}, err
 	}
-	observed, err := observeMaterializedFile(root, item.Target, item.Artifact.Selector)
+	selector := item.Selector
+	if selector == "" {
+		selector = "$"
+	}
+	directory := materializationIsDirectory(item)
+	observed, err := observeMaterialization(root, item.Target, selector, directory)
 	if err != nil {
 		return plannedProfileMaterialization{}, fmt.Errorf("observe: %w", err)
 	}
@@ -163,10 +489,24 @@ func prepareProfileMaterialization(
 		return plannedProfileMaterialization{}, fmt.Errorf("%w: observation changed", ErrProfileMaterializationBlocked)
 	}
 	operation, err := planFileMaterialization(item, observed, batch.Intent)
+	if err == nil && operation == profile.OperationSkip && item.EffectiveCacheKeyChanged {
+		operation = profile.OperationUpdate
+	}
 	return plannedProfileMaterialization{
-		result: materializationResult(item, operation, item.LastAppliedDigest, observed),
-		root:   root, content: append([]byte(nil), item.Artifact.Content...), mode: os.FileMode(item.Artifact.Mode),
+		result: materializationResult(item, operation, item.LastAppliedDigest, observed), root: root,
+		content: append([]byte(nil), item.Content...), mode: materializationMode(item),
+		files: cloneMaterializationFiles(item.Files), directory: directory,
 	}, err
+}
+
+func materializationMode(item ProfileMaterialization) os.FileMode {
+	if !materializationIsDirectory(item) {
+		if item.FileMode != 0 {
+			return item.FileMode
+		}
+		return 0o600
+	}
+	return 0o700
 }
 
 func (plan plannedProfileMaterialization) blocked() bool {
@@ -183,12 +523,14 @@ func (plan *plannedProfileMaterialization) apply() error {
 		plan.result.ObservedDigest = ""
 		return nil
 	}
-	observed, err := observeMaterializedFile(plan.root, plan.result.Target, plan.result.Selector)
+	observed, err := observeMaterialization(plan.root, plan.result.Target, plan.result.Selector, plan.directory)
 	if err != nil || observed != plan.result.ObservedDigest {
 		return fmt.Errorf("%w: observation for %q changed before mutation", ErrProfileMaterializationBlocked, plan.result.ID)
 	}
 	if operation == profile.OperationRemove {
-		if plan.result.Selector == "$" {
+		if plan.directory {
+			err = plan.root.RemoveAll(plan.result.Target)
+		} else if plan.result.Selector == "$" {
 			err = plan.root.Remove(plan.result.Target)
 		} else {
 			err = removeJSONSelection(plan.root, plan.result.Target, plan.result.Selector)
@@ -200,19 +542,25 @@ func (plan *plannedProfileMaterialization) apply() error {
 		plan.result.ObservedDigest = ""
 		return nil
 	}
-	content := plan.content
-	if plan.result.Selector != "$" {
-		content, err = mergeJSONSelection(plan.root, plan.result.Target, plan.result.Selector, content)
-		if err != nil {
-			return fmt.Errorf("merge %q: %w", plan.result.ID, err)
+	if plan.directory {
+		if err := writeMaterializedDirectory(plan.root, plan.result.Target, plan.files); err != nil {
+			return fmt.Errorf("%s %q: %w", operation, plan.result.ID, err)
 		}
-	}
-	exists, err := materializedFileExists(plan.root, plan.result.Target)
-	if err != nil {
-		return fmt.Errorf("inspect %q before mutation: %w", plan.result.ID, err)
-	}
-	if err := writeMaterializedFile(plan.root, plan.result.Target, content, plan.mode, !exists); err != nil {
-		return fmt.Errorf("%s %q: %w", operation, plan.result.ID, err)
+	} else {
+		content := plan.content
+		if plan.result.Selector != "$" {
+			content, err = mergeJSONSelection(plan.root, plan.result.Target, plan.result.Selector, content)
+			if err != nil {
+				return fmt.Errorf("merge %q: %w", plan.result.ID, err)
+			}
+		}
+		exists, err := materializedFileExists(plan.root, plan.result.Target)
+		if err != nil {
+			return fmt.Errorf("inspect %q before mutation: %w", plan.result.ID, err)
+		}
+		if err := writeMaterializedFile(plan.root, plan.result.Target, content, plan.mode, !exists); err != nil {
+			return fmt.Errorf("%s %q: %w", operation, plan.result.ID, err)
+		}
 	}
 	plan.result.LastAppliedDigest = plan.result.DesiredDigest
 	plan.result.ObservedDigest = plan.result.DesiredDigest
@@ -228,11 +576,13 @@ func materializationResults(plans []plannedProfileMaterialization) []ProfileMate
 }
 
 func recordMaterializationOwnership(owned map[string][]string, item ProfileMaterialization) error {
-	selector := materializationSelector(item)
+	selector := item.Selector
+	if selector == "" || materializationIsDirectory(item) {
+		selector = "$"
+	}
 	key := string(item.Root) + "\x00" + item.Target
 	for _, existing := range owned[key] {
-		overlaps := selector == existing || selector == "$" || existing == "$" ||
-			strings.HasPrefix(selector, existing+".") || strings.HasPrefix(existing, selector+".")
+		overlaps := selector == existing || selector == "$" || existing == "$" || strings.HasPrefix(selector, existing+".") || strings.HasPrefix(existing, selector+".")
 		if overlaps {
 			return fmt.Errorf("target %q has overlapping selectors %q and %q", item.Target, existing, selector)
 		}
@@ -241,11 +591,7 @@ func recordMaterializationOwnership(owned map[string][]string, item ProfileMater
 	return nil
 }
 
-func planRemovedMaterialization(
-	batch ProfileMaterializationBatch,
-	roots map[MaterializationRoot]*os.Root,
-	item ProfileMaterialization,
-) (profile.PlanOperation, string, error) {
+func planRemovedMaterialization(batch ProfileMaterializationBatch, roots map[MaterializationRoot]*os.Root, item ProfileMaterialization) (profile.PlanOperation, string, error) {
 	if err := validateRecordedMaterialization(item); err != nil {
 		return "", "", err
 	}
@@ -254,12 +600,13 @@ func planRemovedMaterialization(
 		return "", "", err
 	}
 	observed := item.ObservedDigest
+	directory := materializationIsDirectory(item)
 	if item.Mode != MaterializationReferenced {
 		root, err := batchMaterializationRoot(batch, roots, item.Root)
 		if err != nil {
 			return "", "", err
 		}
-		observed, err = observeMaterializedFile(root, item.Target, item.Selector)
+		observed, err = observeMaterialization(root, item.Target, item.Selector, directory)
 		if err != nil {
 			return "", "", err
 		}
@@ -290,11 +637,8 @@ func planRemovedMaterialization(
 }
 
 func validateRecordedMaterialization(item ProfileMaterialization) error {
-	if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.ArtifactID) == "" {
+	if strings.TrimSpace(item.ID) == "" {
 		return errors.New("materialization identity is required")
-	}
-	if item.ContentSize != 0 {
-		return errors.New("removed materialization cannot contain content metadata")
 	}
 	if err := validateMaterializationTarget(item.Target); err != nil {
 		return err
@@ -315,7 +659,7 @@ func planReferencedMaterialization(item ProfileMaterialization, intent profile.P
 	if err := validateReferencedMaterialization(item); err != nil {
 		return "", err
 	}
-	desired, err := materializationDigestState(item.Artifact.ContentDigest)
+	desired, err := materializationDigestState(item.ContentDigest)
 	if err != nil {
 		return "", err
 	}
@@ -331,26 +675,23 @@ func planReferencedMaterialization(item ProfileMaterialization, intent profile.P
 }
 
 func validateReferencedMaterialization(item ProfileMaterialization) error {
-	if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.ArtifactID) == "" {
+	if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.ComponentID) == "" {
 		return errors.New("materialization identity is required")
 	}
-	if len(item.Artifact.Content) != 0 || item.ContentSize != 0 || item.LastAppliedDigest != "" {
+	if len(item.Content) != 0 || len(item.Files) != 0 || item.ContentSize != 0 || item.LastAppliedDigest != "" {
 		return fmt.Errorf("referenced materialization %q must contain metadata only", item.ID)
 	}
-	if !profileSHA256.MatchString(item.Artifact.ContentDigest) {
+	if !profileSHA256.MatchString(item.ContentDigest) {
 		return fmt.Errorf("referenced materialization %q digest is invalid", item.ID)
 	}
 	if err := validateMaterializationTarget(item.Target); err != nil {
 		return fmt.Errorf("referenced materialization %q: %w", item.ID, err)
 	}
-	if item.Artifact.Path != item.Target || item.Artifact.Selector != "$" || item.Artifact.SourceLocator != item.Target+"#$" {
-		return fmt.Errorf("referenced materialization %q metadata is inconsistent", item.ID)
-	}
 	return nil
 }
 
 func planFileMaterialization(item ProfileMaterialization, observed string, intent profile.PlanIntent) (profile.PlanOperation, error) {
-	desired, err := materializationDigestState(item.Artifact.ContentDigest)
+	desired, err := materializationDigestState(item.ContentDigest)
 	if err != nil {
 		return "", err
 	}
@@ -375,45 +716,53 @@ func planFileMaterialization(item ProfileMaterialization, observed string, inten
 }
 
 func validateDesiredMaterialization(item ProfileMaterialization) error {
-	if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.ArtifactID) == "" {
+	if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.ComponentID) == "" {
 		return errors.New("materialization identity is required")
 	}
-	if err := validateProfileArtifactKind(*item.Artifact); err != nil {
-		return fmt.Errorf("materialization %q: %w", item.ID, err)
+	if !item.Kind.Valid() {
+		return fmt.Errorf("materialization %q has invalid Component type %q", item.ID, item.Kind)
 	}
-	if item.ContentSize < 0 || int64(len(item.Artifact.Content)) != item.ContentSize {
-		return fmt.Errorf("materialization %q content size mismatch", item.ID)
+	if item.ContentSize < 0 {
+		return fmt.Errorf("materialization %q content size is invalid", item.ID)
 	}
-	if !profileSHA256.MatchString(item.Artifact.ContentDigest) || materializationContentDigest(item.Artifact.Content) != item.Artifact.ContentDigest {
-		return fmt.Errorf("materialization %q content digest mismatch", item.ID)
+	if item.FileMode&^0o777 != 0 {
+		return fmt.Errorf("materialization %q file mode is invalid", item.ID)
 	}
-	if item.Artifact.Mode > 0o777 {
-		return fmt.Errorf("materialization %q mode is invalid", item.ID)
+	if !materializationIsDirectory(item) {
+		if int64(len(item.Content)) != item.ContentSize {
+			return fmt.Errorf("materialization %q content size mismatch", item.ID)
+		}
+		if !profileSHA256.MatchString(item.ContentDigest) || materializationContentDigest(item.Content) != item.ContentDigest {
+			return fmt.Errorf("materialization %q content digest mismatch", item.ID)
+		}
+	} else {
+		if len(item.Files) == 0 {
+			return fmt.Errorf("materialization %q directory plan has no files", item.ID)
+		}
+		if item.Selector != "" && item.Selector != "$" {
+			return fmt.Errorf("materialization %q directory plan cannot have a selector", item.ID)
+		}
+		if got := directoryMaterializationDigest(item.Files); !profileSHA256.MatchString(item.ContentDigest) || got != item.ContentDigest {
+			return fmt.Errorf("materialization %q directory digest mismatch", item.ID)
+		}
+		for _, file := range item.Files {
+			if err := validateMaterializationRelativePath(file.Path); err != nil {
+				return fmt.Errorf("materialization %q: %w", item.ID, err)
+			}
+			if file.Mode.Perm() != 0o644 && file.Mode.Perm() != 0o755 {
+				return fmt.Errorf("materialization %q file %q mode is invalid", item.ID, file.Path)
+			}
+		}
 	}
 	if err := validateMaterializationTarget(item.Target); err != nil {
 		return fmt.Errorf("materialization %q: %w", item.ID, err)
 	}
-	if item.Artifact.Path != item.Target || item.Artifact.SourceLocator != item.Target+"#"+item.Artifact.Selector {
-		return fmt.Errorf("materialization %q artifact target metadata is inconsistent", item.ID)
+	selector := item.Selector
+	if selector == "" {
+		selector = "$"
 	}
-	if err := validateMaterializationSelector(item.Target, item.Artifact.Selector, item.Artifact.Content); err != nil {
+	if err := validateMaterializationSelector(item.Target, selector, item.Content); err != nil && !materializationIsDirectory(item) {
 		return fmt.Errorf("materialization %q: %w", item.ID, err)
-	}
-	return nil
-}
-
-func validateProfileArtifactKind(artifact profile.Artifact) error {
-	kind := domain.ArtifactKind(artifact.Kind)
-	switch kind {
-	case domain.ArtifactAgentInstruction, domain.ArtifactCodexSettings, domain.ArtifactClaudeSettings,
-		domain.ArtifactShellPreferences, domain.ArtifactGitPreferences, domain.ArtifactSkillInstruction,
-		domain.ArtifactSkillExecutable:
-	default:
-		return fmt.Errorf("unsupported Profile Artifact kind %q", artifact.Kind)
-	}
-	executable := kind == domain.ArtifactShellPreferences || kind == domain.ArtifactSkillExecutable
-	if artifact.ContainsExecutable != executable {
-		return errors.New("Profile Artifact executable classification is inconsistent")
 	}
 	return nil
 }
@@ -423,27 +772,22 @@ func validateMaterializationSelector(target, selector string, content []byte) er
 		return err
 	}
 	if selector == "$" {
-		if filepath.Ext(target) == ".json" && !json.Valid(content) {
-			return errors.New("JSON artifact has invalid syntax")
+		if filepathExt(target) == ".json" && !json.Valid(content) {
+			return errors.New("JSON component has invalid syntax")
 		}
 		return nil
 	}
-	if filepath.Ext(target) != ".json" || !strings.HasPrefix(selector, "$.") || !json.Valid(content) {
+	if filepathExt(target) != ".json" || !json.Valid(content) {
 		return fmt.Errorf("selector %q is unsupported", selector)
-	}
-	for _, field := range strings.Split(strings.TrimPrefix(selector, "$."), ".") {
-		if field == "" {
-			return fmt.Errorf("selector %q is unsupported", selector)
-		}
 	}
 	return nil
 }
 
 func validateMaterializationSelectorSyntax(target, selector string) error {
-	if selector == "$" {
+	if selector == "" || selector == "$" {
 		return nil
 	}
-	if filepath.Ext(target) != ".json" || !strings.HasPrefix(selector, "$.") {
+	if filepathExt(target) != ".json" || !strings.HasPrefix(selector, "$.") {
 		return fmt.Errorf("selector %q is unsupported", selector)
 	}
 	for _, field := range strings.Split(strings.TrimPrefix(selector, "$."), ".") {
@@ -454,13 +798,27 @@ func validateMaterializationSelectorSyntax(target, selector string) error {
 	return nil
 }
 
+func filepathExt(name string) string {
+	index := strings.LastIndexByte(name, '.')
+	if index < 0 || strings.Contains(name[index:], "/") {
+		return ""
+	}
+	return name[index:]
+}
+
 func validateMaterializationTarget(target string) error {
 	clean := path.Clean(target)
-	unsafe := target == "" || target == "." || clean != target || path.IsAbs(target) ||
-		clean == ".." || strings.HasPrefix(clean, "../") || strings.ContainsAny(target, "\\\x00") ||
-		strings.IndexFunc(target, unicode.IsControl) >= 0
+	unsafe := target == "" || target == "." || clean != target || path.IsAbs(target) || clean == ".." || strings.HasPrefix(clean, "../") || strings.ContainsAny(target, "\\\x00") || strings.IndexFunc(target, unicode.IsControl) >= 0
 	if unsafe {
 		return fmt.Errorf("target %q escapes its State Component root", target)
+	}
+	return nil
+}
+
+func validateMaterializationRelativePath(name string) error {
+	clean := path.Clean(name)
+	if name == "" || clean != name || path.IsAbs(name) || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.ContainsAny(name, "\\\x00") || strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("file path %q escapes its native target", name)
 	}
 	return nil
 }
@@ -476,11 +834,7 @@ func materializationRoot(batch ProfileMaterializationBatch, root Materialization
 	}
 }
 
-func batchMaterializationRoot(
-	batch ProfileMaterializationBatch,
-	roots map[MaterializationRoot]*os.Root,
-	stateComponent MaterializationRoot,
-) (*os.Root, error) {
+func batchMaterializationRoot(batch ProfileMaterializationBatch, roots map[MaterializationRoot]*os.Root, stateComponent MaterializationRoot) (*os.Root, error) {
 	if root := roots[stateComponent]; root != nil {
 		return root, nil
 	}
@@ -497,8 +851,8 @@ func batchMaterializationRoot(
 }
 
 func openMaterializationRoot(rootPath string) (*os.Root, error) {
-	if !filepath.IsAbs(rootPath) {
-		return nil, errors.New("State Component root must be absolute")
+	if !strings.HasPrefix(rootPath, "/") || path.Clean(rootPath) != rootPath {
+		return nil, errors.New("State Component root must be an absolute clean path")
 	}
 	info, err := os.Lstat(rootPath)
 	if err != nil {
@@ -526,11 +880,11 @@ func writeMaterializedFile(root *os.Root, target string, content []byte, mode os
 			return err
 		}
 	}
-	name, err := randomMaterializationName()
+	temporary, err := randomMaterializationName()
 	if err != nil {
 		return err
 	}
-	temporary := path.Join(directory, name)
+	temporary = path.Join(directory, temporary)
 	file, err := root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
@@ -557,18 +911,108 @@ func writeMaterializedFile(root *os.Root, target string, content []byte, mode os
 	return root.Rename(temporary, target)
 }
 
+func writeMaterializedDirectory(root *os.Root, target string, files []MaterializationFile) error {
+	parent := path.Dir(target)
+	if parent != "." {
+		if err := root.MkdirAll(parent, 0o700); err != nil {
+			return err
+		}
+	}
+	temporary, err := randomMaterializationName()
+	if err != nil {
+		return err
+	}
+	temporary = path.Join(parent, temporary)
+	if err := root.Mkdir(temporary, 0o700); err != nil {
+		return err
+	}
+	defer root.RemoveAll(temporary)
+	for _, file := range files {
+		if err := writeMaterializedFile(root, path.Join(temporary, file.Path), file.Content, file.Mode, true); err != nil {
+			return err
+		}
+	}
+	info, err := root.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return root.Rename(temporary, target)
+	}
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("directory target is not a safe directory")
+	}
+	backup, err := randomMaterializationName()
+	if err != nil {
+		return err
+	}
+	backup = path.Join(parent, backup)
+	if err := root.Rename(target, backup); err != nil {
+		return err
+	}
+	if err := root.Rename(temporary, target); err != nil {
+		_ = root.Rename(backup, target)
+		return err
+	}
+	return root.RemoveAll(backup)
+}
+
+func observeMaterialization(root *os.Root, target, selector string, directory bool) (string, error) {
+	if directory {
+		return observeMaterializedDirectory(root, target)
+	}
+	return observeMaterializedFile(root, target, selector)
+}
+
 func observeMaterializedFile(root *os.Root, target, selector string) (string, error) {
 	content, exists, err := readMaterializedFile(root, target)
 	if err != nil || !exists {
 		return "", err
 	}
-	if selector != "$" {
+	if selector != "" && selector != "$" {
 		content, exists, err = selectJSON(content, selector)
 		if err != nil || !exists {
 			return "", err
 		}
 	}
 	return materializationContentDigest(content), nil
+}
+
+func observeMaterializedDirectory(root *os.Root, target string) (string, error) {
+	info, err := root.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("directory target is not a real directory")
+	}
+	files := make([]MaterializationFile, 0)
+	err = fs.WalkDir(root.FS(), target, func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if name == target || entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
+			return errors.New("directory target contains an unsafe entry")
+		}
+		relative := strings.TrimPrefix(name, target+"/")
+		content, err := root.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		fileInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		files = append(files, MaterializationFile{Path: relative, Content: content, Mode: fileInfo.Mode().Perm()})
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return directoryMaterializationDigest(files), nil
 }
 
 func readMaterializedFile(root *os.Root, target string) ([]byte, bool, error) {
@@ -717,13 +1161,6 @@ func materializedFileMode(root *os.Root, target string) (os.FileMode, error) {
 	return info.Mode().Perm(), nil
 }
 
-func materializationSelector(item ProfileMaterialization) string {
-	if item.Artifact != nil {
-		return item.Artifact.Selector
-	}
-	return item.Selector
-}
-
 func randomMaterializationName() (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
@@ -747,22 +1184,66 @@ func materializationContentDigest(content []byte) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
+func directoryMaterializationDigest(files []MaterializationFile) string {
+	ordered := cloneMaterializationFiles(files)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Path < ordered[j].Path })
+	hash := sha256.New()
+	for _, file := range ordered {
+		fmt.Fprintf(hash, "%s\x00%o\x00", file.Path, file.Mode.Perm())
+		hash.Write(file.Content)
+		hash.Write([]byte{0})
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func cloneMaterializationFiles(files []MaterializationFile) []MaterializationFile {
+	cloned := make([]MaterializationFile, len(files))
+	for index, file := range files {
+		cloned[index] = MaterializationFile{Path: file.Path, Content: append([]byte(nil), file.Content...), Mode: file.Mode}
+	}
+	return cloned
+}
+
+func materializationIsDirectory(item ProfileMaterialization) bool {
+	return item.Directory || len(item.Files) > 0
+}
+
+func materializationFilePaths(files []MaterializationFile) []string {
+	paths := make([]string, len(files))
+	for index, file := range files {
+		paths[index] = file.Path
+	}
+	sort.Strings(paths)
+	return paths
+}
+
 func materializationResult(item ProfileMaterialization, operation profile.PlanOperation, lastApplied, observed string) ProfileMaterializationResult {
-	adapter := materializationFileAdapter
+	adapter := item.AdapterID
+	if adapter == "" {
+		adapter = materializationFileAdapter
+	}
+	adapterVersion := item.AdapterVersion
+	if adapterVersion == "" {
+		adapterVersion = materializationAdapterVersion
+	}
 	if item.Mode == MaterializationReferenced {
 		adapter = materializationReferenceAdapter
 	}
 	selector := item.Selector
-	desired := ""
-	if item.Artifact != nil {
-		selector = item.Artifact.Selector
-		desired = item.Artifact.ContentDigest
+	if selector == "" {
+		selector = "$"
 	}
 	return ProfileMaterializationResult{
-		ID: item.ID, ArtifactID: item.ArtifactID, Mode: item.Mode,
-		Adapter: adapter, AdapterVersion: materializationAdapterVersion, Root: item.Root, Target: item.Target,
-		Selector: selector, DesiredDigest: desired,
-		LastAppliedDigest: lastApplied, ObservedDigest: observed, Operation: operation,
-		RequirementState: item.RequirementState,
+		ID: item.ID, LockID: item.LockID, LockDigest: item.LockDigest, CapsuleDigest: item.CapsuleDigest,
+		ComponentID: item.ComponentID, ComponentDigest: item.ComponentDigest,
+		Adapter: adapter, AdapterID: adapter, AdapterVersion: adapterVersion, TargetAgentVersion: item.TargetAgentVersion,
+		Scope: item.Scope, NonSecretOverridesDigest: item.NonSecretOverridesDigest,
+		SecretVersionIdentifiers: append([]string(nil), item.SecretVersionIdentifiers...), EffectiveCacheKey: item.EffectiveCacheKey,
+		Mode: item.Mode, Root: item.Root, Target: item.Target, Selector: selector,
+		Directory: materializationIsDirectory(item), FilePaths: append([]string(nil), item.FilePaths...),
+		DesiredDigest: item.ContentDigest, LastAppliedDigest: lastApplied, ObservedDigest: observed,
+		Operation: operation, RequirementState: item.RequirementState,
+		ApprovalRequired: item.ApprovalRequired, ApprovalReason: item.ApprovalReason,
+		CredentialRequirementDigest: item.CredentialRequirementDigest,
 	}
 }

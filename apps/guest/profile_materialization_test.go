@@ -11,22 +11,15 @@ import (
 	"testing"
 
 	"github.com/ahmedhesham6/sshai/apps/guest"
+	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 func TestManagedProfileMaterializationCreatesVerifiedContent(t *testing.T) {
 	home := t.TempDir()
 	content := []byte("Use Go.\n")
-	digest := materializationDigest(content)
-	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-		HomeRoot: home,
-		Intent:   profile.IntentReconcile,
-		Items: []guest.ProfileMaterialization{{
-			ID: "agents", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-			Root: guest.MaterializationHome, Target: "AGENTS.md", ContentSize: int64(len(content)),
-			Artifact: &profile.Artifact{Kind: "agent_instruction", Path: "AGENTS.md", Selector: "$", SourceLocator: "AGENTS.md#$", ContentDigest: digest, Mode: 0o640, Content: content},
-		}},
-	})
+	item := directFile("agents", "AGENTS.md", content, 0o640)
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 	if err != nil {
 		t.Fatalf("apply Profile Materializations: %v", err)
 	}
@@ -44,11 +37,12 @@ func TestManagedProfileMaterializationCreatesVerifiedContent(t *testing.T) {
 	if info.Mode().Perm() != 0o640 {
 		t.Fatalf("materialized mode = %o", info.Mode().Perm())
 	}
+	digest := materializationDigest(content)
 	if len(results) != 1 || results[0].Operation != profile.OperationCreate || results[0].LastAppliedDigest != digest || results[0].ObservedDigest != digest {
 		t.Fatalf("results = %#v", results)
 	}
 	result := results[0]
-	if result.ID != "agents" || result.ArtifactID != "artifact-1" || result.Mode != guest.MaterializationManaged || result.Adapter != "file" || result.AdapterVersion != "v1" || result.Root != guest.MaterializationHome || result.Target != "AGENTS.md" || result.Selector != "$" || result.DesiredDigest != digest {
+	if result.ID != "agents" || result.ComponentID != "agents" || result.Mode != guest.MaterializationManaged || result.Adapter != "file" || result.AdapterVersion != "v1" || result.Root != guest.MaterializationHome || result.Target != "AGENTS.md" || result.Selector != "$" || result.DesiredDigest != digest {
 		t.Fatalf("persistence result = %#v", result)
 	}
 }
@@ -93,26 +87,11 @@ func TestProfileMaterializationBatchFailsClosedOnDrift(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "AGENTS.md"), remote, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	desiredDigest := materializationDigest(desired)
 	second := []byte("second\n")
-	secondDigest := materializationDigest(second)
-	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-		HomeRoot: home,
-		Intent:   profile.IntentReconcile,
-		Items: []guest.ProfileMaterialization{
-			{
-				ID: "drifted", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-				Root: guest.MaterializationHome, Target: "AGENTS.md", ContentSize: int64(len(desired)),
-				LastAppliedDigest: desiredDigest, ObservedDigest: materializationDigest(remote),
-				Artifact: &profile.Artifact{Kind: "agent_instruction", Path: "AGENTS.md", Selector: "$", SourceLocator: "AGENTS.md#$", ContentDigest: desiredDigest, Mode: 0o600, Content: desired},
-			},
-			{
-				ID: "safe-create", ArtifactID: "artifact-2", Mode: guest.MaterializationManaged,
-				Root: guest.MaterializationHome, Target: "CLAUDE.md", ContentSize: int64(len(second)),
-				Artifact: &profile.Artifact{Kind: "agent_instruction", Path: "CLAUDE.md", Selector: "$", SourceLocator: "CLAUDE.md#$", ContentDigest: secondDigest, Mode: 0o600, Content: second},
-			},
-		},
-	})
+	first := directFile("drifted", "AGENTS.md", desired, 0o600)
+	first.LastAppliedDigest, first.ObservedDigest = materializationDigest(desired), materializationDigest(remote)
+	secondItem := directFile("safe-create", "CLAUDE.md", second, 0o600)
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{first, secondItem}})
 	if !errors.Is(err, guest.ErrProfileMaterializationBlocked) {
 		t.Fatalf("drift error = %v", err)
 	}
@@ -129,11 +108,8 @@ func TestSeededProfileMaterializationCreatesOnceThenTransfersOwnership(t *testin
 	home := t.TempDir()
 	seed := []byte("initial preference\n")
 	seedDigest := materializationDigest(seed)
-	item := guest.ProfileMaterialization{
-		ID: "shell", ArtifactID: "artifact-1", Mode: guest.MaterializationSeeded,
-		Root: guest.MaterializationHome, Target: ".bashrc", ContentSize: int64(len(seed)),
-		Artifact: &profile.Artifact{Kind: "shell_preferences", Path: ".bashrc", Selector: "$", SourceLocator: ".bashrc#$", ContentDigest: seedDigest, ContainsExecutable: true, Mode: 0o600, Content: seed},
-	}
+	item := directFile("shell", ".bashrc", seed, 0o600)
+	item.Mode = guest.MaterializationSeeded
 	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 	if err != nil || results[0].Operation != profile.OperationCreate {
 		t.Fatalf("seed create: results=%#v err=%v", results, err)
@@ -144,8 +120,8 @@ func TestSeededProfileMaterializationCreatesOnceThenTransfersOwnership(t *testin
 		t.Fatal(err)
 	}
 	changedSource := []byte("new Profile preference\n")
-	item.Artifact.Content = changedSource
-	item.Artifact.ContentDigest = materializationDigest(changedSource)
+	item.Content = changedSource
+	item.ContentDigest = materializationDigest(changedSource)
 	item.ContentSize = int64(len(changedSource))
 	item.LastAppliedDigest = seedDigest
 	item.ObservedDigest = materializationDigest(environmentOwned)
@@ -171,11 +147,7 @@ func TestSeededProfileMaterializationCreatesOnceThenTransfersOwnership(t *testin
 
 func TestReferencedProfileMaterializationRecordsRequirementWithoutCopyingContent(t *testing.T) {
 	requirementDigest := materializationDigest([]byte("github:repo"))
-	item := guest.ProfileMaterialization{
-		ID: "github", ArtifactID: "artifact-1", Mode: guest.MaterializationReferenced,
-		Target: "credential/github/repo", RequirementState: profile.RequirementNeedsInput,
-		Artifact: &profile.Artifact{Path: "credential/github/repo", Selector: "$", SourceLocator: "credential/github/repo#$", ContentDigest: requirementDigest},
-	}
+	item := guest.ProfileMaterialization{ID: "github", ComponentID: "github", Mode: guest.MaterializationReferenced, Target: "credential/github/repo", ContentDigest: requirementDigest, RequirementState: profile.RequirementNeedsInput}
 	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 	if !errors.Is(err, guest.ErrProfileMaterializationBlocked) {
 		t.Fatalf("unbound requirement error = %v", err)
@@ -202,11 +174,7 @@ func TestRemovedProfileArtifactIsOrphanedUntilExplicitPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := materializationDigest(content)
-	item := guest.ProfileMaterialization{
-		ID: "agents", ArtifactID: "artifact-old", Mode: guest.MaterializationManaged,
-		Root: guest.MaterializationHome, Target: "AGENTS.md", Selector: "$",
-		LastAppliedDigest: digest, ObservedDigest: digest,
-	}
+	item := guest.ProfileMaterialization{ID: "agents", ComponentID: "agents", Mode: guest.MaterializationManaged, Root: guest.MaterializationHome, Target: "AGENTS.md", Selector: "$", LastAppliedDigest: digest, ObservedDigest: digest}
 	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationOrphan {
 		t.Fatalf("orphan reconcile: results=%#v err=%v", results, err)
@@ -221,11 +189,7 @@ func TestRemovedProfileArtifactIsOrphanedUntilExplicitPrune(t *testing.T) {
 		t.Fatalf("pruned target still exists: %v", err)
 	}
 
-	reference := guest.ProfileMaterialization{
-		ID: "github", ArtifactID: "artifact-reference", Mode: guest.MaterializationReferenced,
-		Target: "credential/github/repo", Selector: "$", ObservedDigest: digest,
-		RequirementState: profile.RequirementBound,
-	}
+	reference := guest.ProfileMaterialization{ID: "github", ComponentID: "github", Mode: guest.MaterializationReferenced, Target: "credential/github/repo", ObservedDigest: digest, RequirementState: profile.RequirementBound}
 	results, err = guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{reference}})
 	if err != nil || results[0].Operation != profile.OperationOrphan || results[0].Adapter != "reference" {
 		t.Fatalf("referenced orphan: results=%#v err=%v", results, err)
@@ -247,16 +211,10 @@ func TestJSONSelectorMaterializationPreservesUnknownFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	desired := []byte(`"dark"`)
-	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-		HomeRoot: home,
-		Intent:   profile.IntentReconcile,
-		Items: []guest.ProfileMaterialization{{
-			ID: "claude-theme", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-			Root: guest.MaterializationHome, Target: ".claude/settings.json", ContentSize: int64(len(desired)),
-			LastAppliedDigest: materializationDigest([]byte(`"light"`)), ObservedDigest: materializationDigest([]byte(`"light"`)),
-			Artifact: &profile.Artifact{Kind: "claude_settings", Path: ".claude/settings.json", Selector: "$.theme", SourceLocator: ".claude/settings.json#$.theme", ContentDigest: materializationDigest(desired), Mode: 0o600, Content: desired},
-		}},
-	})
+	item := directFile("claude-theme", ".claude/settings.json", desired, 0o600)
+	item.Selector = "$.theme"
+	item.LastAppliedDigest, item.ObservedDigest = materializationDigest([]byte(`"light"`)), materializationDigest([]byte(`"light"`))
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationUpdate {
 		t.Fatalf("JSON selector update: results=%#v err=%v", results, err)
 	}
@@ -288,18 +246,9 @@ func TestProfileMaterializationRejectsTraversalAndSymlinkEscapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := []byte("must stay inside\n")
-	digest := materializationDigest(content)
 	for _, target := range []string{"../outside", "escape/config"} {
 		t.Run(target, func(t *testing.T) {
-			_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-				HomeRoot: home,
-				Intent:   profile.IntentReconcile,
-				Items: []guest.ProfileMaterialization{{
-					ID: "unsafe", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-					Root: guest.MaterializationHome, Target: target, ContentSize: int64(len(content)),
-					Artifact: &profile.Artifact{Kind: "agent_instruction", Path: target, Selector: "$", SourceLocator: target + "#$", ContentDigest: digest, Mode: 0o600, Content: content},
-				}},
-			})
+			_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{directFile("unsafe", target, content, 0o600)}})
 			if err == nil {
 				t.Fatal("unsafe target was accepted")
 			}
@@ -332,15 +281,8 @@ func TestPruningJSONSelectorPreservesUnmanagedFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	themeDigest := materializationDigest([]byte(`"dark"`))
-	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-		HomeRoot: home,
-		Intent:   profile.IntentPrune,
-		Items: []guest.ProfileMaterialization{{
-			ID: "claude-theme", ArtifactID: "artifact-old", Mode: guest.MaterializationManaged,
-			Root: guest.MaterializationHome, Target: ".claude/settings.json", Selector: "$.theme",
-			LastAppliedDigest: themeDigest, ObservedDigest: themeDigest,
-		}},
-	})
+	item := guest.ProfileMaterialization{ID: "claude-theme", ComponentID: "claude-theme", Mode: guest.MaterializationManaged, Root: guest.MaterializationHome, Target: ".claude/settings.json", Selector: "$.theme", LastAppliedDigest: themeDigest, ObservedDigest: themeDigest}
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentPrune, Items: []guest.ProfileMaterialization{item}})
 	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationRemove {
 		t.Fatalf("selector prune: results=%#v err=%v", results, err)
 	}
@@ -356,11 +298,8 @@ func TestPruningJSONSelectorPreservesUnmanagedFields(t *testing.T) {
 		t.Fatalf("selector prune changed unmanaged fields: %#v", settings)
 	}
 	info, err := os.Stat(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o640 {
-		t.Fatalf("selector prune changed mode to %o", info.Mode().Perm())
+	if err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("selector prune changed mode/error: %v/%v", info, err)
 	}
 }
 
@@ -379,20 +318,14 @@ func TestProfileMaterializationVerifiesDeclaredContentBeforeMutation(t *testing.
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			home := t.TempDir()
-			_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-				HomeRoot: home,
-				Intent:   profile.IntentReconcile,
-				Items: []guest.ProfileMaterialization{{
-					ID: "invalid", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-					Root: guest.MaterializationHome, Target: test.target, ContentSize: test.size,
-					Artifact: &profile.Artifact{Kind: "agent_instruction", Path: test.target, Selector: "$", SourceLocator: test.target + "#$", ContentDigest: test.digest, Mode: 0o600, Content: test.content},
-				}},
-			})
+			item := directFile("invalid", test.target, test.content, 0o600)
+			item.ContentSize, item.ContentDigest = test.size, test.digest
+			_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 			if err == nil {
-				t.Fatal("invalid artifact was accepted")
+				t.Fatal("invalid component was accepted")
 			}
 			if _, err := os.Stat(filepath.Join(home, filepath.FromSlash(test.target))); !os.IsNotExist(err) {
-				t.Fatalf("invalid artifact mutated its target: %v", err)
+				t.Fatalf("invalid component mutated its target: %v", err)
 			}
 		})
 	}
@@ -402,63 +335,56 @@ func TestProfileMaterializationNeverExecutesSelectedExecutableContent(t *testing
 	home := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "executed")
 	script := []byte("#!/bin/sh\ntouch " + marker + "\n")
-	target := ".codex/skills/danger/scripts/run.sh"
-	digest := materializationDigest(script)
-	_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-		HomeRoot: home,
-		Intent:   profile.IntentReconcile,
-		Items: []guest.ProfileMaterialization{{
-			ID: "skill-script", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-			Root: guest.MaterializationHome, Target: target, ContentSize: int64(len(script)),
-			Artifact: &profile.Artifact{Kind: "agent_skill_executable", Path: target, Selector: "$", SourceLocator: target + "#$", ContentDigest: digest, ContainsExecutable: true, Mode: 0o755, Content: script},
-		}},
-	})
-	if err != nil {
+	item := directFile("skill-script", ".codex/skills/danger/scripts/run.sh", script, 0o755)
+	item.Kind, item.TrustClass = domain.ComponentSkill, domain.TrustExecutable
+	if _, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}}); err != nil {
 		t.Fatalf("materialize reviewed executable content: %v", err)
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("executable content ran during synchronization: %v", err)
 	}
-	info, err := os.Stat(filepath.Join(home, filepath.FromSlash(target)))
+	info, err := os.Stat(filepath.Join(home, ".codex/skills/danger/scripts/run.sh"))
 	if err != nil || info.Mode().Perm() != 0o755 {
 		t.Fatalf("materialized executable metadata: info=%v err=%v", info, err)
+	}
+}
+
+func TestHookMaterializationRequiresConsentEvenWhenDeclaredDeclarative(t *testing.T) {
+	home := t.TempDir()
+	item := directFile("hook:format", ".claude/settings.json", []byte(`{"hooks":[]}`), 0o600)
+	item.Kind = domain.ComponentHook
+	item.TrustClass = domain.TrustDeclarative
+	_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
+		HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item},
+	})
+	if !errors.Is(err, guest.ErrProfileMaterializationBlocked) {
+		t.Fatalf("declarative hook materialization error = %v; want consent gate", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".claude/settings.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("declarative hook was materialized: %v", statErr)
 	}
 }
 
 func TestProfileMaterializationRejectsUnknownPluginArtifacts(t *testing.T) {
 	home := t.TempDir()
 	content := []byte("plugin payload")
-	target := ".codex/plugins/unknown/plugin.sh"
-	_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-		HomeRoot: home,
-		Intent:   profile.IntentReconcile,
-		Items: []guest.ProfileMaterialization{{
-			ID: "plugin", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-			Root: guest.MaterializationHome, Target: target, ContentSize: int64(len(content)),
-			Artifact: &profile.Artifact{Path: target, Selector: "$", SourceLocator: target + "#$", ContentDigest: materializationDigest(content), ContainsExecutable: true, Mode: 0o755, Content: content},
-		}},
-	})
+	item := directFile("plugin", ".codex/plugins/unknown/plugin.sh", content, 0o755)
+	item.Kind = domain.ComponentType("")
+	_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 	if err == nil {
-		t.Fatal("unknown plugin artifact was accepted")
+		t.Fatal("unknown plugin component was accepted")
 	}
-	if _, err := os.Stat(filepath.Join(home, filepath.FromSlash(target))); !os.IsNotExist(err) {
-		t.Fatalf("unknown plugin artifact was materialized: %v", err)
+	if _, err := os.Stat(filepath.Join(home, ".codex/plugins/unknown/plugin.sh")); !os.IsNotExist(err) {
+		t.Fatalf("unknown plugin component was materialized: %v", err)
 	}
 }
 
 func TestProfileMaterializationRejectsDuplicateTargetOwnershipBeforeMutation(t *testing.T) {
 	home := t.TempDir()
 	content := []byte("same target\n")
-	digest := materializationDigest(content)
-	items := make([]guest.ProfileMaterialization, 2)
-	for index := range items {
-		items[index] = guest.ProfileMaterialization{
-			ID: "owner-" + string(rune('a'+index)), ArtifactID: "artifact-" + string(rune('a'+index)),
-			Mode: guest.MaterializationManaged, Root: guest.MaterializationHome, Target: "AGENTS.md", ContentSize: int64(len(content)),
-			Artifact: &profile.Artifact{Kind: "agent_instruction", Path: "AGENTS.md", Selector: "$", SourceLocator: "AGENTS.md#$", ContentDigest: digest, Mode: 0o600, Content: content},
-		}
-	}
-	_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: items})
+	first := directFile("owner-a", "AGENTS.md", content, 0o600)
+	second := directFile("owner-b", "AGENTS.md", content, 0o600)
+	_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{first, second}})
 	if err == nil {
 		t.Fatal("duplicate target ownership was accepted")
 	}
@@ -469,17 +395,14 @@ func TestProfileMaterializationRejectsDuplicateTargetOwnershipBeforeMutation(t *
 
 func applyManagedArtifact(t *testing.T, home string, content []byte, lastApplied, observed string) ([]guest.ProfileMaterializationResult, error) {
 	t.Helper()
+	item := directFile("agents", "AGENTS.md", content, 0o600)
+	item.LastAppliedDigest, item.ObservedDigest = lastApplied, observed
+	return guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
+}
+
+func directFile(id, target string, content []byte, mode os.FileMode) guest.ProfileMaterialization {
 	digest := materializationDigest(content)
-	return guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
-		HomeRoot: home,
-		Intent:   profile.IntentReconcile,
-		Items: []guest.ProfileMaterialization{{
-			ID: "agents", ArtifactID: "artifact-1", Mode: guest.MaterializationManaged,
-			Root: guest.MaterializationHome, Target: "AGENTS.md", ContentSize: int64(len(content)),
-			LastAppliedDigest: lastApplied, ObservedDigest: observed,
-			Artifact: &profile.Artifact{Kind: "agent_instruction", Path: "AGENTS.md", Selector: "$", SourceLocator: "AGENTS.md#$", ContentDigest: digest, Mode: 0o600, Content: content},
-		}},
-	})
+	return guest.ProfileMaterialization{ID: id, ComponentID: id, Kind: domain.ComponentConfig, Scope: domain.ScopeUser, TrustClass: domain.TrustDeclarative, Mode: guest.MaterializationManaged, Root: guest.MaterializationHome, Target: target, Selector: "$", ContentSize: int64(len(content)), ContentDigest: digest, Content: append([]byte(nil), content...), FileMode: mode}
 }
 
 func assertMaterializedContent(t *testing.T, target string, want []byte) {
