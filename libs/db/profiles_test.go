@@ -46,31 +46,26 @@ func TestStorePublishesProfileVersionIdempotentlyAndOwnerScoped(t *testing.T) {
 		t.Fatalf("create Profile: %v", err)
 	}
 
-	first, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("version-1", "artifact-1", 'a', now), "publish-key")
+	first, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("version-1", "registry.example.com/team/base:stable", 'a', now), "publish-key")
 	if err != nil {
 		t.Fatalf("PublishProfileVersion(): %v", err)
 	}
-	replayed, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("unused-version", "unused-artifact", 'a', now.Add(time.Minute)), "publish-key")
+	replayed, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("unused-version", "registry.example.com/team/base:stable", 'a', now.Add(time.Minute)), "publish-key")
 	if err != nil {
 		t.Fatalf("PublishProfileVersion() replay: %v", err)
 	}
-	if replayed.Snapshot().ID != first.Snapshot().ID || replayed.Snapshot().Artifacts[0].ID != "artifact-1" || replayed.Snapshot().Artifacts[0].SizeBytes != 42 || replayed.Snapshot().Artifacts[0].Mode != 0o640 {
+	replayedSnapshot := replayed.Snapshot()
+	if replayedSnapshot.ID != first.Snapshot().ID || len(replayedSnapshot.CapsuleRefs) != 1 || replayedSnapshot.CapsuleRefs[0].Ref != "registry.example.com/team/base:stable" || replayedSnapshot.CapsuleRefs[0].FreshnessPolicy != domain.FreshnessReview || len(replayedSnapshot.CapsuleRefs[0].Exclusions) != 2 || replayedSnapshot.CapsuleRefs[0].Exclusions[0] != "config:editor" || replayedSnapshot.CapsuleRefs[0].Exclusions[1] != "skill:debug" {
 		t.Fatalf("replayed Profile Version = %#v, want original %#v", replayed.Snapshot(), first.Snapshot())
 	}
-	if _, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("conflict-version", "conflict-artifact", 'f', now), "publish-key"); !errors.Is(err, dbstore.ErrIdempotencyConflict) {
+	if _, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("conflict-version", "registry.example.com/team/other:stable", 'f', now), "publish-key"); !errors.Is(err, dbstore.ErrIdempotencyConflict) {
 		t.Fatalf("conflicting replay error = %v", err)
 	}
-	sizeConflict := publication("unused-size-version", "unused-size-artifact", 'a', now)
-	sizeConflict.Artifacts[0].SizeBytes++
-	if _, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, sizeConflict, "publish-key"); !errors.Is(err, dbstore.ErrIdempotencyConflict) {
-		t.Fatalf("size-only replay conflict error = %v", err)
+	refConflict := publication("unused-ref-version", "registry.example.com/team/other:stable", 'a', now)
+	if _, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, refConflict, "publish-key"); !errors.Is(err, dbstore.ErrIdempotencyConflict) {
+		t.Fatalf("ref-only replay conflict error = %v", err)
 	}
-	modeConflict := publication("unused-mode-version", "unused-mode-artifact", 'a', now)
-	modeConflict.Artifacts[0].Mode = 0o600
-	if _, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, modeConflict, "publish-key"); !errors.Is(err, dbstore.ErrIdempotencyConflict) {
-		t.Fatalf("mode-only replay conflict error = %v", err)
-	}
-	if _, err := store.PublishProfileVersion(ctx, "user-2", "profile-1", nil, publication("hidden-version", "hidden-artifact", 'b', now), "hidden-key"); !errors.Is(err, dbstore.ErrReferenceNotOwned) {
+	if _, err := store.PublishProfileVersion(ctx, "user-2", "profile-1", nil, publication("hidden-version", "registry.example.com/team/base:stable", 'b', now), "hidden-key"); !errors.Is(err, dbstore.ErrReferenceNotOwned) {
 		t.Fatalf("cross-owner publication error = %v", err)
 	}
 }
@@ -83,7 +78,7 @@ func TestStoreSerializesProfileHeadPublication(t *testing.T) {
 	if _, err := store.CreateProfile(ctx, newProfile(t, "profile-1", "user-1", "Personal", "personal", now), "create-key"); err != nil {
 		t.Fatalf("create Profile: %v", err)
 	}
-	first, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("version-1", "artifact-1", 'a', now), "first-key")
+	first, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, publication("version-1", "registry.example.com/team/base:stable", 'a', now), "first-key")
 	if err != nil {
 		t.Fatalf("publish first Profile Version: %v", err)
 	}
@@ -95,7 +90,7 @@ func TestStoreSerializesProfileHeadPublication(t *testing.T) {
 		go func() {
 			<-start
 			_, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", &headID,
-				publication(fmt.Sprintf("version-%d", index+2), fmt.Sprintf("artifact-%d", index+2), character, now.Add(time.Minute)),
+				publication(fmt.Sprintf("version-%d", index+2), "registry.example.com/team/tools:stable", character, now.Add(time.Minute)),
 				fmt.Sprintf("concurrent-key-%d", index))
 			results <- err
 		}()
@@ -111,6 +106,42 @@ func TestStoreSerializesProfileHeadPublication(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("Profile Version count = %d, want 2", count)
+	}
+}
+
+func TestStoreRestoresCapsuleRefsFromImmutableVersionRows(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	ensureProfileUser(t, ctx, store, "user-1", now)
+	if _, err := store.CreateProfile(ctx, newProfile(t, "profile-1", "user-1", "Personal", "personal", now), "create-key"); err != nil {
+		t.Fatalf("create Profile: %v", err)
+	}
+	original := publication("version-1", "registry.example.com/team/base:stable", 'a', now)
+	original.CapsuleRefs[0].FreshnessPolicy = domain.FreshnessReview
+	original.CapsuleRefs[0].Exclusions = []string{"config:editor", "skill:debug"}
+	if _, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, original, "publish-key"); err != nil {
+		t.Fatalf("publish Profile Version: %v", err)
+	}
+
+	mutatedRef := "registry.example.com/team/attacker:stable"
+	if _, err := pool.Exec(ctx, `
+		UPDATE profile_publication_registrations
+		SET input = jsonb_set(input, '{capsuleRefs,0,ref}', to_jsonb($1::text))
+		WHERE owner_user_id = 'user-1' AND idempotency_key = 'publish-key'`, mutatedRef); err != nil {
+		t.Fatalf("mutate idempotency registration fixture: %v", err)
+	}
+	mutatedInput := original
+	mutatedInput.ID = "unused-version"
+	mutatedInput.CapsuleRefs = append([]domain.CapsuleRef(nil), original.CapsuleRefs...)
+	mutatedInput.CapsuleRefs[0].Ref = mutatedRef
+	replayed, err := store.PublishProfileVersion(ctx, "user-1", "profile-1", nil, mutatedInput, "publish-key")
+	if err != nil {
+		t.Fatalf("replay Profile Version: %v", err)
+	}
+	got := replayed.Snapshot().CapsuleRefs
+	if len(got) != 1 || got[0].Ref != original.CapsuleRefs[0].Ref || got[0].FreshnessPolicy != domain.FreshnessReview || len(got[0].Exclusions) != 2 || got[0].Exclusions[0] != "config:editor" || got[0].Exclusions[1] != "skill:debug" {
+		t.Fatalf("replayed Capsule Refs = %#v, want immutable publication refs %#v", got, original.CapsuleRefs)
 	}
 }
 
@@ -130,14 +161,9 @@ func newProfile(t *testing.T, id, ownerID, name, slug string, createdAt time.Tim
 	return profile
 }
 
-func publication(versionID, artifactID string, character byte, createdAt time.Time) domain.ProfileVersionPublication {
+func publication(versionID, ref string, character byte, createdAt time.Time) domain.ProfileVersionPublication {
 	return domain.ProfileVersionPublication{
 		ID: versionID, Digest: digest(character), CreatedAt: createdAt,
-		Artifacts: []domain.ProfileArtifact{{
-			ID: artifactID, ProfileVersionID: versionID, Kind: domain.ArtifactAgentInstruction,
-			SourceLocator: "AGENTS.md#$", SourceDigest: digest(character), ContentDigest: digest(character),
-			SizeBytes: 42, Mode: 0o640,
-			Sensitivity: domain.SensitivityPrivate, Trust: domain.TrustUserAuthored,
-		}},
+		CapsuleRefs: []domain.CapsuleRef{{Ref: ref, FreshnessPolicy: domain.FreshnessReview, Exclusions: []string{"config:editor", "skill:debug"}}},
 	}
 }

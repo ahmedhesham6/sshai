@@ -11,6 +11,93 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const completeProfileResolveOperation = `-- name: CompleteProfileResolveOperation :execrows
+UPDATE operations
+SET status = 'succeeded', completed_at = $1
+WHERE id = $2
+  AND type = 'profile.resolve'
+  AND status IN ('queued', 'running')
+`
+
+type CompleteProfileResolveOperationParams struct {
+	CompletedAt pgtype.Timestamptz
+	OperationID string
+}
+
+func (q *Queries) CompleteProfileResolveOperation(ctx context.Context, arg CompleteProfileResolveOperationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeProfileResolveOperation, arg.CompletedAt, arg.OperationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const completeProfileResolveStep = `-- name: CompleteProfileResolveStep :execrows
+UPDATE operation_steps
+SET status = 'succeeded', completed_at = $1
+WHERE operation_id = $2
+  AND step_key = 'resolve'
+  AND status = 'running'
+`
+
+type CompleteProfileResolveStepParams struct {
+	CompletedAt pgtype.Timestamptz
+	OperationID string
+}
+
+func (q *Queries) CompleteProfileResolveStep(ctx context.Context, arg CompleteProfileResolveStepParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeProfileResolveStep, arg.CompletedAt, arg.OperationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getCapsuleLockByTarget = `-- name: GetCapsuleLockByTarget :one
+SELECT id, environment_id, profile_version_id, project_capsule_digest, digest,
+       capsules, resolved_components, created_at
+FROM capsule_locks
+WHERE environment_id = $1
+  AND profile_version_id = $2
+  AND project_capsule_digest = $3
+`
+
+type GetCapsuleLockByTargetParams struct {
+	EnvironmentID        string
+	ProfileVersionID     string
+	ProjectCapsuleDigest string
+}
+
+func (q *Queries) GetCapsuleLockByTarget(ctx context.Context, arg GetCapsuleLockByTargetParams) (CapsuleLock, error) {
+	row := q.db.QueryRow(ctx, getCapsuleLockByTarget, arg.EnvironmentID, arg.ProfileVersionID, arg.ProjectCapsuleDigest)
+	var i CapsuleLock
+	err := row.Scan(
+		&i.ID,
+		&i.EnvironmentID,
+		&i.ProfileVersionID,
+		&i.ProjectCapsuleDigest,
+		&i.Digest,
+		&i.Capsules,
+		&i.ResolvedComponents,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getEnvironmentOwner = `-- name: GetEnvironmentOwner :one
+SELECT owner_user_id
+FROM environments
+WHERE id = $1
+FOR SHARE
+`
+
+func (q *Queries) GetEnvironmentOwner(ctx context.Context, environmentID string) (string, error) {
+	row := q.db.QueryRow(ctx, getEnvironmentOwner, environmentID)
+	var owner_user_id string
+	err := row.Scan(&owner_user_id)
+	return owner_user_id, err
+}
+
 const getOwnedProfileForUpdate = `-- name: GetOwnedProfileForUpdate :one
 SELECT id, owner_user_id, name, slug, created_at, archived_at
 FROM profiles
@@ -123,6 +210,46 @@ func (q *Queries) GetProfilePublicationRegistration(ctx context.Context, arg Get
 	return i, err
 }
 
+const getProfileResolveOperation = `-- name: GetProfileResolveOperation :one
+SELECT id, environment_id, type, status, requested_by_user_id, idempotency_key,
+       restate_invocation_id, input, created_at, completed_at
+FROM operations
+WHERE id = $1
+  AND type = 'profile.resolve'
+FOR UPDATE
+`
+
+type GetProfileResolveOperationRow struct {
+	ID                  string
+	EnvironmentID       string
+	Type                string
+	Status              string
+	RequestedByUserID   string
+	IdempotencyKey      string
+	RestateInvocationID *string
+	Input               []byte
+	CreatedAt           pgtype.Timestamptz
+	CompletedAt         pgtype.Timestamptz
+}
+
+func (q *Queries) GetProfileResolveOperation(ctx context.Context, operationID string) (GetProfileResolveOperationRow, error) {
+	row := q.db.QueryRow(ctx, getProfileResolveOperation, operationID)
+	var i GetProfileResolveOperationRow
+	err := row.Scan(
+		&i.ID,
+		&i.EnvironmentID,
+		&i.Type,
+		&i.Status,
+		&i.RequestedByUserID,
+		&i.IdempotencyKey,
+		&i.RestateInvocationID,
+		&i.Input,
+		&i.CreatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
 const getProfileVersion = `-- name: GetProfileVersion :one
 SELECT id, profile_id, parent_version_id, version, digest, created_at
 FROM profile_versions
@@ -148,6 +275,70 @@ func (q *Queries) GetProfileVersion(ctx context.Context, arg GetProfileVersionPa
 	return i, err
 }
 
+const getProfileVersionForEnvironment = `-- name: GetProfileVersionForEnvironment :one
+SELECT pv.id, pv.profile_id, pv.parent_version_id, pv.version, pv.digest, pv.created_at
+FROM profile_versions pv
+JOIN profiles p ON p.id = pv.profile_id
+JOIN environments e ON e.owner_user_id = p.owner_user_id
+WHERE e.id = $1
+  AND pv.id = $2
+FOR SHARE
+`
+
+type GetProfileVersionForEnvironmentParams struct {
+	EnvironmentID    string
+	ProfileVersionID string
+}
+
+func (q *Queries) GetProfileVersionForEnvironment(ctx context.Context, arg GetProfileVersionForEnvironmentParams) (ProfileVersion, error) {
+	row := q.db.QueryRow(ctx, getProfileVersionForEnvironment, arg.EnvironmentID, arg.ProfileVersionID)
+	var i ProfileVersion
+	err := row.Scan(
+		&i.ID,
+		&i.ProfileID,
+		&i.ParentVersionID,
+		&i.Version,
+		&i.Digest,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertCapsuleLock = `-- name: InsertCapsuleLock :exec
+INSERT INTO capsule_locks (
+    id, environment_id, profile_version_id, project_capsule_digest, digest,
+    capsules, resolved_components, created_at
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8
+)
+`
+
+type InsertCapsuleLockParams struct {
+	ID                   string
+	EnvironmentID        string
+	ProfileVersionID     string
+	ProjectCapsuleDigest string
+	Digest               string
+	Capsules             []byte
+	ResolvedComponents   []byte
+	CreatedAt            pgtype.Timestamptz
+}
+
+func (q *Queries) InsertCapsuleLock(ctx context.Context, arg InsertCapsuleLockParams) error {
+	_, err := q.db.Exec(ctx, insertCapsuleLock,
+		arg.ID,
+		arg.EnvironmentID,
+		arg.ProfileVersionID,
+		arg.ProjectCapsuleDigest,
+		arg.Digest,
+		arg.Capsules,
+		arg.ResolvedComponents,
+		arg.CreatedAt,
+	)
+	return err
+}
+
 const insertProfile = `-- name: InsertProfile :exec
 INSERT INTO profiles (id, owner_user_id, name, slug, created_at, archived_at)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -170,46 +361,6 @@ func (q *Queries) InsertProfile(ctx context.Context, arg InsertProfileParams) er
 		arg.Slug,
 		arg.CreatedAt,
 		arg.ArchivedAt,
-	)
-	return err
-}
-
-const insertProfileArtifact = `-- name: InsertProfileArtifact :exec
-INSERT INTO profile_artifacts (
-    id, profile_version_id, kind, source_locator, source_digest, content_digest, size_bytes, mode, sensitivity, trust, contains_executable
-) VALUES (
-    $1, $2, $3, $4, $5,
-    $6, $7, $8, $9, $10, $11
-)
-`
-
-type InsertProfileArtifactParams struct {
-	ID                 string
-	ProfileVersionID   string
-	Kind               string
-	SourceLocator      string
-	SourceDigest       string
-	ContentDigest      string
-	SizeBytes          int64
-	Mode               int32
-	Sensitivity        string
-	Trust              string
-	ContainsExecutable bool
-}
-
-func (q *Queries) InsertProfileArtifact(ctx context.Context, arg InsertProfileArtifactParams) error {
-	_, err := q.db.Exec(ctx, insertProfileArtifact,
-		arg.ID,
-		arg.ProfileVersionID,
-		arg.Kind,
-		arg.SourceLocator,
-		arg.SourceDigest,
-		arg.ContentDigest,
-		arg.SizeBytes,
-		arg.Mode,
-		arg.Sensitivity,
-		arg.Trust,
-		arg.ContainsExecutable,
 	)
 	return err
 }
@@ -260,6 +411,63 @@ func (q *Queries) InsertProfilePublicationRegistration(ctx context.Context, arg 
 	return err
 }
 
+const insertProfileResolveOperation = `-- name: InsertProfileResolveOperation :exec
+INSERT INTO operations (
+    id, environment_id, type, status, requested_by_user_id, idempotency_key,
+    restate_invocation_id, input, created_at, completed_at
+) VALUES (
+    $1, $2, 'profile.resolve', $3,
+    $4, $5,
+    $6, $7, $8, $9
+)
+`
+
+type InsertProfileResolveOperationParams struct {
+	ID                  string
+	EnvironmentID       string
+	Status              string
+	RequestedByUserID   string
+	IdempotencyKey      string
+	RestateInvocationID *string
+	Input               []byte
+	CreatedAt           pgtype.Timestamptz
+	CompletedAt         pgtype.Timestamptz
+}
+
+func (q *Queries) InsertProfileResolveOperation(ctx context.Context, arg InsertProfileResolveOperationParams) error {
+	_, err := q.db.Exec(ctx, insertProfileResolveOperation,
+		arg.ID,
+		arg.EnvironmentID,
+		arg.Status,
+		arg.RequestedByUserID,
+		arg.IdempotencyKey,
+		arg.RestateInvocationID,
+		arg.Input,
+		arg.CreatedAt,
+		arg.CompletedAt,
+	)
+	return err
+}
+
+const insertProfileResolveStep = `-- name: InsertProfileResolveStep :exec
+INSERT INTO operation_steps (
+    id, operation_id, step_key, status, attempt, summary, started_at
+) VALUES (
+    $1, $2, 'resolve', 'running', 1, 'Resolve Profile Version into Capsule Lock', $3
+)
+`
+
+type InsertProfileResolveStepParams struct {
+	ID          string
+	OperationID string
+	StartedAt   pgtype.Timestamptz
+}
+
+func (q *Queries) InsertProfileResolveStep(ctx context.Context, arg InsertProfileResolveStepParams) error {
+	_, err := q.db.Exec(ctx, insertProfileResolveStep, arg.ID, arg.OperationID, arg.StartedAt)
+	return err
+}
+
 const insertProfileVersion = `-- name: InsertProfileVersion :exec
 INSERT INTO profile_versions (id, profile_id, parent_version_id, version, digest, created_at)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -286,34 +494,58 @@ func (q *Queries) InsertProfileVersion(ctx context.Context, arg InsertProfileVer
 	return err
 }
 
-const listProfileArtifacts = `-- name: ListProfileArtifacts :many
-SELECT id, profile_version_id, kind, source_locator, source_digest, content_digest, size_bytes, mode, sensitivity, trust, contains_executable
-FROM profile_artifacts
-WHERE profile_version_id = $1
-ORDER BY id
+const insertProfileVersionCapsuleRef = `-- name: InsertProfileVersionCapsuleRef :exec
+INSERT INTO profile_version_capsule_refs (profile_version_id, ordinal, ref, freshness_policy, exclusions)
+VALUES ($1, $2, $3, $4, $5)
 `
 
-func (q *Queries) ListProfileArtifacts(ctx context.Context, profileVersionID string) ([]ProfileArtifact, error) {
-	rows, err := q.db.Query(ctx, listProfileArtifacts, profileVersionID)
+type InsertProfileVersionCapsuleRefParams struct {
+	ProfileVersionID string
+	Ordinal          int32
+	Ref              string
+	FreshnessPolicy  string
+	Exclusions       []byte
+}
+
+func (q *Queries) InsertProfileVersionCapsuleRef(ctx context.Context, arg InsertProfileVersionCapsuleRefParams) error {
+	_, err := q.db.Exec(ctx, insertProfileVersionCapsuleRef,
+		arg.ProfileVersionID,
+		arg.Ordinal,
+		arg.Ref,
+		arg.FreshnessPolicy,
+		arg.Exclusions,
+	)
+	return err
+}
+
+const listProfileVersionCapsuleRefs = `-- name: ListProfileVersionCapsuleRefs :many
+SELECT ordinal, ref, freshness_policy, exclusions
+FROM profile_version_capsule_refs
+WHERE profile_version_id = $1
+ORDER BY ordinal
+`
+
+type ListProfileVersionCapsuleRefsRow struct {
+	Ordinal         int32
+	Ref             string
+	FreshnessPolicy string
+	Exclusions      []byte
+}
+
+func (q *Queries) ListProfileVersionCapsuleRefs(ctx context.Context, profileVersionID string) ([]ListProfileVersionCapsuleRefsRow, error) {
+	rows, err := q.db.Query(ctx, listProfileVersionCapsuleRefs, profileVersionID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ProfileArtifact{}
+	items := []ListProfileVersionCapsuleRefsRow{}
 	for rows.Next() {
-		var i ProfileArtifact
+		var i ListProfileVersionCapsuleRefsRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.ProfileVersionID,
-			&i.Kind,
-			&i.SourceLocator,
-			&i.SourceDigest,
-			&i.ContentDigest,
-			&i.SizeBytes,
-			&i.Mode,
-			&i.Sensitivity,
-			&i.Trust,
-			&i.ContainsExecutable,
+			&i.Ordinal,
+			&i.Ref,
+			&i.FreshnessPolicy,
+			&i.Exclusions,
 		); err != nil {
 			return nil, err
 		}

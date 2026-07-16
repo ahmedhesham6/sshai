@@ -1,43 +1,83 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
-type Sensitivity string
-
-var ErrStaleProfileHead = errors.New("stale Profile head")
-
-const (
-	SensitivityPublic     Sensitivity = "public"
-	SensitivityPrivate    Sensitivity = "private"
-	SensitivityCredential Sensitivity = "credential"
-	SensitivityUnknown    Sensitivity = "unknown"
+var (
+	ErrStaleProfileHead       = errors.New("stale Profile head")
+	registryCapsuleRefPattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[a-f0-9]{64})$`)
 )
 
-type TrustClass string
+type canonicalProfileVersionCapsuleRef struct {
+	Ref             string   `json:"ref"`
+	FreshnessPolicy string   `json:"freshnessPolicy"`
+	Exclusions      []string `json:"exclusions"`
+}
+
+// ComputeProfileVersionDigest computes the version digest of record from the
+// ordered Capsule Refs. Exclusions are canonicalized as a set within each Ref;
+// Capsule Ref order remains significant.
+func ComputeProfileVersionDigest(capsuleRefs []CapsuleRef) string {
+	canonicalRefs := make([]canonicalProfileVersionCapsuleRef, len(capsuleRefs))
+	for index, ref := range capsuleRefs {
+		exclusions := append([]string(nil), ref.Exclusions...)
+		sort.Strings(exclusions)
+		if exclusions == nil {
+			exclusions = []string{}
+		}
+		canonicalRefs[index] = canonicalProfileVersionCapsuleRef{
+			Ref: ref.Ref, FreshnessPolicy: string(ref.FreshnessPolicy), Exclusions: exclusions,
+		}
+	}
+	canonicalJSON, _ := json.Marshal(canonicalRefs)
+	digest := sha256.Sum256(canonicalJSON)
+	return fmt.Sprintf("sha256:%x", digest)
+}
+
+// ArtifactTrust identifies provenance metadata for legacy Profile Artifacts.
+type ArtifactTrust string
 
 const (
-	TrustUserAuthored  TrustClass = "user_authored"
-	TrustTrustedSource TrustClass = "trusted_source"
-	TrustThirdParty    TrustClass = "third_party"
-	TrustUnknown       TrustClass = "unknown"
+	TrustUserAuthored  ArtifactTrust = "user_authored"
+	TrustTrustedSource ArtifactTrust = "trusted_source"
+	TrustThirdParty    ArtifactTrust = "third_party"
+	TrustUnknown       ArtifactTrust = "unknown"
 )
 
-type ArtifactKind string
+type FreshnessPolicy string
 
 const (
-	ArtifactAgentInstruction ArtifactKind = "agent_instruction"
-	ArtifactCodexSettings    ArtifactKind = "codex_settings"
-	ArtifactClaudeSettings   ArtifactKind = "claude_settings"
-	ArtifactShellPreferences ArtifactKind = "shell_preferences"
-	ArtifactGitPreferences   ArtifactKind = "git_preferences"
-	ArtifactSkillInstruction ArtifactKind = "agent_skill_instruction"
-	ArtifactSkillExecutable  ArtifactKind = "agent_skill_executable"
+	FreshnessTrack  FreshnessPolicy = "track"
+	FreshnessReview FreshnessPolicy = "review"
+	FreshnessPin    FreshnessPolicy = "pin"
+
+	FreshnessPolicyTrack  = FreshnessTrack
+	FreshnessPolicyReview = FreshnessReview
+	FreshnessPolicyPin    = FreshnessPin
 )
+
+func (policy FreshnessPolicy) Valid() bool {
+	switch policy {
+	case FreshnessTrack, FreshnessReview, FreshnessPin:
+		return true
+	default:
+		return false
+	}
+}
+
+type CapsuleRef struct {
+	Ref             string
+	FreshnessPolicy FreshnessPolicy
+	Exclusions      []string
+}
 
 type ProfileSnapshot struct {
 	ID          string
@@ -72,37 +112,31 @@ func (profile Profile) Snapshot() ProfileSnapshot {
 	return snapshot
 }
 
-type ProfileArtifact struct {
-	ID                 string
-	ProfileVersionID   string
-	Kind               ArtifactKind
-	SourceLocator      string
-	SourceDigest       string
-	ContentDigest      string
-	SizeBytes          int64
-	Mode               uint32
-	Sensitivity        Sensitivity
-	Trust              TrustClass
-	ContainsExecutable bool
-}
-
 type ProfileVersionSnapshot struct {
 	ID              string
 	ProfileID       string
 	ParentVersionID *string
 	Version         int64
 	Digest          string
-	Artifacts       []ProfileArtifact
+	CapsuleRefs     []CapsuleRef
 	CreatedAt       time.Time
 }
 
 type ProfileVersion struct{ snapshot ProfileVersionSnapshot }
 
 type ProfileVersionPublication struct {
-	ID        string
-	Digest    string
-	Artifacts []ProfileArtifact
-	CreatedAt time.Time
+	ID          string
+	Digest      string
+	CapsuleRefs []CapsuleRef
+	CreatedAt   time.Time
+}
+
+// ProfileVersionData is the exported, durable projection used when a
+// workflow crosses a Restate action boundary. It intentionally contains only
+// the immutable identity and ordered Capsule Refs needed for resolution.
+type ProfileVersionData struct {
+	ID          string       `json:"id"`
+	CapsuleRefs []CapsuleRef `json:"capsuleRefs"`
 }
 
 func (profile Profile) PublishVersion(head *ProfileVersion, expectedHeadVersionID *string, publication ProfileVersionPublication) (ProfileVersion, error) {
@@ -129,7 +163,7 @@ func (profile Profile) PublishVersion(head *ProfileVersion, expectedHeadVersionI
 	}
 	return publishProfileVersion(ProfileVersionSnapshot{
 		ID: publication.ID, ProfileID: profileSnapshot.ID, ParentVersionID: parentVersionID,
-		Version: version, Digest: publication.Digest, Artifacts: publication.Artifacts, CreatedAt: publication.CreatedAt,
+		Version: version, Digest: publication.Digest, CapsuleRefs: publication.CapsuleRefs, CreatedAt: publication.CreatedAt,
 	})
 }
 
@@ -140,8 +174,11 @@ func publishProfileVersion(snapshot ProfileVersionSnapshot) (ProfileVersion, err
 	if !contentDigestPattern.MatchString(snapshot.Digest) {
 		return ProfileVersion{}, errors.New("publish Profile Version: digest is invalid")
 	}
-	if snapshot.CreatedAt.IsZero() || len(snapshot.Artifacts) == 0 {
-		return ProfileVersion{}, errors.New("publish Profile Version: creation time and artifacts are required")
+	if snapshot.CreatedAt.IsZero() {
+		return ProfileVersion{}, errors.New("publish Profile Version: creation time is required")
+	}
+	if err := ValidateCapsuleRefs(snapshot.CapsuleRefs); err != nil {
+		return ProfileVersion{}, fmt.Errorf("publish Profile Version: %w", err)
 	}
 	if snapshot.ParentVersionID != nil && strings.TrimSpace(*snapshot.ParentVersionID) == "" {
 		return ProfileVersion{}, errors.New("publish Profile Version: parent ID cannot be empty")
@@ -155,78 +192,67 @@ func publishProfileVersion(snapshot ProfileVersionSnapshot) (ProfileVersion, err
 	if snapshot.ParentVersionID != nil && *snapshot.ParentVersionID == snapshot.ID {
 		return ProfileVersion{}, errors.New("publish Profile Version: version cannot parent itself")
 	}
-	seenIDs := make(map[string]struct{}, len(snapshot.Artifacts))
-	seenLocators := make(map[string]struct{}, len(snapshot.Artifacts))
-	artifacts := append([]ProfileArtifact(nil), snapshot.Artifacts...)
-	for index, artifact := range artifacts {
-		if err := validateProfileArtifact(snapshot.ID, artifact); err != nil {
-			return ProfileVersion{}, fmt.Errorf("publish Profile Version: artifact %d: %w", index, err)
-		}
-		if _, duplicate := seenIDs[artifact.ID]; duplicate {
-			return ProfileVersion{}, fmt.Errorf("publish Profile Version: duplicate artifact ID %q", artifact.ID)
-		}
-		if _, duplicate := seenLocators[artifact.SourceLocator]; duplicate {
-			return ProfileVersion{}, fmt.Errorf("publish Profile Version: duplicate source locator %q", artifact.SourceLocator)
-		}
-		seenIDs[artifact.ID] = struct{}{}
-		seenLocators[artifact.SourceLocator] = struct{}{}
-	}
+	refs := cloneCapsuleRefs(snapshot.CapsuleRefs)
 	snapshot.ParentVersionID = cloneString(snapshot.ParentVersionID)
-	snapshot.Artifacts = artifacts
+	snapshot.CapsuleRefs = refs
 	snapshot.CreatedAt = snapshot.CreatedAt.Round(0).UTC()
 	return ProfileVersion{snapshot: snapshot}, nil
+}
+
+// ValidateCapsuleRefs validates the ordered Capsule Ref composition of a
+// Profile Version without requiring a Profile aggregate.
+func ValidateCapsuleRefs(refs []CapsuleRef) error {
+	if len(refs) == 0 {
+		return errors.New("Capsule Refs are required")
+	}
+	seenRefs := make(map[string]struct{}, len(refs))
+	for index, ref := range refs {
+		if err := validateCapsuleRef(ref); err != nil {
+			return fmt.Errorf("Capsule Ref %d: %w", index, err)
+		}
+		if _, duplicate := seenRefs[ref.Ref]; duplicate {
+			return fmt.Errorf("duplicate Capsule Ref %q", ref.Ref)
+		}
+		seenRefs[ref.Ref] = struct{}{}
+	}
+	return nil
 }
 
 func RestoreProfileVersion(snapshot ProfileVersionSnapshot) (ProfileVersion, error) {
 	return publishProfileVersion(snapshot)
 }
 
-func validateProfileArtifact(versionID string, artifact ProfileArtifact) error {
-	if strings.TrimSpace(artifact.ID) == "" || artifact.ProfileVersionID != versionID || strings.TrimSpace(string(artifact.Kind)) == "" || strings.TrimSpace(artifact.SourceLocator) == "" {
-		return errors.New("identity, kind, and source locator are required")
+func validateCapsuleRef(ref CapsuleRef) error {
+	if strings.TrimSpace(ref.Ref) == "" || strings.TrimSpace(ref.Ref) != ref.Ref || !registryCapsuleRefPattern.MatchString(ref.Ref) {
+		return errors.New("registry reference is invalid")
 	}
-	if !contentDigestPattern.MatchString(artifact.SourceDigest) || !contentDigestPattern.MatchString(artifact.ContentDigest) {
-		return errors.New("source and content digests must be SHA-256")
+	if !ref.FreshnessPolicy.Valid() {
+		return errors.New("freshness policy is invalid")
 	}
-	if artifact.SizeBytes < 0 || artifact.Mode > 0o777 {
-		return errors.New("artifact size or file mode is invalid")
-	}
-	if artifact.Sensitivity != SensitivityPublic && artifact.Sensitivity != SensitivityPrivate {
-		return errors.New("credential and unknown sensitivity cannot be published")
-	}
-	if !artifact.Kind.valid() {
-		return errors.New("artifact kind is invalid")
-	}
-	if artifact.ContainsExecutable != artifact.Kind.containsExecutable() {
-		return errors.New("executable classification does not match artifact kind")
-	}
-	switch artifact.Trust {
-	case TrustUserAuthored, TrustTrustedSource, TrustThirdParty:
-	default:
-		return errors.New("trust classification is invalid")
+	for _, exclusion := range ref.Exclusions {
+		if strings.TrimSpace(exclusion) == "" {
+			return errors.New("exclusions must contain non-empty component IDs")
+		}
 	}
 	return nil
-}
-
-func (kind ArtifactKind) valid() bool {
-	switch kind {
-	case ArtifactAgentInstruction, ArtifactCodexSettings, ArtifactClaudeSettings,
-		ArtifactShellPreferences, ArtifactGitPreferences, ArtifactSkillInstruction, ArtifactSkillExecutable:
-		return true
-	default:
-		return false
-	}
-}
-
-func (kind ArtifactKind) containsExecutable() bool {
-	return kind == ArtifactShellPreferences || kind == ArtifactSkillExecutable
 }
 
 func (version ProfileVersion) Snapshot() ProfileVersionSnapshot {
 	snapshot := version.snapshot
 	snapshot.ParentVersionID = cloneString(snapshot.ParentVersionID)
-	snapshot.Artifacts = append([]ProfileArtifact(nil), snapshot.Artifacts...)
+	snapshot.CapsuleRefs = cloneCapsuleRefs(snapshot.CapsuleRefs)
 	return snapshot
+}
+
+func cloneCapsuleRefs(refs []CapsuleRef) []CapsuleRef {
+	if refs == nil {
+		return nil
+	}
+	clone := append([]CapsuleRef(nil), refs...)
+	for index := range clone {
+		clone[index].Exclusions = append([]string(nil), clone[index].Exclusions...)
+	}
+	return clone
 }
 
 func cloneCanonicalTime(value *time.Time) *time.Time {

@@ -19,28 +19,33 @@ var (
 	ErrInvalidProfilePublication = errors.New("invalid Profile publication")
 )
 
+func (store *Store) CheckProfileOwnership(ctx context.Context, ownerID, profileID string) error {
+	_, err := store.queries.GetOwnedProfileForUpdate(ctx, dbsql.GetOwnedProfileForUpdateParams{ProfileID: profileID, OwnerUserID: ownerID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrReferenceNotOwned
+	}
+	if err != nil {
+		return fmt.Errorf("check Profile ownership: %w", err)
+	}
+	return nil
+}
+
 type profileCreateInput struct {
 	Name string `json:"name"`
 	Slug string `json:"slug"`
 }
 
 type profilePublicationInput struct {
-	ProfileID             string                 `json:"profileId"`
-	ExpectedHeadVersionID *string                `json:"expectedHeadVersionId"`
-	Digest                string                 `json:"digest"`
-	Artifacts             []profileArtifactInput `json:"artifacts"`
+	ProfileID             string                   `json:"profileId"`
+	ExpectedHeadVersionID *string                  `json:"expectedHeadVersionId"`
+	Digest                string                   `json:"digest"`
+	CapsuleRefs           []profileCapsuleRefInput `json:"capsuleRefs"`
 }
 
-type profileArtifactInput struct {
-	Kind               domain.ArtifactKind `json:"kind"`
-	SourceLocator      string              `json:"sourceLocator"`
-	SourceDigest       string              `json:"sourceDigest"`
-	ContentDigest      string              `json:"contentDigest"`
-	SizeBytes          int64               `json:"sizeBytes"`
-	Mode               uint32              `json:"mode"`
-	Sensitivity        domain.Sensitivity  `json:"sensitivity"`
-	Trust              domain.TrustClass   `json:"trust"`
-	ContainsExecutable bool                `json:"containsExecutable"`
+type profileCapsuleRefInput struct {
+	Ref             string                 `json:"ref"`
+	FreshnessPolicy domain.FreshnessPolicy `json:"freshnessPolicy"`
+	Exclusions      []string               `json:"exclusions,omitempty"`
 }
 
 func (store *Store) CreateProfile(ctx context.Context, candidate domain.Profile, idempotencyKey string) (domain.Profile, error) {
@@ -167,17 +172,14 @@ func (store *Store) PublishProfileVersion(ctx context.Context, ownerID, profileI
 }
 
 func encodeProfilePublication(profileID string, expectedHeadVersionID *string, publication domain.ProfileVersionPublication) ([]byte, error) {
-	artifacts := make([]profileArtifactInput, len(publication.Artifacts))
-	for index, artifact := range publication.Artifacts {
-		artifacts[index] = profileArtifactInput{
-			Kind: artifact.Kind, SourceLocator: artifact.SourceLocator, SourceDigest: artifact.SourceDigest,
-			ContentDigest: artifact.ContentDigest, SizeBytes: artifact.SizeBytes, Mode: artifact.Mode,
-			Sensitivity: artifact.Sensitivity, Trust: artifact.Trust,
-			ContainsExecutable: artifact.ContainsExecutable,
+	refs := make([]profileCapsuleRefInput, len(publication.CapsuleRefs))
+	for index, ref := range publication.CapsuleRefs {
+		refs[index] = profileCapsuleRefInput{
+			Ref: ref.Ref, FreshnessPolicy: ref.FreshnessPolicy, Exclusions: append([]string(nil), ref.Exclusions...),
 		}
 	}
 	input, err := json.Marshal(profilePublicationInput{
-		ProfileID: profileID, ExpectedHeadVersionID: expectedHeadVersionID, Digest: publication.Digest, Artifacts: artifacts,
+		ProfileID: profileID, ExpectedHeadVersionID: expectedHeadVersionID, Digest: publication.Digest, CapsuleRefs: refs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("publish Profile Version: encode input: %w", err)
@@ -209,23 +211,23 @@ func restoreProfileVersion(ctx context.Context, queries *dbsql.Queries, row dbsq
 	if !row.CreatedAt.Valid {
 		return domain.ProfileVersion{}, errors.New("restore Profile Version: database returned invalid creation time")
 	}
-	artifactRows, err := queries.ListProfileArtifacts(ctx, row.ID)
+	refRows, err := queries.ListProfileVersionCapsuleRefs(ctx, row.ID)
 	if err != nil {
-		return domain.ProfileVersion{}, fmt.Errorf("restore Profile Version: load artifacts: %w", err)
+		return domain.ProfileVersion{}, fmt.Errorf("restore Profile Version: load Capsule Refs: %w", err)
 	}
-	artifacts := make([]domain.ProfileArtifact, len(artifactRows))
-	for index, artifact := range artifactRows {
-		artifacts[index] = domain.ProfileArtifact{
-			ID: artifact.ID, ProfileVersionID: artifact.ProfileVersionID, Kind: domain.ArtifactKind(artifact.Kind),
-			SourceLocator: artifact.SourceLocator, SourceDigest: artifact.SourceDigest, ContentDigest: artifact.ContentDigest,
-			SizeBytes: artifact.SizeBytes, Mode: uint32(artifact.Mode),
-			Sensitivity: domain.Sensitivity(artifact.Sensitivity), Trust: domain.TrustClass(artifact.Trust),
-			ContainsExecutable: artifact.ContainsExecutable,
+	refs := make([]domain.CapsuleRef, len(refRows))
+	for index, refRow := range refRows {
+		var exclusions []string
+		if err := json.Unmarshal(refRow.Exclusions, &exclusions); err != nil {
+			return domain.ProfileVersion{}, fmt.Errorf("restore Profile Version: decode Capsule Ref %d exclusions: %w", index, err)
+		}
+		refs[index] = domain.CapsuleRef{
+			Ref: refRow.Ref, FreshnessPolicy: domain.FreshnessPolicy(refRow.FreshnessPolicy), Exclusions: exclusions,
 		}
 	}
 	version, err := domain.RestoreProfileVersion(domain.ProfileVersionSnapshot{
 		ID: row.ID, ProfileID: row.ProfileID, ParentVersionID: row.ParentVersionID, Version: row.Version,
-		Digest: row.Digest, Artifacts: artifacts, CreatedAt: row.CreatedAt.Time,
+		Digest: row.Digest, CapsuleRefs: refs, CreatedAt: row.CreatedAt.Time,
 	})
 	if err != nil {
 		return domain.ProfileVersion{}, fmt.Errorf("restore Profile Version: %w", err)
@@ -241,14 +243,16 @@ func insertProfileVersion(ctx context.Context, queries *dbsql.Queries, version d
 	}); err != nil {
 		return fmt.Errorf("publish Profile Version: insert version: %w", err)
 	}
-	for _, artifact := range snapshot.Artifacts {
-		if err := queries.InsertProfileArtifact(ctx, dbsql.InsertProfileArtifactParams{
-			ID: artifact.ID, ProfileVersionID: artifact.ProfileVersionID, Kind: string(artifact.Kind),
-			SourceLocator: artifact.SourceLocator, SourceDigest: artifact.SourceDigest, ContentDigest: artifact.ContentDigest,
-			SizeBytes: artifact.SizeBytes, Mode: int32(artifact.Mode),
-			Sensitivity: string(artifact.Sensitivity), Trust: string(artifact.Trust), ContainsExecutable: artifact.ContainsExecutable,
+	for ordinal, ref := range snapshot.CapsuleRefs {
+		exclusions, err := json.Marshal(ref.Exclusions)
+		if err != nil {
+			return fmt.Errorf("publish Profile Version: encode Capsule Ref %d exclusions: %w", ordinal, err)
+		}
+		if err := queries.InsertProfileVersionCapsuleRef(ctx, dbsql.InsertProfileVersionCapsuleRefParams{
+			ProfileVersionID: snapshot.ID, Ordinal: int32(ordinal), Ref: ref.Ref,
+			FreshnessPolicy: string(ref.FreshnessPolicy), Exclusions: exclusions,
 		}); err != nil {
-			return fmt.Errorf("publish Profile Version: insert artifact: %w", err)
+			return fmt.Errorf("publish Profile Version: insert Capsule Ref %d: %w", ordinal, err)
 		}
 	}
 	return nil

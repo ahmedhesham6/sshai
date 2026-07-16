@@ -18,6 +18,7 @@ var (
 type ProfileRepository interface {
 	CreateProfile(context.Context, domain.Profile, string) (domain.Profile, error)
 	PublishProfileVersion(context.Context, string, string, *string, domain.ProfileVersionPublication, string) (domain.ProfileVersion, error)
+	CheckProfileOwnership(context.Context, string, string) error
 }
 
 type CreateProfileInput struct {
@@ -27,24 +28,11 @@ type CreateProfileInput struct {
 	IdempotencyKey      string
 }
 
-type ProfileArtifactInput struct {
-	Kind               domain.ArtifactKind
-	SourceLocator      string
-	SourceDigest       string
-	ContentDigest      string
-	SizeBytes          int64
-	Mode               uint32
-	Sensitivity        domain.Sensitivity
-	Trust              domain.TrustClass
-	ContainsExecutable bool
-}
-
 type PublishProfileVersionInput struct {
 	OwnerUserID           string
 	ProfileID             string
 	ExpectedHeadVersionID *string
-	Digest                string
-	Artifacts             []ProfileArtifactInput
+	CapsuleRefs           []domain.CapsuleRef
 	IdempotencyKey        string
 }
 
@@ -85,31 +73,9 @@ func (service *ProfileService) PublishProfileVersion(ctx context.Context, input 
 		return domain.ProfileVersion{}, fmt.Errorf("publish Profile Version: %w: idempotency key is required", ErrInvalidProfileCommand)
 	}
 	versionID := service.ids.NewID()
-	artifacts := make([]domain.ProfileArtifact, len(input.Artifacts))
-	for index, artifact := range input.Artifacts {
-		artifacts[index] = domain.ProfileArtifact{
-			ID: service.ids.NewID(), ProfileVersionID: versionID, Kind: artifact.Kind,
-			SourceLocator: artifact.SourceLocator, SourceDigest: artifact.SourceDigest,
-			ContentDigest: artifact.ContentDigest, SizeBytes: artifact.SizeBytes, Mode: artifact.Mode, Sensitivity: artifact.Sensitivity,
-			Trust: artifact.Trust, ContainsExecutable: artifact.ContainsExecutable,
-		}
-	}
 	publication := domain.ProfileVersionPublication{
-		ID: versionID, Digest: input.Digest, Artifacts: artifacts, CreatedAt: service.now(),
-	}
-	if service.uploads == nil {
-		return domain.ProfileVersion{}, ErrUploadNotVerified
-	}
-	for index, artifact := range artifacts {
-		verified, err := service.uploads.Verify(ctx, VerifyUploadInput{
-			OwnerUserID: input.OwnerUserID, Kind: domain.UploadProfileArtifact, Digest: artifact.ContentDigest,
-		})
-		if err != nil {
-			return domain.ProfileVersion{}, fmt.Errorf("publish Profile Version: verify artifact %d: %w", index, err)
-		}
-		if verified.Intent.Snapshot().SizeBytes != artifact.SizeBytes {
-			return domain.ProfileVersion{}, fmt.Errorf("publish Profile Version: artifact %d size: %w", index, ErrUploadNotVerified)
-		}
+		ID: versionID, Digest: domain.ComputeProfileVersionDigest(input.CapsuleRefs),
+		CapsuleRefs: cloneCapsuleRefs(input.CapsuleRefs), CreatedAt: service.now(),
 	}
 	expectedHead := input.ExpectedHeadVersionID
 	if expectedHead != nil {
@@ -123,4 +89,30 @@ func (service *ProfileService) PublishProfileVersion(ctx context.Context, input 
 		return domain.ProfileVersion{}, fmt.Errorf("publish Profile Version: persist: %w", err)
 	}
 	return version, nil
+}
+
+// ValidateProfileVersionPublication runs the authenticated owner's validation
+// chain for the publication stub without persisting a Profile Version.
+func (service *ProfileService) ValidateProfileVersionPublication(ctx context.Context, input PublishProfileVersionInput) error {
+	if strings.TrimSpace(input.IdempotencyKey) == "" {
+		return fmt.Errorf("publish Profile Version: %w: idempotency key is required", ErrInvalidProfileCommand)
+	}
+	if err := domain.ValidateCapsuleRefs(input.CapsuleRefs); err != nil {
+		return fmt.Errorf("publish Profile Version: %w: %v", ErrInvalidProfileCommand, err)
+	}
+	if err := service.repository.CheckProfileOwnership(ctx, input.OwnerUserID, input.ProfileID); err != nil {
+		return fmt.Errorf("publish Profile Version: check ownership: %w", err)
+	}
+	return nil
+}
+
+func cloneCapsuleRefs(refs []domain.CapsuleRef) []domain.CapsuleRef {
+	if refs == nil {
+		return nil
+	}
+	clone := append([]domain.CapsuleRef(nil), refs...)
+	for index := range clone {
+		clone[index].Exclusions = append([]string(nil), clone[index].Exclusions...)
+	}
+	return clone
 }
