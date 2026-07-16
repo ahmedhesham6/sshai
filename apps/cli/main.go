@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -77,7 +78,7 @@ func newCLI() cli {
 
 func (application cli) run(ctx context.Context, arguments []string) error {
 	if len(arguments) == 0 {
-		return fmt.Errorf("usage: devm <inspect|plan|login|ssh-proxy>")
+		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh-proxy>")
 	}
 	switch arguments[0] {
 	case "login":
@@ -100,10 +101,40 @@ func (application cli) run(ctx context.Context, arguments []string) error {
 		return application.runPlan(ctx, arguments[1:])
 	case "inspect":
 		return application.runInspect(ctx, arguments[1:])
+	case "capsule":
+		return application.runCapsule(ctx, arguments[1:])
 	case "ssh-proxy":
 		return application.runSSHProxy(ctx, arguments[1:])
 	default:
-		return fmt.Errorf("usage: devm <inspect|plan|login|ssh-proxy>")
+		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh-proxy>")
+	}
+}
+
+func (application cli) runCapsule(ctx context.Context, arguments []string) error {
+	if len(arguments) == 0 {
+		return errors.New("usage: devm capsule <capture|build> [flags]")
+	}
+	command := arguments[0]
+	flags := flag.NewFlagSet("capsule "+command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	profileRoot := flags.String("profile-root", ".", "root containing Capsule candidates")
+	selectionsFile := flags.String("selections", "", "JSON file containing PATH/SELECTOR selections")
+	var selections selectorFlags
+	flags.Var(&selections, "select", "explicit Profile path and selector")
+	if err := flags.Parse(arguments[1:]); err != nil || flags.NArg() != 0 {
+		return fmt.Errorf("usage: devm capsule %s --profile-root PATH [--select PATH=SELECTOR] [--selections FILE]", command)
+	}
+	resolvedSelections, err := loadSelections(*selectionsFile, selections)
+	if err != nil {
+		return err
+	}
+	switch command {
+	case "capture":
+		return RunCapsuleCapture(ctx, *profileRoot, resolvedSelections, application.output)
+	case "build":
+		return RunCapsuleBuild(ctx, *profileRoot, resolvedSelections, application.output)
+	default:
+		return errors.New("usage: devm capsule <capture|build> [flags]")
 	}
 }
 
@@ -182,6 +213,7 @@ func (application cli) runPlan(ctx context.Context, arguments []string) error {
 	profileRoot := flags.String("profile-root", ".", "root containing selected Profile content")
 	var selections selectorFlags
 	flags.Var(&selections, "select", "explicit Profile path and selector")
+	selectionsFile := flags.String("selections", "", "JSON file containing PATH/SELECTOR selections")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -189,7 +221,11 @@ func (application cli) runPlan(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve repository directory: %w", err)
 	}
-	return RunPlan(ctx, repositoryRoot, *profileRoot, selections, application.output)
+	resolvedSelections, err := loadSelections(*selectionsFile, selections)
+	if err != nil {
+		return err
+	}
+	return RunPlan(ctx, repositoryRoot, *profileRoot, resolvedSelections, application.output)
 }
 
 type selectorFlags []profile.Selector
@@ -203,4 +239,20 @@ func (values *selectorFlags) Set(value string) error {
 	}
 	*values = append(*values, profile.Selector{Path: path, Selector: selector})
 	return nil
+}
+
+func loadSelections(path string, flags selectorFlags) ([]profile.Selector, error) {
+	selections := append([]profile.Selector(nil), flags...)
+	if path == "" {
+		return selections, nil
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read selections file: %w", err)
+	}
+	var fileSelections []profile.Selector
+	if err := json.Unmarshal(content, &fileSelections); err != nil {
+		return nil, fmt.Errorf("decode selections file: %w", err)
+	}
+	return append(selections, fileSelections...), nil
 }

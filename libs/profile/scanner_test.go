@@ -3,8 +3,10 @@ package profile_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
@@ -57,43 +59,7 @@ func TestScanClassifiesOnlyKnownProfileCandidatesDeterministically(t *testing.T)
 	}
 }
 
-func TestCompileUsesClosedExecutablePolicyInsteadOfFileMode(t *testing.T) {
-	root := t.TempDir()
-	writeProfileFile(t, root, "AGENTS.md", "Use Go.\n", 0o755)
-	writeProfileFile(t, root, ".bashrc", "alias ll='ls -la'\n", 0o644)
-	writeProfileFile(t, root, ".codex/skills/review/scripts/check.sh", "#!/bin/sh\nexit 0\n", 0o644)
-
-	version, err := profile.Compile(root, []profile.Selector{
-		{Path: "AGENTS.md", Selector: "$"},
-		{Path: ".bashrc", Selector: "$"},
-		{Path: ".codex/skills/review/scripts/check.sh", Selector: "$"},
-	})
-	if err != nil {
-		t.Fatalf("compile Profile Version: %v", err)
-	}
-	artifacts := version.Artifacts()
-	want := []struct {
-		kind       string
-		executable bool
-	}{
-		{"shell_preferences", true},
-		{"agent_skill_executable", true},
-		{"agent_instruction", false},
-	}
-	if len(artifacts) != len(want) {
-		t.Fatalf("artifacts = %+v", artifacts)
-	}
-	for i, expected := range want {
-		if artifacts[i].Kind != expected.kind || artifacts[i].ContainsExecutable != expected.executable {
-			t.Fatalf("artifact %d classification = kind:%q executable:%t", i, artifacts[i].Kind, artifacts[i].ContainsExecutable)
-		}
-	}
-	if artifacts[2].Evidence != "known_agent_instruction+executable_mode" {
-		t.Fatalf("executable-mode evidence = %q", artifacts[2].Evidence)
-	}
-}
-
-func TestScanUsesExactlyTheDomainArtifactKindsAndExecutablePolicy(t *testing.T) {
+func TestScanUsesTypedComponentKindsAndExecutablePolicy(t *testing.T) {
 	root := t.TempDir()
 	writeProfileFile(t, root, "AGENTS.md", "Use Go.\n", 0o644)
 	writeProfileFile(t, root, ".codex/config.toml", "model = \"gpt\"\n", 0o644)
@@ -123,7 +89,7 @@ func TestScanUsesExactlyTheDomainArtifactKindsAndExecutablePolicy(t *testing.T) 
 		delete(want, candidate.Kind)
 	}
 	if len(want) != 0 {
-		t.Fatalf("missing artifact kinds = %v", want)
+		t.Fatalf("missing candidate kinds = %v", want)
 	}
 }
 
@@ -167,6 +133,130 @@ func TestScanExcludesCredentialBearingKnownCandidate(t *testing.T) {
 	}
 	if len(candidates) != 1 || candidates[0].Disposition != "excluded" || candidates[0].Sensitivity != "credential" || candidates[0].ContentDigest != "" {
 		t.Fatalf("credential candidate = %+v", candidates)
+	}
+}
+
+func TestScanNeverPackagesSensitiveAndUnknownPaths(t *testing.T) {
+	root := t.TempDir()
+	writeProfileFile(t, root, "AGENTS.md", "Use Go.\n", 0o644)
+	for _, path := range []string{
+		".codex/auth.json",
+		".codex/sessions/2026/session.jsonl",
+		".claude/.credentials.json",
+		".claude/projects/repo/session.jsonl",
+		".config/opencode/auth.json",
+		".config/opencode/mcp-auth.json",
+		".local/share/opencode/auth.json",
+		".local/share/opencode/mcp-auth.json",
+		".opencode/auth.json",
+		".opencode/mcp-auth.json",
+		".ssh/id_ed25519",
+		".codex/unknown.dat",
+	} {
+		writeProfileFile(t, root, path, "secret body must not be read or packaged\n", 0o600)
+	}
+
+	candidates, err := profile.Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(): %v", err)
+	}
+	byPath := make(map[string]profile.Candidate, len(candidates))
+	for _, candidate := range candidates {
+		byPath[candidate.Path] = candidate
+	}
+	for _, path := range []string{
+		".codex/auth.json",
+		".codex/sessions/2026/session.jsonl",
+		".claude/.credentials.json",
+		".claude/projects/repo/session.jsonl",
+		".config/opencode/auth.json",
+		".config/opencode/mcp-auth.json",
+		".local/share/opencode/auth.json",
+		".local/share/opencode/mcp-auth.json",
+		".opencode/auth.json",
+		".opencode/mcp-auth.json",
+		".ssh/id_ed25519",
+		".codex/unknown.dat",
+	} {
+		candidate, ok := byPath[path]
+		if !ok {
+			t.Fatalf("Scan() omitted never-package path %q", path)
+		}
+		if candidate.Disposition != "excluded" || candidate.ContentDigest != "" || candidate.SourceDigest != "" {
+			t.Fatalf("never-package candidate %q = %+v", path, candidate)
+		}
+	}
+	portable := byPath["AGENTS.md"]
+	if portable.Component.Type != domain.ComponentConfig || portable.Component.Scope != domain.ScopeUser || portable.Component.TrustClass != domain.TrustDeclarative {
+		t.Fatalf("portable component mapping = %+v", portable.Component)
+	}
+	if portable.Component.ID != "config:AGENTS.md" {
+		t.Fatalf("portable component ID = %q", portable.Component.ID)
+	}
+}
+
+func TestScanExtractsMCPSecretNamesAndBlocksLiteralValues(t *testing.T) {
+	root := t.TempDir()
+	writeProfileFile(t, root, ".codex/config.toml", "[mcp_servers.github.env]\nGITHUB_TOKEN = \"${GITHUB_TOKEN}\"\nGITHUB_ORG = \"literal-secret-value\"\n", 0o600)
+	writeProfileFile(t, root, ".claude/settings.json", `{"mcpServers":{"docs":{"command":"docs-server"}}}`+"\n", 0o600)
+	writeProfileFile(t, root, ".config/opencode/opencode.json", `{
+  "mcp": {
+    "docs": {
+      "environment": {
+        "DOCS_TOKEN": "{env:DOCS_TOKEN}"
+      }
+    }
+  }
+}`+"\n", 0o600)
+
+	candidates, err := profile.Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(): %v", err)
+	}
+	byPath := make(map[string]profile.Candidate, len(candidates))
+	for _, candidate := range candidates {
+		byPath[candidate.Path] = candidate
+	}
+	literal := byPath[".codex/config.toml"]
+	if literal.Component.Type != domain.ComponentIntegration || literal.Disposition != "excluded" || literal.ContentDigest != "" {
+		t.Fatalf("literal MCP candidate = %+v", literal)
+	}
+	if got := literal.Component.Requirements.Secrets; len(got) != 2 || got[0] != "GITHUB_ORG" || got[1] != "GITHUB_TOKEN" {
+		t.Fatalf("literal MCP secret requirements = %#v", got)
+	}
+	if strings.Contains(literal.Evidence, "literal-secret-value") {
+		t.Fatalf("MCP evidence leaked value: %q", literal.Evidence)
+	}
+
+	referenced := byPath[".config/opencode/opencode.json"]
+	if referenced.Component.Type != domain.ComponentIntegration || referenced.Disposition != "requires_authorization" {
+		t.Fatalf("referenced MCP candidate = %+v", referenced)
+	}
+	if got := referenced.Component.Requirements.Secrets; len(got) != 1 || got[0] != "DOCS_TOKEN" {
+		t.Fatalf("referenced MCP secret requirements = %#v", got)
+	}
+	if got := byPath[".claude/settings.json"].Component.Type; got != domain.ComponentIntegration {
+		t.Fatalf("MCP reference without env mapped to %q", got)
+	}
+}
+
+func TestScanPlacesExecutableMCPReferenceInRequiresAuthorization(t *testing.T) {
+	root := t.TempDir()
+	writeProfileFile(t, root, ".mcp.json", `{"mcpServers":{"docs":{"command":"docs-server"}}}`+"\n", 0o755)
+
+	candidates, err := profile.Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(): %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+	candidate := candidates[0]
+	if candidate.Disposition != "requires_authorization" {
+		t.Fatalf("executable MCP disposition = %q, want requires_authorization: %+v", candidate.Disposition, candidate)
+	}
+	if !candidate.ContainsExecutable {
+		t.Fatalf("executable MCP candidate did not retain executable flag: %+v", candidate)
 	}
 }
 

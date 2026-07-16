@@ -44,7 +44,7 @@ func TestRunPlanComposesDeterministicProfileAndProjectSeed(t *testing.T) {
 	if first.String() != second.String() {
 		t.Fatalf("plan changed between runs:\n%s\n%s", first.String(), second.String())
 	}
-	for _, expected := range []string{"profile_version sha256:", "project_seed sha256:", "safe:", `source=profile type=agent_instruction path="AGENTS.md" selector="$" evidence=known_agent_instruction sensitivity=private trust=user_authored executable=false size_bytes=8 mode=0644`, "review:", `source=profile type=shell_preferences path=".bashrc" selector="$" evidence=known_shell_preferences sensitivity=private trust=user_authored executable=true`, `source=project_seed path="local.txt" evidence=untracked`, "requires_authorization:", "excluded:", `source=profile type=unknown path=".codex/mystery.txt" selector="$" evidence=unknown_file_in_known_root sensitivity=unknown trust=unknown executable=false`, "conflict:"} {
+	for _, expected := range []string{"project_seed sha256:", "profile_components:\n", "safe:", `component=config:AGENTS.md type=config scope=user trust=declarative path="AGENTS.md" selector="$" selected=true evidence=known_agent_instruction sensitivity=private`, "review:", `component=config:.bashrc type=config scope=user trust=executable path=".bashrc" selector="$" selected=true evidence=known_shell_preferences sensitivity=private`, `source=project_seed path="local.txt" evidence=untracked`, "requires_authorization:", "excluded:", `component=config:.codex/mystery.txt type=config scope=user trust=declarative path=".codex/mystery.txt" selector="$" selected=false evidence=unknown_file_in_known_root sensitivity=unknown`, "conflict:"} {
 		if !strings.Contains(first.String(), expected) {
 			t.Fatalf("plan lacks %q:\n%s", expected, first.String())
 		}

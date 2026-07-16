@@ -20,7 +20,7 @@ func RunInspect(ctx context.Context, repositoryRoot, profileRoot, sshDirectory s
 	}
 	candidates, err := profile.Scan(profileRoot)
 	if err != nil {
-		return fmt.Errorf("inspect Profile candidates: %w", err)
+		return fmt.Errorf("inspect Capsule candidates: %w", err)
 	}
 	keys, err := discoverEd25519Keys(sshDirectory)
 	if err != nil {
@@ -40,10 +40,12 @@ func RunInspect(ctx context.Context, repositoryRoot, profileRoot, sshDirectory s
 	for _, path := range untracked {
 		fmt.Fprintf(&report, "  untracked path=%q\n", path)
 	}
-	report.WriteString("profile_candidates:\n")
+	report.WriteString("profile_components:\n")
+	items := make([]captureItem, 0, len(candidates))
 	for _, candidate := range candidates {
-		writeCandidateItem(&report, candidate, candidate.Evidence)
+		items = append(items, captureItem{candidate: candidate})
 	}
+	report.WriteString(captureGroupsString(items))
 	report.WriteString("ssh_keys:\n")
 	for _, key := range keys {
 		fmt.Fprintf(&report, "  label=%q fingerprint=%s private_key_path=%q\n", key.Label, key.Fingerprint, key.PrivateKeyPath)

@@ -39,9 +39,9 @@ func TestRunInspectReportsContentFreeLocalEvidenceDeterministically(t *testing.T
 	for _, expected := range []string{
 		"project:\n",
 		"  revision=", "  base_revision=", "  untracked path=\"local.txt\"\n",
-		"profile_candidates:\n",
-		`source=profile type=agent_instruction path="AGENTS.md"`,
-		`source=profile type=unknown path=".codex/unknown.txt"`,
+		"profile_components:\n",
+		`component=config:AGENTS.md type=config scope=user trust=declarative path="AGENTS.md"`,
+		`component=config:.codex/unknown.txt type=config scope=user trust=declarative path=".codex/unknown.txt"`,
 		"ssh_keys:\n",
 		`label="id_work"`, "fingerprint=" + fingerprint,
 		`private_key_path="` + filepath.Join(sshDirectory, "id_work") + `"`,
