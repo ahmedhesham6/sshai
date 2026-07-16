@@ -58,6 +58,25 @@ paths:
                   url: { type: string, format: uri }
         default:
           $ref: '#/components/responses/Error'
+  /capsule-access:
+    post:
+      summary: Create Capsule access grants
+      operationId: createCapsuleAccess
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CapsuleAccessRequest' }
+      responses:
+        '200':
+          description: Short-lived owner-scoped Capsule access grants.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CapsuleAccessResponse' }
+        default:
+          $ref: '#/components/responses/Error'
   /ssh-keys:
     get:
       summary: List active SSH public keys
@@ -185,14 +204,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [expectedHeadVersionId, digest, artifacts]
+              required: [expectedHeadVersionId, capsuleRefs]
               properties:
                 expectedHeadVersionId: { type: string, nullable: true }
-                digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
-                artifacts:
+                capsuleRefs:
                   type: array
                   minItems: 1
-                  items: { $ref: '#/components/schemas/ProfileArtifactInput' }
+                  items: { $ref: '#/components/schemas/CapsuleRef' }
       responses:
         '201':
           description: Immutable Profile Version published.
@@ -626,49 +644,34 @@ components:
           type: array
           items: { $ref: '#/components/schemas/ProfileSummary' }
         nextCursor: { type: string, nullable: true }
-    ProfileArtifactInput:
+    CapsuleRef:
       type: object
-      required: [kind, sourceLocator, sourceDigest, contentDigest, sizeBytes, mode, sensitivity, trust, containsExecutable]
+      required: [ref, freshnessPolicy]
       properties:
-        kind:
+        ref:
           type: string
-          enum: [agent_instruction, codex_settings, claude_settings, shell_preferences, git_preferences, agent_skill_instruction, agent_skill_executable]
-        sourceLocator: { type: string }
-        sourceDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
-        contentDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
-        sizeBytes: { type: integer, format: int64, minimum: 0 }
-        mode: { type: integer, minimum: 0, maximum: 511 }
-        sensitivity: { type: string, enum: [public, private] }
-        trust: { type: string, enum: [user_authored, trusted_source, third_party] }
-        containsExecutable: { type: boolean }
-    ProfileArtifact:
-      type: object
-      required: [id, kind, sourceLocator, sourceDigest, contentDigest, sizeBytes, mode, sensitivity, trust, containsExecutable]
-      properties:
-        id: { type: string }
-        kind:
+          minLength: 3
+          pattern: '^owner/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/capsule@sha256:[a-f0-9]{64}$'
+        freshnessPolicy:
           type: string
-          enum: [agent_instruction, codex_settings, claude_settings, shell_preferences, git_preferences, agent_skill_instruction, agent_skill_executable]
-        sourceLocator: { type: string }
-        sourceDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
-        contentDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
-        sizeBytes: { type: integer, format: int64, minimum: 0 }
-        mode: { type: integer, minimum: 0, maximum: 511 }
-        sensitivity: { type: string, enum: [public, private] }
-        trust: { type: string, enum: [user_authored, trusted_source, third_party] }
-        containsExecutable: { type: boolean }
+          enum: [track, review, pin]
+        exclusions:
+          type: array
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 256 }
     ProfileVersion:
       type: object
-      required: [id, profileId, version, digest, artifacts, createdAt]
+      required: [id, profileId, version, digest, capsuleRefs, createdAt]
       properties:
         id: { type: string }
         profileId: { type: string }
         parentVersionId: { type: string, nullable: true }
         version: { type: integer, format: int64 }
         digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
-        artifacts:
+        capsuleRefs:
           type: array
-          items: { $ref: '#/components/schemas/ProfileArtifact' }
+          minItems: 1
+          items: { $ref: '#/components/schemas/CapsuleRef' }
         createdAt: { type: string, format: date-time }
     ProjectSeedInput:
       type: object
@@ -717,7 +720,7 @@ components:
         imageVersion: { type: string }
     Environment:
       type: object
-      required: [id, name, slug, lifecycle, health, region, runtimePreset, pinnedProfileVersionId, autoStopPolicy, createdAt]
+      required: [id, name, slug, lifecycle, health, region, runtimePreset, pinnedProfileVersionId, capsuleLockId, autoStopPolicy, createdAt]
       properties:
         id: { type: string }
         name: { type: string }
@@ -727,10 +730,66 @@ components:
         region: { type: string }
         runtimePreset: { type: string }
         pinnedProfileVersionId: { type: string }
+        capsuleLockId: { type: string }
+        capsuleLock: { $ref: '#/components/schemas/CapsuleLock' }
         autoStopPolicy: { $ref: '#/components/schemas/AutoStopPolicy' }
         runtime: { $ref: '#/components/schemas/Runtime' }
         activeOperationId: { type: string, nullable: true }
         createdAt: { type: string, format: date-time }
+    LockedCapsule:
+      type: object
+      required: [ref, digest]
+      properties:
+        ref: { type: string }
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+    CapsuleLock:
+      type: object
+      required: [id, digest, profileVersionId, projectCapsuleDigest, capsules]
+      properties:
+        id: { type: string }
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        profileVersionId: { type: string }
+        projectCapsuleDigest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        capsules:
+          type: array
+          items: { $ref: '#/components/schemas/LockedCapsule' }
+    CapsuleAccessRequest:
+      type: object
+      required: [intent, objects]
+      properties:
+        intent:
+          type: string
+          enum: [pull, push]
+        objects:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/CapsuleAccessObject' }
+    CapsuleAccessObject:
+      type: object
+      description: One owner-scoped OCI object. index maps to IndexKey, manifest to ManifestKey, and blob to BlobKey.
+      required: [kind, digest]
+      properties:
+        kind:
+          type: string
+          enum: [index, manifest, blob]
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+    CapsuleAccessGrant:
+      type: object
+      required: [url, method, headers, expiresAt]
+      properties:
+        url: { type: string, format: uri }
+        method: { type: string, enum: [GET, PUT] }
+        headers:
+          type: object
+          additionalProperties: { type: string, maxLength: 8192 }
+        expiresAt: { type: string, format: date-time }
+    CapsuleAccessResponse:
+      type: object
+      required: [grants]
+      properties:
+        grants:
+          type: array
+          items: { $ref: '#/components/schemas/CapsuleAccessGrant' }
     EnvironmentOperation:
       type: object
       required: [environment, operation]

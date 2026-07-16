@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,7 +17,7 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/domain"
 )
 
-func TestProfileHTTPTracerCreatesAndPublishesOwnedProfile(t *testing.T) {
+func TestProfileHTTPCreatesAndPublishesOwnedProfile(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	repository := &profileHTTPRepositoryFake{}
 	handler := profileHandler(repository, []string{"profile-1", "version-1", "artifact-1"}, []string{"request-create", "request-publish"}, now)
@@ -35,17 +34,7 @@ func TestProfileHTTPTracerCreatesAndPublishesOwnedProfile(t *testing.T) {
 		t.Fatalf("created Profile = %#v", created)
 	}
 
-	publishedResponse := serveProfileRequest(handler, http.MethodPost, "/v1/profiles/profile-1/versions", "profile-publish-key", `{
-		"expectedHeadVersionId":null,
-		"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		"artifacts":[{
-			"kind":"agent_instruction","sourceLocator":"AGENTS.md#$",
-			"sourceDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-			"contentDigest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-			"sizeBytes":42,"mode":416,
-			"sensitivity":"private","trust":"user_authored","containsExecutable":false
-		}]
-	}`)
+	publishedResponse := serveProfileRequest(handler, http.MethodPost, "/v1/profiles/profile-1/versions", "profile-publish-key", validProfilePublicationBody())
 	if publishedResponse.Code != http.StatusCreated || publishedResponse.Header().Get("X-Request-ID") != "request-publish" {
 		t.Fatalf("publish response = status:%d request:%q body:%s", publishedResponse.Code, publishedResponse.Header().Get("X-Request-ID"), publishedResponse.Body.String())
 	}
@@ -53,31 +42,33 @@ func TestProfileHTTPTracerCreatesAndPublishesOwnedProfile(t *testing.T) {
 	if err := json.NewDecoder(publishedResponse.Body).Decode(&published); err != nil {
 		t.Fatalf("decode published Profile Version: %v", err)
 	}
-	if published.Id != "version-1" || published.ProfileId != "profile-1" || published.Version != 1 || len(published.Artifacts) != 1 || published.Artifacts[0].Id != "artifact-1" || published.Artifacts[0].SizeBytes != 42 || published.Artifacts[0].Mode != 416 {
+	if published.Id != "version-1" || published.ProfileId != "profile-1" || published.Version != 1 || len(published.CapsuleRefs) != 1 {
 		t.Fatalf("published Profile Version = %#v", published)
 	}
-	if repository.ownerID != "user-1" || repository.createKey != "profile-create-key" || repository.publishKey != "profile-publish-key" {
-		t.Fatalf("repository command scope = owner:%q create:%q publish:%q", repository.ownerID, repository.createKey, repository.publishKey)
+	if published.Digest != domain.ComputeProfileVersionDigest([]domain.CapsuleRef{{
+		Ref: "owner/user-1/capsule@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", FreshnessPolicy: domain.FreshnessTrack, Exclusions: []string{"config:editor"},
+	}}) {
+		t.Fatalf("published digest = %q, want server-computed digest", published.Digest)
+	}
+	if repository.publishCalls != 1 || repository.ownerID != "user-1" || repository.publishKey != "profile-publish-key" {
+		t.Fatalf("publication repository scope = calls:%d owner:%q key:%q", repository.publishCalls, repository.ownerID, repository.publishKey)
 	}
 }
 
-func TestProfileHTTPMapsSafeCommandErrors(t *testing.T) {
+func TestProfileHTTPMapsSafeCreateErrors(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	for _, scenario := range []struct {
-		name, path, body, wantCode string
-		repositoryError            error
-		wantStatus                 int
+		name, body, wantCode string
+		repositoryError      error
+		wantStatus           int
 	}{
-		{name: "unsupported fork", path: "/v1/profiles", body: `{"name":"Fork","forkedFromVersionId":"version-1"}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "PROFILE_FORK_UNSUPPORTED"},
-		{name: "create conflict", path: "/v1/profiles", body: `{"name":"Personal"}`, repositoryError: db.ErrProfileConflict, wantStatus: http.StatusConflict, wantCode: "PROFILE_CONFLICT"},
-		{name: "stale head", path: "/v1/profiles/profile-1/versions", body: validProfilePublicationBody(), repositoryError: domain.ErrStaleProfileHead, wantStatus: http.StatusConflict, wantCode: "STALE_PROFILE_HEAD"},
-		{name: "foreign Profile", path: "/v1/profiles/profile-1/versions", body: validProfilePublicationBody(), repositoryError: db.ErrReferenceNotOwned, wantStatus: http.StatusNotFound, wantCode: "PROFILE_NOT_FOUND"},
-		{name: "unavailable", path: "/v1/profiles/profile-1/versions", body: validProfilePublicationBody(), repositoryError: errors.New("postgres password=secret"), wantStatus: http.StatusServiceUnavailable, wantCode: "COMMAND_UNAVAILABLE"},
+		{name: "unsupported fork", body: `{"name":"Fork","forkedFromVersionId":"version-1"}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "PROFILE_FORK_UNSUPPORTED"},
+		{name: "create conflict", body: `{"name":"Personal"}`, repositoryError: db.ErrProfileConflict, wantStatus: http.StatusConflict, wantCode: "PROFILE_CONFLICT"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			repository := &profileHTTPRepositoryFake{err: scenario.repositoryError}
 			handler := profileHandler(repository, []string{"generated-1", "generated-2"}, []string{"request-error"}, now)
-			response := serveProfileRequest(handler, http.MethodPost, scenario.path, "profile-error-key", scenario.body)
+			response := serveProfileRequest(handler, http.MethodPost, "/v1/profiles", "profile-error-key", scenario.body)
 			if response.Code != scenario.wantStatus || !bytes.Contains(response.Body.Bytes(), []byte(`"code":"`+scenario.wantCode+`"`)) {
 				t.Fatalf("error response = status:%d body:%s", response.Code, response.Body.String())
 			}
@@ -88,55 +79,80 @@ func TestProfileHTTPMapsSafeCommandErrors(t *testing.T) {
 	}
 }
 
-func TestProfileHTTPMapsUploadVerificationErrorsSafely(t *testing.T) {
+func TestProfileHTTPRejectsInvalidCapsulePublicationContract(t *testing.T) {
 	for _, scenario := range []struct {
-		name       string
-		err        error
-		wantStatus int
-		wantCode   string
+		name, body string
 	}{
-		{name: "invalid upload", err: application.ErrUploadNotVerified, wantStatus: http.StatusBadRequest, wantCode: "INVALID_UPLOAD"},
-		{name: "missing object", err: application.ErrUploadObjectNotFound, wantStatus: http.StatusNotFound, wantCode: "UPLOAD_NOT_FOUND"},
-		{name: "unavailable", err: errors.New("s3 password=secret"), wantStatus: http.StatusServiceUnavailable, wantCode: "COMMAND_UNAVAILABLE"},
+		{name: "empty capsuleRefs", body: `{"expectedHeadVersionId":null,"capsuleRefs":[]}`},
+		{name: "bad freshnessPolicy", body: `{"expectedHeadVersionId":null,"capsuleRefs":[{"ref":"owner/user-1/capsule@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","freshnessPolicy":"archive"}]}`},
+		{name: "malformed ref", body: `{"expectedHeadVersionId":null,"capsuleRefs":[{"ref":"not a registry reference","freshnessPolicy":"track"}]}`},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			now := time.Now()
-			handler := controlplane.NewHandler(controlplane.Config{
-				Profiles: application.NewProfileService(&profileHTTPRepositoryFake{}, &successfulUploadVerifier{size: 42, err: scenario.err}, &idsFake{values: []string{"version-1", "artifact-1"}}, func() time.Time { return now }),
-				Verifier: verifierFake{}, Users: &usersFake{}, UserIDs: &idsFake{values: []string{"user-1"}},
-				RequestIDs: &idsFake{values: []string{"request-upload-error"}}, DefaultRegion: "us-east-1", Now: func() time.Time { return now },
-			})
-			response := serveProfileRequest(handler, http.MethodPost, "/v1/profiles/profile-1/versions", "profile-publish-key", validProfilePublicationBody())
-			if response.Code != scenario.wantStatus || !bytes.Contains(response.Body.Bytes(), []byte(`"code":"`+scenario.wantCode+`"`)) || bytes.Contains(response.Body.Bytes(), []byte("password=secret")) {
-				t.Fatalf("response = status:%d body:%s", response.Code, response.Body.String())
-			}
-		})
-	}
-}
-
-func TestProfileHTTPRejectsMissingOrOutOfRangeArtifactFilesystemMetadataBeforeApplication(t *testing.T) {
-	valid := validProfilePublicationBody()
-	tests := []struct{ name, body string }{
-		{name: "missing size", body: strings.Replace(valid, `"sizeBytes":42,`, "", 1)},
-		{name: "missing mode", body: strings.Replace(valid, `"mode":416,`, "", 1)},
-		{name: "negative size", body: strings.Replace(valid, `"sizeBytes":42`, `"sizeBytes":-1`, 1)},
-		{name: "negative mode", body: strings.Replace(valid, `"mode":416`, `"mode":-1`, 1)},
-		{name: "mode above permissions", body: strings.Replace(valid, `"mode":416`, `"mode":512`, 1)},
-		{name: "mode uint32 wrap", body: strings.Replace(valid, `"mode":416`, `"mode":4294967296`, 1)},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
 			repository := &profileHTTPRepositoryFake{}
 			handler := profileHandler(repository, []string{"unused"}, []string{"request-invalid"}, time.Now())
-			response := serveProfileRequest(handler, http.MethodPost, "/v1/profiles/profile-1/versions", "key", test.body)
-			if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte(`"code":"INVALID_REQUEST"`)) {
-				t.Fatalf("response = status:%d body:%s", response.Code, response.Body.String())
+			response := serveProfileRequest(handler, http.MethodPost, "/v1/profiles/profile-1/versions", "profile-publish-key", scenario.body)
+			if response.Code < http.StatusBadRequest || response.Code >= http.StatusInternalServerError {
+				t.Fatalf("invalid publication status = %d, want 4xx; body:%s", response.Code, response.Body.String())
 			}
+			assertErrorResponse(t, response, "INVALID_REQUEST")
 			if repository.publishCalls != 0 {
 				t.Fatalf("invalid request reached Profile publication %d times", repository.publishCalls)
 			}
 		})
 	}
+}
+
+func TestProfileHTTPRejectsForeignOwnedCapsuleRef(t *testing.T) {
+	repository := &profileHTTPRepositoryFake{}
+	handler := profileHandler(repository, []string{"unused"}, []string{"request-foreign-ref"}, time.Now())
+	body := `{"expectedHeadVersionId":null,"capsuleRefs":[{"ref":"owner/user-2/capsule@sha256:` + strings.Repeat("a", 64) + `","freshnessPolicy":"pin"}]}`
+
+	response := serveProfileRequest(handler, http.MethodPost, "/v1/profiles/profile-1/versions", "profile-foreign-ref-key", body)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("foreign Capsule Ref status = %d, want 422; body:%s", response.Code, response.Body.String())
+	}
+	assertErrorResponse(t, response, "PROFILE_INCOMPATIBLE")
+	if repository.publishCalls != 0 {
+		t.Fatalf("foreign Capsule Ref reached publication %d times", repository.publishCalls)
+	}
+}
+
+func TestProfileHTTPPublicationAuthenticatesAndMapsConflicts(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		withAuth      bool
+		repositoryErr error
+		wantStatus    int
+	}{
+		{name: "unauthenticated", wantStatus: http.StatusUnauthorized},
+		{name: "foreign Profile", withAuth: true, repositoryErr: db.ErrReferenceNotOwned, wantStatus: http.StatusNotFound},
+		{name: "owned Profile", withAuth: true, wantStatus: http.StatusCreated},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := &profileHTTPRepositoryFake{err: test.repositoryErr}
+			handler := profileHandler(repository, []string{"unused"}, []string{"request-publication"}, time.Now())
+			response := serveProfileRequestWithAuth(handler, test.withAuth, http.MethodPost, "/v1/profiles/profile-1/versions", "profile-publish-key", validProfilePublicationBody())
+			if response.Code != test.wantStatus {
+				t.Fatalf("publication status = %d, want %d; body:%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if test.wantStatus == http.StatusCreated && repository.publishCalls != 1 {
+				t.Fatalf("owned publication persistence calls = %d, want 1", repository.publishCalls)
+			}
+			if test.wantStatus == http.StatusNotFound && repository.publishCalls != 1 {
+				t.Fatalf("foreign publication persistence calls = %d, want 1", repository.publishCalls)
+			}
+		})
+	}
+}
+
+func TestProfileHTTPMapsStaleHeadToConflict(t *testing.T) {
+	repository := &profileHTTPRepositoryFake{err: domain.ErrStaleProfileHead}
+	handler := profileHandler(repository, []string{"unused"}, []string{"request-stale"}, time.Now())
+	response := serveProfileRequest(handler, http.MethodPost, "/v1/profiles/profile-1/versions", "profile-publish-key", validProfilePublicationBody())
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stale publication status = %d, want 409; body:%s", response.Code, response.Body.String())
+	}
+	assertErrorResponse(t, response, "STALE_PROFILE_HEAD")
 }
 
 func profileHandler(repository application.ProfileRepository, profileIDs, requestIDs []string, now time.Time) http.Handler {
@@ -148,8 +164,14 @@ func profileHandler(repository application.ProfileRepository, profileIDs, reques
 }
 
 func serveProfileRequest(handler http.Handler, method, path, key, body string) *httptest.ResponseRecorder {
+	return serveProfileRequestWithAuth(handler, true, method, path, key, body)
+}
+
+func serveProfileRequestWithAuth(handler http.Handler, withAuth bool, method, path, key, body string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(method, path, bytes.NewBufferString(body))
-	request.Header.Set("Authorization", "Bearer valid-token")
+	if withAuth {
+		request.Header.Set("Authorization", "Bearer valid-token")
+	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", key)
 	response := httptest.NewRecorder()
@@ -158,7 +180,18 @@ func serveProfileRequest(handler http.Handler, method, path, key, body string) *
 }
 
 func validProfilePublicationBody() string {
-	return `{"expectedHeadVersionId":null,"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifacts":[{"kind":"agent_instruction","sourceLocator":"AGENTS.md#$","sourceDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","contentDigest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sizeBytes":42,"mode":416,"sensitivity":"private","trust":"user_authored","containsExecutable":false}]}`
+	return `{"expectedHeadVersionId":null,"capsuleRefs":[{"ref":"owner/user-1/capsule@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","freshnessPolicy":"track","exclusions":["config:editor"]}]}`
+}
+
+func assertErrorResponse(t *testing.T, response *httptest.ResponseRecorder, wantCode string) {
+	t.Helper()
+	var body contracts.ErrorResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if body.RequestId != response.Header().Get("X-Request-ID") || body.Error.Code != wantCode || body.Error.Message == "" {
+		t.Fatalf("error response = %#v, want request ID %q and code %q", body, response.Header().Get("X-Request-ID"), wantCode)
+	}
 }
 
 type profileHTTPRepositoryFake struct {
@@ -166,12 +199,18 @@ type profileHTTPRepositoryFake struct {
 	ownerID, createKey string
 	publishKey         string
 	publishCalls       int
+	ownershipCalls     int
 	err                error
 }
 
 func (repository *profileHTTPRepositoryFake) CreateProfile(_ context.Context, profile domain.Profile, key string) (domain.Profile, error) {
 	repository.profile, repository.ownerID, repository.createKey = profile, profile.Snapshot().OwnerUserID, key
 	return profile, repository.err
+}
+
+func (repository *profileHTTPRepositoryFake) CheckProfileOwnership(_ context.Context, _, _ string) error {
+	repository.ownershipCalls++
+	return repository.err
 }
 
 func (repository *profileHTTPRepositoryFake) PublishProfileVersion(_ context.Context, ownerID, profileID string, expectedHead *string, publication domain.ProfileVersionPublication, key string) (domain.ProfileVersion, error) {

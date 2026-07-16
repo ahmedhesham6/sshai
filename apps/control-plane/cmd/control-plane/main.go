@@ -19,6 +19,9 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/provideraws"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -89,6 +92,17 @@ func run(ctx context.Context) error {
 			domain.UploadSeedManifest:    maxSingleObjectBytes,
 		},
 	)
+	awsSDKConfig, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(config.defaultRegion))
+	if err != nil {
+		return fmt.Errorf("load Capsule store AWS configuration: %w", err)
+	}
+	capsuleClient := s3.NewFromConfig(awsSDKConfig, func(options *s3.Options) {
+		if config.s3EndpointURL != "" {
+			options.BaseEndpoint = aws.String(config.s3EndpointURL)
+			options.UsePathStyle = true
+		}
+	})
+	capsulePresigner := s3.NewPresignClient(capsuleClient)
 	createEnvironment := application.NewCreateEnvironmentService(
 		store, dispatcher, ids, time.Now,
 		map[string]string{config.defaultRegion: config.defaultAvailabilityZone},
@@ -98,7 +112,7 @@ func run(ctx context.Context) error {
 	sshKeys := application.NewSSHKeyService(store, ids, time.Now)
 	handler := controlplane.NewHandler(controlplane.Config{
 		CreateEnvironment: createEnvironment, RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
-		Verifier: verifier, Users: store,
+		Verifier: verifier, Users: store, CapsulePresigner: capsulePresigner, CapsuleOwnership: controlplane.NewS3CapsuleOwnership(capsuleClient, config.capsuleBucket), CapsuleBucket: config.capsuleBucket, CapsuleAccessTTL: 15 * time.Minute,
 		UserIDs: ids, RequestIDs: ids, DefaultRegion: config.defaultRegion, Now: time.Now,
 	})
 	server := &http.Server{Addr: config.listenAddress, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
@@ -124,6 +138,7 @@ type config struct {
 	defaultAvailabilityZone string
 	listenAddress           string
 	uploadBucket            string
+	capsuleBucket           string
 	s3EndpointURL           string
 }
 
@@ -137,11 +152,11 @@ func loadConfig() (config, error) {
 		defaultRegion:           valueOrDefault("DEFAULT_REGION", "us-east-1"),
 		defaultAvailabilityZone: valueOrDefault("DEFAULT_AVAILABILITY_ZONE", "us-east-1a"),
 		listenAddress:           valueOrDefault("LISTEN_ADDR", ":8081"),
-		uploadBucket:            os.Getenv("UPLOAD_BUCKET"),
-		s3EndpointURL:           os.Getenv("AWS_ENDPOINT_URL_S3"),
+		uploadBucket:            os.Getenv("UPLOAD_BUCKET"), capsuleBucket: os.Getenv("CAPSULE_BUCKET"),
+		s3EndpointURL: os.Getenv("AWS_ENDPOINT_URL_S3"),
 	}
-	if config.databaseURL == "" || config.workOSClientID == "" || config.uploadBucket == "" {
-		return config, errors.New("DATABASE_URL, WORKOS_CLIENT_ID, and UPLOAD_BUCKET are required")
+	if config.databaseURL == "" || config.workOSClientID == "" || config.uploadBucket == "" || config.capsuleBucket == "" {
+		return config, errors.New("DATABASE_URL, WORKOS_CLIENT_ID, UPLOAD_BUCKET, and CAPSULE_BUCKET are required")
 	}
 	return config, nil
 }

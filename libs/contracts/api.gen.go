@@ -51,6 +51,84 @@ func (e AutoStopPolicyMode) Valid() bool {
 	}
 }
 
+// Defines values for CapsuleAccessGrantMethod.
+const (
+	GET CapsuleAccessGrantMethod = "GET"
+	PUT CapsuleAccessGrantMethod = "PUT"
+)
+
+// Valid indicates whether the value is a known member of the CapsuleAccessGrantMethod enum.
+func (e CapsuleAccessGrantMethod) Valid() bool {
+	switch e {
+	case GET:
+		return true
+	case PUT:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CapsuleAccessObjectKind.
+const (
+	Blob     CapsuleAccessObjectKind = "blob"
+	Index    CapsuleAccessObjectKind = "index"
+	Manifest CapsuleAccessObjectKind = "manifest"
+)
+
+// Valid indicates whether the value is a known member of the CapsuleAccessObjectKind enum.
+func (e CapsuleAccessObjectKind) Valid() bool {
+	switch e {
+	case Blob:
+		return true
+	case Index:
+		return true
+	case Manifest:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CapsuleAccessRequestIntent.
+const (
+	Pull CapsuleAccessRequestIntent = "pull"
+	Push CapsuleAccessRequestIntent = "push"
+)
+
+// Valid indicates whether the value is a known member of the CapsuleAccessRequestIntent enum.
+func (e CapsuleAccessRequestIntent) Valid() bool {
+	switch e {
+	case Pull:
+		return true
+	case Push:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CapsuleRefFreshnessPolicy.
+const (
+	Pin    CapsuleRefFreshnessPolicy = "pin"
+	Review CapsuleRefFreshnessPolicy = "review"
+	Track  CapsuleRefFreshnessPolicy = "track"
+)
+
+// Valid indicates whether the value is a known member of the CapsuleRefFreshnessPolicy enum.
+func (e CapsuleRefFreshnessPolicy) Valid() bool {
+	switch e {
+	case Pin:
+		return true
+	case Review:
+		return true
+	case Track:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for EnvironmentHealth.
 const (
 	EnvironmentHealthBlocked  EnvironmentHealth = "blocked"
@@ -159,150 +237,6 @@ func (e OperationStepStatus) Valid() bool {
 	}
 }
 
-// Defines values for ProfileArtifactKind.
-const (
-	ProfileArtifactKindAgentInstruction      ProfileArtifactKind = "agent_instruction"
-	ProfileArtifactKindAgentSkillExecutable  ProfileArtifactKind = "agent_skill_executable"
-	ProfileArtifactKindAgentSkillInstruction ProfileArtifactKind = "agent_skill_instruction"
-	ProfileArtifactKindClaudeSettings        ProfileArtifactKind = "claude_settings"
-	ProfileArtifactKindCodexSettings         ProfileArtifactKind = "codex_settings"
-	ProfileArtifactKindGitPreferences        ProfileArtifactKind = "git_preferences"
-	ProfileArtifactKindShellPreferences      ProfileArtifactKind = "shell_preferences"
-)
-
-// Valid indicates whether the value is a known member of the ProfileArtifactKind enum.
-func (e ProfileArtifactKind) Valid() bool {
-	switch e {
-	case ProfileArtifactKindAgentInstruction:
-		return true
-	case ProfileArtifactKindAgentSkillExecutable:
-		return true
-	case ProfileArtifactKindAgentSkillInstruction:
-		return true
-	case ProfileArtifactKindClaudeSettings:
-		return true
-	case ProfileArtifactKindCodexSettings:
-		return true
-	case ProfileArtifactKindGitPreferences:
-		return true
-	case ProfileArtifactKindShellPreferences:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for ProfileArtifactSensitivity.
-const (
-	ProfileArtifactSensitivityPrivate ProfileArtifactSensitivity = "private"
-	ProfileArtifactSensitivityPublic  ProfileArtifactSensitivity = "public"
-)
-
-// Valid indicates whether the value is a known member of the ProfileArtifactSensitivity enum.
-func (e ProfileArtifactSensitivity) Valid() bool {
-	switch e {
-	case ProfileArtifactSensitivityPrivate:
-		return true
-	case ProfileArtifactSensitivityPublic:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for ProfileArtifactTrust.
-const (
-	ProfileArtifactTrustThirdParty    ProfileArtifactTrust = "third_party"
-	ProfileArtifactTrustTrustedSource ProfileArtifactTrust = "trusted_source"
-	ProfileArtifactTrustUserAuthored  ProfileArtifactTrust = "user_authored"
-)
-
-// Valid indicates whether the value is a known member of the ProfileArtifactTrust enum.
-func (e ProfileArtifactTrust) Valid() bool {
-	switch e {
-	case ProfileArtifactTrustThirdParty:
-		return true
-	case ProfileArtifactTrustTrustedSource:
-		return true
-	case ProfileArtifactTrustUserAuthored:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for ProfileArtifactInputKind.
-const (
-	ProfileArtifactInputKindAgentInstruction      ProfileArtifactInputKind = "agent_instruction"
-	ProfileArtifactInputKindAgentSkillExecutable  ProfileArtifactInputKind = "agent_skill_executable"
-	ProfileArtifactInputKindAgentSkillInstruction ProfileArtifactInputKind = "agent_skill_instruction"
-	ProfileArtifactInputKindClaudeSettings        ProfileArtifactInputKind = "claude_settings"
-	ProfileArtifactInputKindCodexSettings         ProfileArtifactInputKind = "codex_settings"
-	ProfileArtifactInputKindGitPreferences        ProfileArtifactInputKind = "git_preferences"
-	ProfileArtifactInputKindShellPreferences      ProfileArtifactInputKind = "shell_preferences"
-)
-
-// Valid indicates whether the value is a known member of the ProfileArtifactInputKind enum.
-func (e ProfileArtifactInputKind) Valid() bool {
-	switch e {
-	case ProfileArtifactInputKindAgentInstruction:
-		return true
-	case ProfileArtifactInputKindAgentSkillExecutable:
-		return true
-	case ProfileArtifactInputKindAgentSkillInstruction:
-		return true
-	case ProfileArtifactInputKindClaudeSettings:
-		return true
-	case ProfileArtifactInputKindCodexSettings:
-		return true
-	case ProfileArtifactInputKindGitPreferences:
-		return true
-	case ProfileArtifactInputKindShellPreferences:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for ProfileArtifactInputSensitivity.
-const (
-	ProfileArtifactInputSensitivityPrivate ProfileArtifactInputSensitivity = "private"
-	ProfileArtifactInputSensitivityPublic  ProfileArtifactInputSensitivity = "public"
-)
-
-// Valid indicates whether the value is a known member of the ProfileArtifactInputSensitivity enum.
-func (e ProfileArtifactInputSensitivity) Valid() bool {
-	switch e {
-	case ProfileArtifactInputSensitivityPrivate:
-		return true
-	case ProfileArtifactInputSensitivityPublic:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for ProfileArtifactInputTrust.
-const (
-	ProfileArtifactInputTrustThirdParty    ProfileArtifactInputTrust = "third_party"
-	ProfileArtifactInputTrustTrustedSource ProfileArtifactInputTrust = "trusted_source"
-	ProfileArtifactInputTrustUserAuthored  ProfileArtifactInputTrust = "user_authored"
-)
-
-// Valid indicates whether the value is a known member of the ProfileArtifactInputTrust enum.
-func (e ProfileArtifactInputTrust) Valid() bool {
-	switch e {
-	case ProfileArtifactInputTrustThirdParty:
-		return true
-	case ProfileArtifactInputTrustTrustedSource:
-		return true
-	case ProfileArtifactInputTrustUserAuthored:
-		return true
-	default:
-		return false
-	}
-}
-
 // Defines values for RuntimeStatus.
 const (
 	RuntimeStatusAbsent       RuntimeStatus = "absent"
@@ -371,25 +305,25 @@ func (e StopEnvironmentRuntimeJSONBodyReason) Valid() bool {
 
 // Defines values for CreateUploadIntentJSONBodyKind.
 const (
-	CreateUploadIntentJSONBodyKindGitBundle       CreateUploadIntentJSONBodyKind = "git_bundle"
-	CreateUploadIntentJSONBodyKindProfileArtifact CreateUploadIntentJSONBodyKind = "profile_artifact"
-	CreateUploadIntentJSONBodyKindSeedManifest    CreateUploadIntentJSONBodyKind = "seed_manifest"
-	CreateUploadIntentJSONBodyKindTrackedPatch    CreateUploadIntentJSONBodyKind = "tracked_patch"
-	CreateUploadIntentJSONBodyKindUntrackedBundle CreateUploadIntentJSONBodyKind = "untracked_bundle"
+	GitBundle       CreateUploadIntentJSONBodyKind = "git_bundle"
+	ProfileArtifact CreateUploadIntentJSONBodyKind = "profile_artifact"
+	SeedManifest    CreateUploadIntentJSONBodyKind = "seed_manifest"
+	TrackedPatch    CreateUploadIntentJSONBodyKind = "tracked_patch"
+	UntrackedBundle CreateUploadIntentJSONBodyKind = "untracked_bundle"
 )
 
 // Valid indicates whether the value is a known member of the CreateUploadIntentJSONBodyKind enum.
 func (e CreateUploadIntentJSONBodyKind) Valid() bool {
 	switch e {
-	case CreateUploadIntentJSONBodyKindGitBundle:
+	case GitBundle:
 		return true
-	case CreateUploadIntentJSONBodyKindProfileArtifact:
+	case ProfileArtifact:
 		return true
-	case CreateUploadIntentJSONBodyKindSeedManifest:
+	case SeedManifest:
 		return true
-	case CreateUploadIntentJSONBodyKindTrackedPatch:
+	case TrackedPatch:
 		return true
-	case CreateUploadIntentJSONBodyKindUntrackedBundle:
+	case UntrackedBundle:
 		return true
 	default:
 		return false
@@ -411,6 +345,59 @@ type BillingSummary struct {
 	CurrentPeriodEnd   *time.Time `json:"currentPeriodEnd,omitempty"`
 	SubscriptionStatus string     `json:"subscriptionStatus"`
 }
+
+// CapsuleAccessGrant defines model for CapsuleAccessGrant.
+type CapsuleAccessGrant struct {
+	ExpiresAt time.Time                `json:"expiresAt"`
+	Headers   map[string]string        `json:"headers"`
+	Method    CapsuleAccessGrantMethod `json:"method"`
+	Url       string                   `json:"url"`
+}
+
+// CapsuleAccessGrantMethod defines model for CapsuleAccessGrant.Method.
+type CapsuleAccessGrantMethod string
+
+// CapsuleAccessObject One owner-scoped OCI object. index maps to IndexKey, manifest to ManifestKey, and blob to BlobKey.
+type CapsuleAccessObject struct {
+	Digest string                  `json:"digest"`
+	Kind   CapsuleAccessObjectKind `json:"kind"`
+}
+
+// CapsuleAccessObjectKind defines model for CapsuleAccessObject.Kind.
+type CapsuleAccessObjectKind string
+
+// CapsuleAccessRequest defines model for CapsuleAccessRequest.
+type CapsuleAccessRequest struct {
+	Intent  CapsuleAccessRequestIntent `json:"intent"`
+	Objects []CapsuleAccessObject      `json:"objects"`
+}
+
+// CapsuleAccessRequestIntent defines model for CapsuleAccessRequest.Intent.
+type CapsuleAccessRequestIntent string
+
+// CapsuleAccessResponse defines model for CapsuleAccessResponse.
+type CapsuleAccessResponse struct {
+	Grants []CapsuleAccessGrant `json:"grants"`
+}
+
+// CapsuleLock defines model for CapsuleLock.
+type CapsuleLock struct {
+	Capsules             []LockedCapsule `json:"capsules"`
+	Digest               string          `json:"digest"`
+	Id                   string          `json:"id"`
+	ProfileVersionId     string          `json:"profileVersionId"`
+	ProjectCapsuleDigest string          `json:"projectCapsuleDigest"`
+}
+
+// CapsuleRef defines model for CapsuleRef.
+type CapsuleRef struct {
+	Exclusions      *[]string                 `json:"exclusions,omitempty"`
+	FreshnessPolicy CapsuleRefFreshnessPolicy `json:"freshnessPolicy"`
+	Ref             string                    `json:"ref"`
+}
+
+// CapsuleRefFreshnessPolicy defines model for CapsuleRef.FreshnessPolicy.
+type CapsuleRefFreshnessPolicy string
 
 // ConnectionIntent defines model for ConnectionIntent.
 type ConnectionIntent struct {
@@ -437,6 +424,8 @@ type CreateEnvironmentInput struct {
 type Environment struct {
 	ActiveOperationId      *string              `json:"activeOperationId,omitempty"`
 	AutoStopPolicy         AutoStopPolicy       `json:"autoStopPolicy"`
+	CapsuleLock            *CapsuleLock         `json:"capsuleLock,omitempty"`
+	CapsuleLockId          string               `json:"capsuleLockId"`
 	CreatedAt              time.Time            `json:"createdAt"`
 	Health                 EnvironmentHealth    `json:"health"`
 	Id                     string               `json:"id"`
@@ -495,6 +484,12 @@ type ErrorResponse struct {
 	RequestId string `json:"requestId"`
 }
 
+// LockedCapsule defines model for LockedCapsule.
+type LockedCapsule struct {
+	Digest string `json:"digest"`
+	Ref    string `json:"ref"`
+}
+
 // Operation defines model for Operation.
 type Operation struct {
 	CompletedAt   *time.Time      `json:"completedAt,omitempty"`
@@ -519,51 +514,6 @@ type OperationStep struct {
 // OperationStepStatus defines model for OperationStep.Status.
 type OperationStepStatus string
 
-// ProfileArtifact defines model for ProfileArtifact.
-type ProfileArtifact struct {
-	ContainsExecutable bool                       `json:"containsExecutable"`
-	ContentDigest      string                     `json:"contentDigest"`
-	Id                 string                     `json:"id"`
-	Kind               ProfileArtifactKind        `json:"kind"`
-	Mode               int                        `json:"mode"`
-	Sensitivity        ProfileArtifactSensitivity `json:"sensitivity"`
-	SizeBytes          int64                      `json:"sizeBytes"`
-	SourceDigest       string                     `json:"sourceDigest"`
-	SourceLocator      string                     `json:"sourceLocator"`
-	Trust              ProfileArtifactTrust       `json:"trust"`
-}
-
-// ProfileArtifactKind defines model for ProfileArtifact.Kind.
-type ProfileArtifactKind string
-
-// ProfileArtifactSensitivity defines model for ProfileArtifact.Sensitivity.
-type ProfileArtifactSensitivity string
-
-// ProfileArtifactTrust defines model for ProfileArtifact.Trust.
-type ProfileArtifactTrust string
-
-// ProfileArtifactInput defines model for ProfileArtifactInput.
-type ProfileArtifactInput struct {
-	ContainsExecutable bool                            `json:"containsExecutable"`
-	ContentDigest      string                          `json:"contentDigest"`
-	Kind               ProfileArtifactInputKind        `json:"kind"`
-	Mode               int                             `json:"mode"`
-	Sensitivity        ProfileArtifactInputSensitivity `json:"sensitivity"`
-	SizeBytes          int64                           `json:"sizeBytes"`
-	SourceDigest       string                          `json:"sourceDigest"`
-	SourceLocator      string                          `json:"sourceLocator"`
-	Trust              ProfileArtifactInputTrust       `json:"trust"`
-}
-
-// ProfileArtifactInputKind defines model for ProfileArtifactInput.Kind.
-type ProfileArtifactInputKind string
-
-// ProfileArtifactInputSensitivity defines model for ProfileArtifactInput.Sensitivity.
-type ProfileArtifactInputSensitivity string
-
-// ProfileArtifactInputTrust defines model for ProfileArtifactInput.Trust.
-type ProfileArtifactInputTrust string
-
 // ProfilePage defines model for ProfilePage.
 type ProfilePage struct {
 	Items      []ProfileSummary `json:"items"`
@@ -580,13 +530,13 @@ type ProfileSummary struct {
 
 // ProfileVersion defines model for ProfileVersion.
 type ProfileVersion struct {
-	Artifacts       []ProfileArtifact `json:"artifacts"`
-	CreatedAt       time.Time         `json:"createdAt"`
-	Digest          string            `json:"digest"`
-	Id              string            `json:"id"`
-	ParentVersionId *string           `json:"parentVersionId,omitempty"`
-	ProfileId       string            `json:"profileId"`
-	Version         int64             `json:"version"`
+	CapsuleRefs     []CapsuleRef `json:"capsuleRefs"`
+	CreatedAt       time.Time    `json:"createdAt"`
+	Digest          string       `json:"digest"`
+	Id              string       `json:"id"`
+	ParentVersionId *string      `json:"parentVersionId,omitempty"`
+	ProfileId       string       `json:"profileId"`
+	Version         int64        `json:"version"`
 }
 
 // ProjectSeedInput defines model for ProjectSeedInput.
@@ -757,9 +707,8 @@ type CreateProfileParams struct {
 
 // PublishProfileVersionJSONBody defines parameters for PublishProfileVersion.
 type PublishProfileVersionJSONBody struct {
-	Artifacts             []ProfileArtifactInput `json:"artifacts"`
-	Digest                string                 `json:"digest"`
-	ExpectedHeadVersionId *string                `json:"expectedHeadVersionId"`
+	CapsuleRefs           []CapsuleRef `json:"capsuleRefs"`
+	ExpectedHeadVersionId *string      `json:"expectedHeadVersionId"`
 }
 
 // PublishProfileVersionParams defines parameters for PublishProfileVersion.
@@ -808,6 +757,9 @@ type CreateUploadIntentParams struct {
 
 // CreateUploadIntentJSONBodyKind defines parameters for CreateUploadIntent.
 type CreateUploadIntentJSONBodyKind string
+
+// CreateCapsuleAccessJSONRequestBody defines body for CreateCapsuleAccess for application/json ContentType.
+type CreateCapsuleAccessJSONRequestBody = CapsuleAccessRequest
 
 // CreateEnvironmentJSONRequestBody defines body for CreateEnvironment for application/json ContentType.
 type CreateEnvironmentJSONRequestBody = CreateEnvironmentInput
@@ -918,6 +870,11 @@ type ClientInterface interface {
 	// CreateBillingPortal request
 	CreateBillingPortal(ctx context.Context, params *CreateBillingPortalParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// CreateCapsuleAccessWithBody request with any body
+	CreateCapsuleAccessWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	CreateCapsuleAccess(ctx context.Context, body CreateCapsuleAccessJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// ListEnvironments request
 	ListEnvironments(ctx context.Context, params *ListEnvironmentsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -1022,6 +979,30 @@ func (c *Client) GetBillingSummary(ctx context.Context, reqEditors ...RequestEdi
 
 func (c *Client) CreateBillingPortal(ctx context.Context, params *CreateBillingPortalParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewCreateBillingPortalRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) CreateCapsuleAccessWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateCapsuleAccessRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) CreateCapsuleAccess(ctx context.Context, body CreateCapsuleAccessJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateCapsuleAccessRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1491,6 +1472,46 @@ func NewCreateBillingPortalRequest(server string, params *CreateBillingPortalPar
 		req.Header.Set("Idempotency-Key", headerParam0)
 
 	}
+
+	return req, nil
+}
+
+// NewCreateCapsuleAccessRequest calls the generic CreateCapsuleAccess builder with application/json body
+func NewCreateCapsuleAccessRequest(server string, body CreateCapsuleAccessJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCreateCapsuleAccessRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCreateCapsuleAccessRequestWithBody generates requests for CreateCapsuleAccess with any type of body
+func NewCreateCapsuleAccessRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/capsule-access")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -2731,6 +2752,11 @@ type ClientWithResponsesInterface interface {
 	// CreateBillingPortalWithResponse request
 	CreateBillingPortalWithResponse(ctx context.Context, params *CreateBillingPortalParams, reqEditors ...RequestEditorFn) (*CreateBillingPortalResponse, error)
 
+	// CreateCapsuleAccessWithBodyWithResponse request with any body
+	CreateCapsuleAccessWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateCapsuleAccessResponse, error)
+
+	CreateCapsuleAccessWithResponse(ctx context.Context, body CreateCapsuleAccessJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateCapsuleAccessResponse, error)
+
 	// ListEnvironmentsWithResponse request
 	ListEnvironmentsWithResponse(ctx context.Context, params *ListEnvironmentsParams, reqEditors ...RequestEditorFn) (*ListEnvironmentsResponse, error)
 
@@ -2879,6 +2905,37 @@ func (r CreateBillingPortalResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r CreateBillingPortalResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type CreateCapsuleAccessResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *CapsuleAccessResponse
+	JSONDefault  *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r CreateCapsuleAccessResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CreateCapsuleAccessResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CreateCapsuleAccessResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -3623,6 +3680,23 @@ func (c *ClientWithResponses) CreateBillingPortalWithResponse(ctx context.Contex
 	return ParseCreateBillingPortalResponse(rsp)
 }
 
+// CreateCapsuleAccessWithBodyWithResponse request with arbitrary body returning *CreateCapsuleAccessResponse
+func (c *ClientWithResponses) CreateCapsuleAccessWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateCapsuleAccessResponse, error) {
+	rsp, err := c.CreateCapsuleAccessWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateCapsuleAccessResponse(rsp)
+}
+
+func (c *ClientWithResponses) CreateCapsuleAccessWithResponse(ctx context.Context, body CreateCapsuleAccessJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateCapsuleAccessResponse, error) {
+	rsp, err := c.CreateCapsuleAccess(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateCapsuleAccessResponse(rsp)
+}
+
 // ListEnvironmentsWithResponse request returning *ListEnvironmentsResponse
 func (c *ClientWithResponses) ListEnvironmentsWithResponse(ctx context.Context, params *ListEnvironmentsParams, reqEditors ...RequestEditorFn) (*ListEnvironmentsResponse, error) {
 	rsp, err := c.ListEnvironments(ctx, params, reqEditors...)
@@ -3961,6 +4035,39 @@ func ParseCreateBillingPortalResponse(rsp *http.Response) (*CreateBillingPortalR
 		var dest struct {
 			Url string `json:"url"`
 		}
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCreateCapsuleAccessResponse parses an HTTP response from a CreateCapsuleAccessWithResponse call
+func ParseCreateCapsuleAccessResponse(rsp *http.Response) (*CreateCapsuleAccessResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CreateCapsuleAccessResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest CapsuleAccessResponse
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4746,6 +4853,9 @@ type ServerInterface interface {
 	// Create a billing portal session
 	// (POST /billing/portal)
 	CreateBillingPortal(w http.ResponseWriter, r *http.Request, params CreateBillingPortalParams)
+	// Create Capsule access grants
+	// (POST /capsule-access)
+	CreateCapsuleAccess(w http.ResponseWriter, r *http.Request)
 	// List Environments
 	// (GET /environments)
 	ListEnvironments(w http.ResponseWriter, r *http.Request, params ListEnvironmentsParams)
@@ -4830,6 +4940,12 @@ func (_ Unimplemented) GetBillingSummary(w http.ResponseWriter, r *http.Request)
 // Create a billing portal session
 // (POST /billing/portal)
 func (_ Unimplemented) CreateBillingPortal(w http.ResponseWriter, r *http.Request, params CreateBillingPortalParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Create Capsule access grants
+// (POST /capsule-access)
+func (_ Unimplemented) CreateCapsuleAccess(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -5042,6 +5158,26 @@ func (siw *ServerInterfaceWrapper) CreateBillingPortal(w http.ResponseWriter, r 
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.CreateBillingPortal(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateCapsuleAccess operation middleware
+func (siw *ServerInterfaceWrapper) CreateCapsuleAccess(w http.ResponseWriter, r *http.Request) {
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, WorkosBearerScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateCapsuleAccess(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -6331,6 +6467,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Post(options.BaseURL+"/billing/portal", wrapper.CreateBillingPortal)
 	})
 	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/capsule-access", wrapper.CreateCapsuleAccess)
+	})
+	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/environments", wrapper.ListEnvironments)
 	})
 	r.Group(func(r chi.Router) {
@@ -6499,6 +6638,55 @@ type CreateBillingPortaldefaultJSONResponse struct {
 }
 
 func (response CreateBillingPortaldefaultJSONResponse) VisitCreateBillingPortalResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", fmt.Sprint(response.Headers.XRequestID))
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateCapsuleAccessRequestObject struct {
+	Body *CreateCapsuleAccessJSONRequestBody
+}
+
+type CreateCapsuleAccessResponseObject interface {
+	VisitCreateCapsuleAccessResponse(w http.ResponseWriter) error
+}
+
+type CreateCapsuleAccess200ResponseHeaders struct {
+	XRequestID string
+}
+
+type CreateCapsuleAccess200JSONResponse struct {
+	Body    CapsuleAccessResponse
+	Headers CreateCapsuleAccess200ResponseHeaders
+}
+
+func (response CreateCapsuleAccess200JSONResponse) VisitCreateCapsuleAccessResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", fmt.Sprint(response.Headers.XRequestID))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateCapsuleAccessdefaultJSONResponse struct {
+	Body       ErrorResponse
+	Headers    ErrorResponseHeaders
+	StatusCode int
+}
+
+func (response CreateCapsuleAccessdefaultJSONResponse) VisitCreateCapsuleAccessResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -7665,6 +7853,9 @@ type StrictServerInterface interface {
 	// Create a billing portal session
 	// (POST /billing/portal)
 	CreateBillingPortal(ctx context.Context, request CreateBillingPortalRequestObject) (CreateBillingPortalResponseObject, error)
+	// Create Capsule access grants
+	// (POST /capsule-access)
+	CreateCapsuleAccess(ctx context.Context, request CreateCapsuleAccessRequestObject) (CreateCapsuleAccessResponseObject, error)
 	// List Environments
 	// (GET /environments)
 	ListEnvironments(ctx context.Context, request ListEnvironmentsRequestObject) (ListEnvironmentsResponseObject, error)
@@ -7808,6 +7999,37 @@ func (sh *strictHandler) CreateBillingPortal(w http.ResponseWriter, r *http.Requ
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(CreateBillingPortalResponseObject); ok {
 		if err := validResponse.VisitCreateBillingPortalResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateCapsuleAccess operation middleware
+func (sh *strictHandler) CreateCapsuleAccess(w http.ResponseWriter, r *http.Request) {
+	var request CreateCapsuleAccessRequestObject
+
+	var body CreateCapsuleAccessJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateCapsuleAccess(ctx, request.(CreateCapsuleAccessRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateCapsuleAccess")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateCapsuleAccessResponseObject); ok {
+		if err := validResponse.VisitCreateCapsuleAccessResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -8499,61 +8721,65 @@ func (sh *strictHandler) CreateUploadIntent(w http.ResponseWriter, r *http.Reque
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
+	"CQAA//8=",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

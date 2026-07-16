@@ -8,6 +8,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type CapsuleLock struct {
+	ID                   string
+	EnvironmentID        string
+	ProfileVersionID     string
+	ProjectCapsuleDigest string
+	Digest               string
+	Capsules             []byte
+	ResolvedComponents   []byte
+	CreatedAt            pgtype.Timestamptz
+}
+
 type ComputeUsageInterval struct {
 	ID                  string
 	UserID              string
@@ -85,20 +96,6 @@ type Profile struct {
 	Slug        string
 	CreatedAt   pgtype.Timestamptz
 	ArchivedAt  pgtype.Timestamptz
-}
-
-type ProfileArtifact struct {
-	ID                 string
-	ProfileVersionID   string
-	Kind               string
-	SourceLocator      string
-	SourceDigest       string
-	ContentDigest      string
-	SizeBytes          int64
-	Mode               int32
-	Sensitivity        string
-	Trust              string
-	ContainsExecutable bool
 }
 
 type ProfileVersion struct {

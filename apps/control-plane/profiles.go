@@ -46,62 +46,69 @@ func (server *server) PublishProfileVersion(response http.ResponseWriter, reques
 		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", "The request body is not valid JSON.")
 		return
 	}
+	if err := ValidatePublishProfileVersionRequest(body); err != nil {
+		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
 	user, present := userFromContext(request.Context())
 	if !present {
 		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
 		return
 	}
-	artifacts := make([]application.ProfileArtifactInput, len(body.Artifacts))
-	for index, artifact := range body.Artifacts {
-		artifacts[index] = application.ProfileArtifactInput{
-			Kind: domain.ArtifactKind(artifact.Kind), SourceLocator: artifact.SourceLocator,
-			SourceDigest: artifact.SourceDigest, ContentDigest: artifact.ContentDigest,
-			SizeBytes: artifact.SizeBytes, Mode: uint32(artifact.Mode),
-			Sensitivity: domain.Sensitivity(artifact.Sensitivity), Trust: domain.TrustClass(artifact.Trust),
-			ContainsExecutable: artifact.ContainsExecutable,
+	if err := ValidatePublishProfileVersionRequestForOwner(body, user.ID); err != nil {
+		if errors.Is(err, ErrCapsuleRefNotOwned) {
+			writeError(response, request, http.StatusUnprocessableEntity, "PROFILE_INCOMPATIBLE", "Every Capsule Ref must belong to the authenticated User.")
+			return
+		}
+		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	refs := make([]domain.CapsuleRef, len(body.CapsuleRefs))
+	for index, ref := range body.CapsuleRefs {
+		var exclusions []string
+		if ref.Exclusions != nil {
+			exclusions = append([]string(nil), (*ref.Exclusions)...)
+		}
+		refs[index] = domain.CapsuleRef{
+			Ref: ref.Ref, FreshnessPolicy: domain.FreshnessPolicy(ref.FreshnessPolicy), Exclusions: exclusions,
 		}
 	}
 	version, err := server.profiles.PublishProfileVersion(request.Context(), application.PublishProfileVersionInput{
-		OwnerUserID: user.ID, ProfileID: profileID, ExpectedHeadVersionID: body.ExpectedHeadVersionId,
-		Digest: body.Digest, Artifacts: artifacts, IdempotencyKey: params.IdempotencyKey,
+		OwnerUserID: user.ID, ProfileID: string(profileID), ExpectedHeadVersionID: body.ExpectedHeadVersionId,
+		CapsuleRefs: refs, IdempotencyKey: params.IdempotencyKey,
 	})
 	if err != nil {
 		writeProfileError(response, request, err)
 		return
 	}
+	snapshot := version.Snapshot()
 	result := contracts.PublishProfileVersion201JSONResponse{
 		Headers: contracts.PublishProfileVersion201ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
-		Body:    profileVersionResponse(version),
+		Body: contracts.ProfileVersion{
+			Id: snapshot.ID, ProfileId: snapshot.ProfileID, ParentVersionId: snapshot.ParentVersionID,
+			Version: snapshot.Version, Digest: snapshot.Digest, CreatedAt: snapshot.CreatedAt,
+			CapsuleRefs: capsuleRefsResponse(snapshot.CapsuleRefs),
+		},
 	}
 	if err := result.VisitPublishProfileVersionResponse(response); err != nil {
 		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
 	}
 }
 
-func profileVersionResponse(version domain.ProfileVersion) contracts.ProfileVersion {
-	snapshot := version.Snapshot()
-	artifacts := make([]contracts.ProfileArtifact, len(snapshot.Artifacts))
-	for index, artifact := range snapshot.Artifacts {
-		artifacts[index] = contracts.ProfileArtifact{
-			Id: artifact.ID, Kind: contracts.ProfileArtifactKind(artifact.Kind), SourceLocator: artifact.SourceLocator,
-			SourceDigest: artifact.SourceDigest, ContentDigest: artifact.ContentDigest,
-			SizeBytes: artifact.SizeBytes, Mode: int(artifact.Mode),
-			Sensitivity: contracts.ProfileArtifactSensitivity(artifact.Sensitivity), Trust: contracts.ProfileArtifactTrust(artifact.Trust),
-			ContainsExecutable: artifact.ContainsExecutable,
+func capsuleRefsResponse(refs []domain.CapsuleRef) []contracts.CapsuleRef {
+	result := make([]contracts.CapsuleRef, len(refs))
+	for index, ref := range refs {
+		exclusions := append([]string(nil), ref.Exclusions...)
+		result[index] = contracts.CapsuleRef{Ref: ref.Ref, FreshnessPolicy: contracts.CapsuleRefFreshnessPolicy(ref.FreshnessPolicy)}
+		if exclusions != nil {
+			result[index].Exclusions = &exclusions
 		}
 	}
-	return contracts.ProfileVersion{
-		Id: snapshot.ID, ProfileId: snapshot.ProfileID, ParentVersionId: snapshot.ParentVersionID,
-		Version: snapshot.Version, Digest: snapshot.Digest, Artifacts: artifacts, CreatedAt: snapshot.CreatedAt,
-	}
+	return result
 }
 
 func writeProfileError(response http.ResponseWriter, request *http.Request, err error) {
 	switch {
-	case errors.Is(err, application.ErrUploadNotVerified):
-		writeError(response, request, http.StatusBadRequest, "INVALID_UPLOAD", "A Profile artifact upload is not valid.")
-	case errors.Is(err, application.ErrUploadObjectNotFound):
-		writeError(response, request, http.StatusNotFound, "UPLOAD_NOT_FOUND", "A Profile artifact upload was not found.")
 	case errors.Is(err, application.ErrProfileForkUnsupported):
 		writeError(response, request, http.StatusUnprocessableEntity, "PROFILE_FORK_UNSUPPORTED", "Profile forks are not supported yet.")
 	case errors.Is(err, application.ErrInvalidProfileCommand), errors.Is(err, db.ErrInvalidProfilePublication):

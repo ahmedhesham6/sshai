@@ -13,6 +13,7 @@ const (
 	OperationRuntimeStart      OperationType = "runtime.start"
 	OperationRuntimeStop       OperationType = "runtime.stop"
 	OperationRuntimeReplace    OperationType = "runtime.replace"
+	OperationProfileResolve    OperationType = "profile.resolve"
 )
 
 type OperationStatus string

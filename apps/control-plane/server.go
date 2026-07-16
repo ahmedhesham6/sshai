@@ -13,6 +13,8 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/go-chi/chi/v5"
 	nethttpmiddleware "github.com/oapi-codegen/nethttp-middleware"
@@ -24,6 +26,22 @@ type TokenVerifier interface {
 
 type UserProjection interface {
 	EnsureUser(context.Context, db.EnsureUserInput) (domain.User, error)
+}
+
+type CapsulePresigner interface {
+	PresignGetObject(context.Context, *s3.GetObjectInput, ...func(*s3.PresignOptions)) (*v4.PresignedHTTPRequest, error)
+	PresignPutObject(context.Context, *s3.PutObjectInput, ...func(*s3.PresignOptions)) (*v4.PresignedHTTPRequest, error)
+}
+
+type CapsuleOwnership interface {
+	OwnsCapsule(context.Context, string, string) (bool, error)
+}
+
+// CapsuleObjectOwnership optionally verifies non-index OCI objects before a
+// pull grant is minted. Index ownership remains available through the
+// CapsuleOwnership seam for callers that only need Capsule-level checks.
+type CapsuleObjectOwnership interface {
+	OwnsObject(context.Context, string, contracts.CapsuleAccessObjectKind, string) (bool, error)
 }
 
 type Config struct {
@@ -38,6 +56,10 @@ type Config struct {
 	RequestIDs          application.IDGenerator
 	DefaultRegion       string
 	Now                 func() time.Time
+	CapsulePresigner    CapsulePresigner
+	CapsuleOwnership    CapsuleOwnership
+	CapsuleBucket       string
+	CapsuleAccessTTL    time.Duration
 }
 
 type server struct {
@@ -47,10 +69,21 @@ type server struct {
 	profiles            *application.ProfileService
 	uploads             *application.UploadIntentService
 	sshKeys             *application.SSHKeyService
+	capsulePresigner    CapsulePresigner
+	capsuleOwnership    CapsuleOwnership
+	capsuleBucket       string
+	capsuleAccessTTL    time.Duration
+	now                 func() time.Time
 }
 
 func NewHandler(config Config) http.Handler {
-	api := &server{createEnvironment: config.CreateEnvironment, registerProjectSeed: config.RegisterProjectSeed, profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys}
+	api := &server{
+		createEnvironment: config.CreateEnvironment, registerProjectSeed: config.RegisterProjectSeed,
+		profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys,
+		capsulePresigner: config.CapsulePresigner, capsuleOwnership: config.CapsuleOwnership,
+		capsuleBucket: config.CapsuleBucket, capsuleAccessTTL: config.CapsuleAccessTTL,
+		now: config.Now,
+	}
 	router := chi.NewRouter()
 	router.Use(requestIDMiddleware(config.RequestIDs))
 	router.Use(authenticationMiddleware(config.Verifier, config.Users, config.UserIDs, config.DefaultRegion, config.Now))

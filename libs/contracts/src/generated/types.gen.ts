@@ -41,29 +41,10 @@ export type ProfilePage = {
     nextCursor?: string | null;
 };
 
-export type ProfileArtifactInput = {
-    kind: 'agent_instruction' | 'codex_settings' | 'claude_settings' | 'shell_preferences' | 'git_preferences' | 'agent_skill_instruction' | 'agent_skill_executable';
-    sourceLocator: string;
-    sourceDigest: string;
-    contentDigest: string;
-    sizeBytes: number;
-    mode: number;
-    sensitivity: 'public' | 'private';
-    trust: 'user_authored' | 'trusted_source' | 'third_party';
-    containsExecutable: boolean;
-};
-
-export type ProfileArtifact = {
-    id: string;
-    kind: 'agent_instruction' | 'codex_settings' | 'claude_settings' | 'shell_preferences' | 'git_preferences' | 'agent_skill_instruction' | 'agent_skill_executable';
-    sourceLocator: string;
-    sourceDigest: string;
-    contentDigest: string;
-    sizeBytes: number;
-    mode: number;
-    sensitivity: 'public' | 'private';
-    trust: 'user_authored' | 'trusted_source' | 'third_party';
-    containsExecutable: boolean;
+export type CapsuleRef = {
+    ref: string;
+    freshnessPolicy: 'track' | 'review' | 'pin';
+    exclusions?: Array<string>;
 };
 
 export type ProfileVersion = {
@@ -72,7 +53,7 @@ export type ProfileVersion = {
     parentVersionId?: string | null;
     version: number;
     digest: string;
-    artifacts: Array<ProfileArtifact>;
+    capsuleRefs: Array<CapsuleRef>;
     createdAt: string;
 };
 
@@ -119,10 +100,51 @@ export type Environment = {
     region: string;
     runtimePreset: string;
     pinnedProfileVersionId: string;
+    capsuleLockId: string;
+    capsuleLock?: CapsuleLock;
     autoStopPolicy: AutoStopPolicy;
     runtime?: Runtime;
     activeOperationId?: string | null;
     createdAt: string;
+};
+
+export type LockedCapsule = {
+    ref: string;
+    digest: string;
+};
+
+export type CapsuleLock = {
+    id: string;
+    digest: string;
+    profileVersionId: string;
+    projectCapsuleDigest: string;
+    capsules: Array<LockedCapsule>;
+};
+
+export type CapsuleAccessRequest = {
+    intent: 'pull' | 'push';
+    objects: Array<CapsuleAccessObject>;
+};
+
+/**
+ * One owner-scoped OCI object. index maps to IndexKey, manifest to ManifestKey, and blob to BlobKey.
+ */
+export type CapsuleAccessObject = {
+    kind: 'index' | 'manifest' | 'blob';
+    digest: string;
+};
+
+export type CapsuleAccessGrant = {
+    url: string;
+    method: 'GET' | 'PUT';
+    headers: {
+        [key: string]: string;
+    };
+    expiresAt: string;
+};
+
+export type CapsuleAccessResponse = {
+    grants: Array<CapsuleAccessGrant>;
 };
 
 export type EnvironmentOperation = {
@@ -276,6 +298,31 @@ export type CreateBillingPortalResponses = {
 };
 
 export type CreateBillingPortalResponse = CreateBillingPortalResponses[keyof CreateBillingPortalResponses];
+
+export type CreateCapsuleAccessData = {
+    body: CapsuleAccessRequest;
+    path?: never;
+    query?: never;
+    url: '/capsule-access';
+};
+
+export type CreateCapsuleAccessErrors = {
+    /**
+     * Product-level error.
+     */
+    default: ErrorResponse;
+};
+
+export type CreateCapsuleAccessError = CreateCapsuleAccessErrors[keyof CreateCapsuleAccessErrors];
+
+export type CreateCapsuleAccessResponses = {
+    /**
+     * Short-lived owner-scoped Capsule access grants.
+     */
+    200: CapsuleAccessResponse;
+};
+
+export type CreateCapsuleAccessResponse = CreateCapsuleAccessResponses[keyof CreateCapsuleAccessResponses];
 
 export type ListSshKeysData = {
     body?: never;
@@ -455,8 +502,7 @@ export type GetProfileResponse = GetProfileResponses[keyof GetProfileResponses];
 export type PublishProfileVersionData = {
     body: {
         expectedHeadVersionId: string | null;
-        digest: string;
-        artifacts: Array<ProfileArtifactInput>;
+        capsuleRefs: Array<CapsuleRef>;
     };
     headers: {
         'Idempotency-Key': string;
