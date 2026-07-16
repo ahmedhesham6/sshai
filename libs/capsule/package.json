@@ -1,0 +1,12 @@
+{
+  "name": "@sshai/capsule",
+  "private": true,
+  "scripts": {
+    "build": "go test -run '^$' ./...",
+    "format:check": "test -z \"$(gofmt -l .)\"",
+    "generate": "go generate ./...",
+    "lint": "go vet ./...",
+    "test": "go test ./...",
+    "test:race": "go test -race ./..."
+  }
+}
