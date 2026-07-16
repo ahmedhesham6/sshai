@@ -110,6 +110,51 @@ func TestRuntimeMigrationOwnsOneCurrentRuntimePerEnvironment(t *testing.T) {
 		VALUES ('op_env_02', 'runtime.stop', now())`), "23503", "outbox kind differs from Operation type")
 }
 
+func TestRuntimeProviderResourceInventoryOwnsProviderIdentity(t *testing.T) {
+	ctx := context.Background()
+	database, _ := openTestDatabase(t, ctx)
+	if err := dbstore.Migrate(ctx, database); err != nil {
+		t.Fatalf("migrate database: %v", err)
+	}
+	insertEnvironmentPrerequisites(t, ctx, database, "usr_01", "workos_01", "pro_01", "prv_01")
+	if err := insertEnvironment(ctx, database, "env_01", "usr_01", "prv_01", "first"); err != nil {
+		t.Fatalf("insert Environment: %v", err)
+	}
+	transaction, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin Runtime inventory: %v", err)
+	}
+	defer func() { _ = transaction.Rollback() }()
+	for _, statement := range []string{
+		`INSERT INTO operations (id, environment_id, type, status, requested_by_user_id, idempotency_key, input)
+		 VALUES ('op_01', 'env_01', 'environment.create', 'running', 'usr_01', 'create-1', '{}')`,
+		`INSERT INTO runtimes (id, environment_id, sequence, status, runtime_preset, region, availability_zone, image_version, created_at, updated_at, version)
+		 VALUES ('run_01', 'env_01', 1, 'absent', 'standard', 'us-east-1', 'us-east-1a', 'image-v1', now(), now(), 1)`,
+		`UPDATE environments SET current_runtime_id = 'run_01' WHERE id = 'env_01'`,
+		`INSERT INTO provider_resources (id, environment_id, runtime_id, operation_id, provider, region, resource_type, provider_id, metadata)
+		 VALUES ('resource-runtime-1', 'env_01', 'run_01', 'op_01', 'aws', 'us-east-1', 'runtime', 'i-runtime-1', '{}')`,
+		`UPDATE runtimes SET status = 'provisioning', provider_resource_id = 'resource-runtime-1', updated_at = now(), version = 2 WHERE id = 'run_01'`,
+	} {
+		if _, err := transaction.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("persist Runtime Provider Resource: %v", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatalf("commit Runtime Provider Resource: %v", err)
+	}
+	var providerID, resourceID string
+	if err := database.QueryRowContext(ctx, `
+		SELECT resource.provider_id, runtime.provider_resource_id
+		FROM runtimes runtime
+		JOIN provider_resources resource ON resource.id = runtime.provider_resource_id
+		WHERE runtime.id = 'run_01'`).Scan(&providerID, &resourceID); err != nil {
+		t.Fatalf("read Runtime Provider Resource: %v", err)
+	}
+	if providerID != "i-runtime-1" || resourceID != "resource-runtime-1" {
+		t.Fatalf("Runtime Provider Resource = provider:%q resource:%q", providerID, resourceID)
+	}
+}
+
 func TestRuntimeMigrationRejectsImpossiblePersistedState(t *testing.T) {
 	ctx := context.Background()
 	createdAt := time.Date(2026, time.July, 13, 16, 0, 0, 0, time.UTC)

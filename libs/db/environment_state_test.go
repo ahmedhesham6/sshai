@@ -304,7 +304,7 @@ func TestStoreDistinguishesLargeJSONBIntegersOnEnvironmentStateReplay(t *testing
 	}
 }
 
-func TestStoreSerializesEnvironmentStateInventoryWithCompletion(t *testing.T) {
+func TestStoreSerializesInitialRuntimeReservationWithCompletion(t *testing.T) {
 	ctx := context.Background()
 	store, pool := openTestStoreAndPool(t, ctx)
 	insertCreationPrerequisites(t, ctx, pool)
@@ -316,13 +316,16 @@ func TestStoreSerializesEnvironmentStateInventoryWithCompletion(t *testing.T) {
 	if _, err := store.RecordEnvironmentCreateInvocation(ctx, "operation-1", "invocation-1", createdAt.Add(time.Second)); err != nil {
 		t.Fatalf("record Environment creation invocation: %v", err)
 	}
+	if _, err := store.InventoryEnvironmentState(ctx, "operation-1", environmentStateReservation(createdAt.Add(30*time.Second), "volume-1")); err != nil {
+		t.Fatalf("inventory Environment State: %v", err)
+	}
 
 	start := make(chan struct{})
-	inventoryResult, completionResult := make(chan error, 1), make(chan error, 1)
+	runtimeResult, completionResult := make(chan error, 1), make(chan error, 1)
 	go func() {
 		<-start
-		_, err := store.InventoryEnvironmentState(ctx, "operation-1", environmentStateReservation(createdAt.Add(30*time.Second), "volume-1"))
-		inventoryResult <- err
+		_, err := store.ReserveInitialRuntime(ctx, "operation-1", initialRuntimeReservation(createdAt.Add(45*time.Second)))
+		runtimeResult <- err
 	}()
 	go func() {
 		<-start
@@ -330,15 +333,15 @@ func TestStoreSerializesEnvironmentStateInventoryWithCompletion(t *testing.T) {
 		completionResult <- err
 	}()
 	close(start)
-	if err := <-inventoryResult; err != nil {
-		t.Fatalf("concurrent Environment State inventory: %v", err)
+	if err := <-runtimeResult; err != nil {
+		t.Fatalf("concurrent initial Runtime reservation: %v", err)
 	}
 	if err := <-completionResult; err != nil {
-		if !errors.Is(err, dbstore.ErrEnvironmentStateRequired) {
+		if !errors.Is(err, domain.ErrInitialRuntimeRequired) {
 			t.Fatalf("concurrent Environment completion: %v", err)
 		}
 		if _, err := store.CompleteEnvironmentCreation(ctx, "operation-1", createdAt.Add(time.Minute)); err != nil {
-			t.Fatalf("retry Environment completion after inventory: %v", err)
+			t.Fatalf("retry Environment completion after Runtime reservation: %v", err)
 		}
 	}
 	var lifecycle string

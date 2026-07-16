@@ -22,13 +22,13 @@ import (
 func TestEnvironmentCreateWorkflowRunsDurableProviderAndCompletionActionsOnce(t *testing.T) {
 	provider := testfixtures.NewProvider()
 	completion := &completionFake{persistedProviderID: "persisted-volume-1"}
-	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1"}}
+	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
 	completedAt := time.Date(2026, time.July, 13, 12, 1, 0, 0, time.UTC)
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(provider, completion, ids, func() time.Time { return completedAt }))
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(provider, completion, ids, func() time.Time { return completedAt }, "image-v1"))
 	client := workflows.NewClient(environment.Ingress())
 	input := application.EnvironmentCreateWorkflowInput{
 		OperationID: "operation-1", EnvironmentID: "environment-1",
-		Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
 
 	if err := client.SendEnvironmentCreate(t.Context(), input); err != nil {
@@ -41,8 +41,8 @@ func TestEnvironmentCreateWorkflowRunsDurableProviderAndCompletionActionsOnce(t 
 	if err != nil {
 		t.Fatalf("await Environment create workflow: %v", err)
 	}
-	if output.DataVolumeProviderID != "persisted-volume-1" {
-		t.Fatalf("Data Volume provider ID = %q", output.DataVolumeProviderID)
+	if output.DataVolumeProviderID != "persisted-volume-1" || output.RuntimeID != "runtime-1" {
+		t.Fatalf("Environment creation output = %#v", output)
 	}
 	if got := provider.DataVolumeCreateCount(); got != 1 {
 		t.Fatalf("provider mutations = %d, want 1", got)
@@ -56,6 +56,12 @@ func TestEnvironmentCreateWorkflowRunsDurableProviderAndCompletionActionsOnce(t 
 		reservation.Provider != "fake" || reservation.ProviderID != "fake-volume-environment-1" ||
 		string(reservation.Metadata) != `{"availabilityZone":"us-east-1a"}` || !reservation.CreatedAt.Equal(completedAt) {
 		t.Fatalf("inventory = calls:%d operation:%q reservation:%#v", calls, operationID, reservation)
+	}
+	if calls, operationID, reservation := completion.initialRuntime(); calls != 1 || operationID != input.OperationID ||
+		reservation.ID != "runtime-1" || reservation.EnvironmentID != input.EnvironmentID || reservation.Sequence != 1 ||
+		reservation.Region != input.Region || reservation.AvailabilityZone != input.AvailabilityZone ||
+		reservation.RuntimePreset != input.RuntimePreset || reservation.ImageVersion != "image-v1" || !reservation.CreatedAt.Equal(completedAt) {
+		t.Fatalf("initial Runtime = calls:%d operation:%q reservation:%#v", calls, operationID, reservation)
 	}
 	if invocationID := completion.invocation(); invocationID == "" || invocationID == input.OperationID {
 		t.Fatalf("actual Restate invocation ID = %q", invocationID)
@@ -71,7 +77,7 @@ func TestEnvironmentCreateWorkflowRunsDurableProviderAndCompletionActionsOnce(t 
 	if calls, _, _ := completion.snapshot(); calls != 1 {
 		t.Fatalf("completion calls after reattach = %d, want 1", calls)
 	}
-	if events := completion.eventLog(); len(events) != 3 || events[0] != "record" || events[1] != "inventory" || events[2] != "complete" {
+	if events := completion.eventLog(); len(events) != 4 || events[0] != "record" || events[1] != "inventory" || events[2] != "reserve-runtime" || events[3] != "complete" {
 		t.Fatalf("durable store action order = %#v", events)
 	}
 }
@@ -81,10 +87,10 @@ func TestEnvironmentCreateWorkflowDoesNotCompleteAfterInventoryFailure(t *testin
 	completion := &completionFake{}
 	store := &inventoryFailureStore{completionFake: completion}
 	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1"}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, store, ids, time.Now))
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, store, ids, time.Now, "image-v1"))
 	client := workflows.NewClient(environment.Ingress())
 	input := application.EnvironmentCreateWorkflowInput{
-		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
 	if err := client.SendEnvironmentCreate(t.Context(), input); err != nil {
 		t.Fatalf("submit Environment create workflow: %v", err)
@@ -108,10 +114,10 @@ func TestEnvironmentCreateWorkflowRejectsDivergedProviderResultBeforeInventory(t
 	}}
 	store := &completionFake{}
 	ids := &workflowIDs{values: []string{"unused"}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, store, ids, time.Now))
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, store, ids, time.Now, "image-v1"))
 	client := workflows.NewClient(environment.Ingress())
 	input := application.EnvironmentCreateWorkflowInput{
-		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
 	if err := client.SendEnvironmentCreate(t.Context(), input); err != nil {
 		t.Fatalf("submit Environment create workflow: %v", err)
@@ -135,10 +141,10 @@ func TestEnvironmentCreateWorkflowTerminatesPermanentProviderFailure(t *testing.
 	}}
 	store := &completionFake{}
 	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
-		dataVolumes, store, &workflowIDs{values: []string{"unused"}}, time.Now,
+		dataVolumes, store, &workflowIDs{values: []string{"unused"}}, time.Now, "image-v1",
 	))
 	input := application.EnvironmentCreateWorkflowInput{
-		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
 	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
 		t.Fatalf("submit Environment create workflow: %v", err)
@@ -169,10 +175,10 @@ func TestEnvironmentCreateWorkflowRetriesTransientProviderFailure(t *testing.T) 
 	store := &completionFake{}
 	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
 		dataVolumes, store,
-		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1"}}, time.Now,
+		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}, time.Now, "image-v1",
 	))
 	input := application.EnvironmentCreateWorkflowInput{
-		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
 	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
 		t.Fatalf("submit Environment create workflow: %v", err)
@@ -199,10 +205,10 @@ func TestEnvironmentCreateWorkflowRetriesTransientInventoryWithoutRepeatingPrior
 	store := &transientInventoryStore{completionFake: completion}
 	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
 		dataVolumes, store,
-		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1"}}, time.Now,
+		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}, time.Now, "image-v1",
 	))
 	input := application.EnvironmentCreateWorkflowInput{
-		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
 	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
 		t.Fatalf("submit Environment create workflow: %v", err)
@@ -221,8 +227,71 @@ func TestEnvironmentCreateWorkflowRetriesTransientInventoryWithoutRepeatingPrior
 	if dataVolumes.DataVolumeCreateCount() != 1 {
 		t.Fatalf("provider mutations after inventory retry = %d, want 1", dataVolumes.DataVolumeCreateCount())
 	}
-	if events := completion.eventLog(); len(events) != 3 || events[0] != "record" || events[1] != "inventory" || events[2] != "complete" {
+	if events := completion.eventLog(); len(events) != 4 || events[0] != "record" || events[1] != "inventory" || events[2] != "reserve-runtime" || events[3] != "complete" {
 		t.Fatalf("durable actions after inventory retry = %#v", events)
+	}
+}
+
+func TestEnvironmentCreateWorkflowTerminatesPermanentInitialRuntimeFailure(t *testing.T) {
+	dataVolumes := testfixtures.NewProvider()
+	completion := &completionFake{}
+	store := &runtimeFailureStore{completionFake: completion, failures: []error{permanentActionError{errors.New("Runtime reservation conflicts")}}}
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
+		dataVolumes, store,
+		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
+		time.Now, "image-v1",
+	))
+	input := application.EnvironmentCreateWorkflowInput{
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1",
+		AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
+	}
+	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
+		t.Fatalf("submit Environment create workflow: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if _, err := ingress.WorkflowHandle[workflows.EnvironmentCreateOutput](
+		environment.Ingress(), workflows.EnvironmentCreateService, input.OperationID,
+	).Attach(ctx); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("permanent Runtime reservation error = %v", err)
+	}
+	if attempts := store.attemptCount(); attempts != 1 {
+		t.Fatalf("permanent Runtime reservation attempts = %d", attempts)
+	}
+	if calls, _, _ := completion.snapshot(); calls != 0 {
+		t.Fatalf("completion calls after Runtime reservation failure = %d", calls)
+	}
+}
+
+func TestEnvironmentCreateWorkflowRetriesTransientInitialRuntimeFailureWithoutRepeatingPriorActions(t *testing.T) {
+	dataVolumes := testfixtures.NewProvider()
+	completion := &completionFake{}
+	store := &runtimeFailureStore{completionFake: completion, failures: []error{transientActionError{errors.New("database restarting")}}}
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
+		dataVolumes, store,
+		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
+		time.Now, "image-v1",
+	))
+	input := application.EnvironmentCreateWorkflowInput{
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1",
+		AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
+	}
+	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
+		t.Fatalf("submit Environment create workflow: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	output, err := ingress.WorkflowHandle[workflows.EnvironmentCreateOutput](
+		environment.Ingress(), workflows.EnvironmentCreateService, input.OperationID,
+	).Attach(ctx)
+	if err != nil {
+		t.Fatalf("await retried Runtime reservation: %v", err)
+	}
+	if output.RuntimeID != "runtime-1" || store.attemptCount() != 2 {
+		t.Fatalf("retried Runtime reservation = %#v attempts:%d", output, store.attemptCount())
+	}
+	if dataVolumes.DataVolumeCreateCount() != 1 {
+		t.Fatalf("Data Volume mutations after Runtime reservation retry = %d", dataVolumes.DataVolumeCreateCount())
 	}
 }
 
@@ -233,9 +302,20 @@ type completionFake struct {
 	at                  time.Time
 	invocationID        string
 	inventoryCalls      int
+	runtimeCalls        int
 	reservation         domain.EnvironmentStateReservation
+	runtimeReservation  domain.RuntimeReservation
 	persistedProviderID string
 	events              []string
+}
+
+func (fake *completionFake) ReserveInitialRuntime(_ context.Context, operationID string, reservation domain.RuntimeReservation) (string, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.runtimeCalls++
+	fake.events = append(fake.events, "reserve-runtime")
+	fake.operationID, fake.runtimeReservation = operationID, reservation
+	return reservation.ID, nil
 }
 
 func (fake *completionFake) InventoryEnvironmentState(_ context.Context, operationID string, reservation domain.EnvironmentStateReservation) (string, error) {
@@ -286,6 +366,12 @@ func (fake *completionFake) inventory() (int, string, domain.EnvironmentStateRes
 	return fake.inventoryCalls, fake.operationID, fake.reservation
 }
 
+func (fake *completionFake) initialRuntime() (int, string, domain.RuntimeReservation) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return fake.runtimeCalls, fake.operationID, fake.runtimeReservation
+}
+
 func (fake *completionFake) eventLog() []string {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -300,6 +386,32 @@ type transientInventoryStore struct {
 	*completionFake
 	mu       sync.Mutex
 	attempts int
+}
+
+type runtimeFailureStore struct {
+	*completionFake
+	mu       sync.Mutex
+	attempts int
+	failures []error
+}
+
+func (store *runtimeFailureStore) ReserveInitialRuntime(ctx context.Context, operationID string, reservation domain.RuntimeReservation) (string, error) {
+	store.mu.Lock()
+	store.attempts++
+	if len(store.failures) != 0 {
+		err := store.failures[0]
+		store.failures = store.failures[1:]
+		store.mu.Unlock()
+		return "", err
+	}
+	store.mu.Unlock()
+	return store.completionFake.ReserveInitialRuntime(ctx, operationID, reservation)
+}
+
+func (store *runtimeFailureStore) attemptCount() int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.attempts
 }
 
 func (store *transientInventoryStore) InventoryEnvironmentState(ctx context.Context, operationID string, reservation domain.EnvironmentStateReservation) (string, error) {

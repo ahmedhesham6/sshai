@@ -97,7 +97,6 @@ func (store *Store) CompleteEnvironmentCreation(ctx context.Context, operationID
 	if _, err := restoreEnvironmentState(ctx, queries, creation, backends); err != nil {
 		return domain.EnvironmentCreation{}, fmt.Errorf("complete Environment creation: %w", err)
 	}
-
 	completed, err := creation.Complete(at)
 	if err != nil {
 		return domain.EnvironmentCreation{}, permanent(err)
@@ -214,7 +213,7 @@ func (store *Store) PendingEnvironmentCreate(ctx context.Context, operationID st
 	if err != nil {
 		return domain.EnvironmentCreateDispatch{}, false, fmt.Errorf("read Environment create outbox: %w", err)
 	}
-	return environmentCreateDispatch(row.OperationID, row.EnvironmentID, row.Region, row.AvailabilityZone), true, nil
+	return environmentCreateDispatch(row.OperationID, row.EnvironmentID, row.Region, row.AvailabilityZone, row.RuntimePreset), true, nil
 }
 
 func (store *Store) PendingEnvironmentCreates(ctx context.Context, limit int) ([]domain.EnvironmentCreateDispatch, error) {
@@ -227,7 +226,7 @@ func (store *Store) PendingEnvironmentCreates(ctx context.Context, limit int) ([
 	}
 	result := make([]domain.EnvironmentCreateDispatch, len(rows))
 	for index, row := range rows {
-		result[index] = environmentCreateDispatch(row.OperationID, row.EnvironmentID, row.Region, row.AvailabilityZone)
+		result[index] = environmentCreateDispatch(row.OperationID, row.EnvironmentID, row.Region, row.AvailabilityZone, row.RuntimePreset)
 	}
 	return result, nil
 }
@@ -275,9 +274,10 @@ func (store *Store) RecordEnvironmentCreateInvocation(ctx context.Context, opera
 	return creation, nil
 }
 
-func environmentCreateDispatch(operationID, environmentID, region, availabilityZone string) domain.EnvironmentCreateDispatch {
+func environmentCreateDispatch(operationID, environmentID, region, availabilityZone, runtimePreset string) domain.EnvironmentCreateDispatch {
 	return domain.EnvironmentCreateDispatch{
 		OperationID: operationID, EnvironmentID: environmentID, Region: region, AvailabilityZone: availabilityZone,
+		RuntimePreset: runtimePreset,
 	}
 }
 

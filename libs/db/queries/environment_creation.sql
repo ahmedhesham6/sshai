@@ -99,7 +99,7 @@ INSERT INTO workflow_outbox (operation_id, kind, created_at)
 VALUES (sqlc.arg(operation_id), 'environment.create', sqlc.arg(created_at));
 
 -- name: GetPendingEnvironmentCreate :one
-SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone
+SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone, e.runtime_preset
 FROM workflow_outbox outbox
 JOIN operations o ON o.id = outbox.operation_id
 JOIN environments e ON e.id = o.environment_id
@@ -107,7 +107,7 @@ WHERE outbox.operation_id = sqlc.arg(operation_id)
   AND outbox.started_at IS NULL;
 
 -- name: ListPendingEnvironmentCreates :many
-SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone
+SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone, e.runtime_preset
 FROM workflow_outbox outbox
 JOIN operations o ON o.id = outbox.operation_id
 JOIN environments e ON e.id = o.environment_id

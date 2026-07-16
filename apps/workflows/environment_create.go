@@ -21,12 +21,14 @@ const (
 type EnvironmentCreationActions interface {
 	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error
 	InventoryEnvironmentState(context.Context, string, domain.EnvironmentStateReservation) (string, error)
+	ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (string, error)
 	CompleteEnvironmentCreation(context.Context, string, time.Time) error
 }
 
 type EnvironmentCreationRepository interface {
 	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) (domain.EnvironmentCreation, error)
 	InventoryEnvironmentState(context.Context, string, domain.EnvironmentStateReservation) (domain.EnvironmentState, error)
+	ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (domain.Runtime, error)
 	CompleteEnvironmentCreation(context.Context, string, time.Time) (domain.EnvironmentCreation, error)
 }
 
@@ -51,6 +53,14 @@ func (actions *environmentCreationActions) InventoryEnvironmentState(ctx context
 	return state.DataVolumeProviderID(), nil
 }
 
+func (actions *environmentCreationActions) ReserveInitialRuntime(ctx context.Context, operationID string, reservation domain.RuntimeReservation) (string, error) {
+	runtime, err := actions.repository.ReserveInitialRuntime(ctx, operationID, reservation)
+	if err != nil {
+		return "", err
+	}
+	return runtime.Snapshot().ID, nil
+}
+
 func (actions *environmentCreationActions) CompleteEnvironmentCreation(ctx context.Context, operationID string, at time.Time) error {
 	_, err := actions.repository.CompleteEnvironmentCreation(ctx, operationID, at)
 	return err
@@ -62,6 +72,7 @@ type IDGenerator interface {
 
 type EnvironmentCreateOutput struct {
 	DataVolumeProviderID string `json:"dataVolumeProviderId"`
+	RuntimeID            string `json:"runtimeId"`
 }
 
 type environmentCreateWorkflow struct {
@@ -69,10 +80,11 @@ type environmentCreateWorkflow struct {
 	actions  EnvironmentCreationActions
 	ids      IDGenerator
 	now      func() time.Time
+	image    string
 }
 
-func EnvironmentCreateDefinition(dataVolumes provider.DataVolumeProvider, actions EnvironmentCreationActions, ids IDGenerator, now func() time.Time) restate.ServiceDefinition {
-	workflow := &environmentCreateWorkflow{provider: dataVolumes, actions: actions, ids: ids, now: now}
+func EnvironmentCreateDefinition(dataVolumes provider.DataVolumeProvider, actions EnvironmentCreationActions, ids IDGenerator, now func() time.Time, imageVersion string) restate.ServiceDefinition {
+	workflow := &environmentCreateWorkflow{provider: dataVolumes, actions: actions, ids: ids, now: now, image: imageVersion}
 	return restate.NewWorkflow(EnvironmentCreateService).Handler(
 		RunHandler,
 		restate.NewWorkflowHandler(workflow.Run),
@@ -104,9 +116,10 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	seed, err := restate.Run(ctx, func(restate.RunContext) (environmentStateReservationSeed, error) {
 		return environmentStateReservationSeed{
 			BackendResourceID: workflow.ids.NewID(), WorkspaceID: workflow.ids.NewID(), HomeID: workflow.ids.NewID(),
-			ServicesID: workflow.ids.NewID(), CacheID: workflow.ids.NewID(), CreatedAt: workflow.now(),
+			ServicesID: workflow.ids.NewID(), CacheID: workflow.ids.NewID(), RuntimeID: workflow.ids.NewID(),
+			ImageVersion: workflow.image, CreatedAt: workflow.now(),
 		}, nil
-	}, restate.WithName("reserve-state-identities"))
+	}, restate.WithName("reserve-creation-identities"))
 	if err != nil {
 		return EnvironmentCreateOutput{}, err
 	}
@@ -130,12 +143,23 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	if err != nil {
 		return EnvironmentCreateOutput{}, err
 	}
+	runtimeID, err := restate.Run(ctx, func(runCtx restate.RunContext) (string, error) {
+		runtimeID, err := workflow.actions.ReserveInitialRuntime(runCtx, input.OperationID, domain.RuntimeReservation{
+			ID: seed.RuntimeID, EnvironmentID: input.EnvironmentID, Sequence: 1,
+			RuntimePreset: input.RuntimePreset, Region: input.Region, AvailabilityZone: input.AvailabilityZone,
+			ImageVersion: seed.ImageVersion, CreatedAt: seed.CreatedAt,
+		})
+		return runtimeID, classifyDurableError(err)
+	}, restate.WithName("reserve-initial-runtime"))
+	if err != nil {
+		return EnvironmentCreateOutput{}, err
+	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(workflow.actions.CompleteEnvironmentCreation(runCtx, input.OperationID, workflow.now()))
 	}, restate.WithName("complete-projection")); err != nil {
 		return EnvironmentCreateOutput{}, err
 	}
-	return EnvironmentCreateOutput{DataVolumeProviderID: inventory.DataVolumeProviderID}, nil
+	return EnvironmentCreateOutput{DataVolumeProviderID: inventory.DataVolumeProviderID, RuntimeID: runtimeID}, nil
 }
 
 func validateDataVolume(input domain.EnvironmentCreateDispatch, volume provider.DataVolume) error {
@@ -165,6 +189,8 @@ type environmentStateReservationSeed struct {
 	HomeID            string    `json:"homeId"`
 	ServicesID        string    `json:"servicesId"`
 	CacheID           string    `json:"cacheId"`
+	RuntimeID         string    `json:"runtimeId"`
+	ImageVersion      string    `json:"imageVersion"`
 	CreatedAt         time.Time `json:"createdAt"`
 }
 

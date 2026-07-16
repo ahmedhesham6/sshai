@@ -69,11 +69,17 @@ type EnvironmentCreation struct {
 	sshKeyIDs     []string
 }
 
+var (
+	ErrInitialRuntimeAlreadyReserved = errors.New("initial Runtime is already reserved")
+	ErrInitialRuntimeRequired        = errors.New("initial Runtime is required before activation")
+)
+
 type EnvironmentCreateDispatch struct {
 	OperationID      string
 	EnvironmentID    string
 	Region           string
 	AvailabilityZone string
+	RuntimePreset    string
 }
 
 func NewEnvironmentCreation(environment Environment, policy AutoStopPolicy, operation Operation, projectSeedID string, sshKeyIDs []string) (EnvironmentCreation, error) {
@@ -126,7 +132,26 @@ func (creation EnvironmentCreation) RecordRestateInvocation(invocationID string)
 	return creation, nil
 }
 
+func (creation EnvironmentCreation) ReserveInitialRuntime(reservation RuntimeReservation) (EnvironmentCreation, Runtime, error) {
+	if creation.environment.Snapshot().CurrentRuntimeID != nil {
+		return EnvironmentCreation{}, Runtime{}, ErrInitialRuntimeAlreadyReserved
+	}
+	runtime, err := ReserveRuntime(reservation)
+	if err != nil {
+		return EnvironmentCreation{}, Runtime{}, err
+	}
+	environment, err := creation.environment.AttachRuntime(runtime, reservation.CreatedAt)
+	if err != nil {
+		return EnvironmentCreation{}, Runtime{}, err
+	}
+	creation.environment = environment
+	return creation, runtime, nil
+}
+
 func (creation EnvironmentCreation) Complete(at time.Time) (EnvironmentCreation, error) {
+	if creation.environment.Snapshot().CurrentRuntimeID == nil {
+		return EnvironmentCreation{}, ErrInitialRuntimeRequired
+	}
 	operation, err := creation.operation.Start(at)
 	if err != nil {
 		return EnvironmentCreation{}, err

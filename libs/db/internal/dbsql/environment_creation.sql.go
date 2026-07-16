@@ -206,7 +206,7 @@ func (q *Queries) GetOperationCreationKeyForUpdate(ctx context.Context, operatio
 }
 
 const getPendingEnvironmentCreate = `-- name: GetPendingEnvironmentCreate :one
-SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone
+SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone, e.runtime_preset
 FROM workflow_outbox outbox
 JOIN operations o ON o.id = outbox.operation_id
 JOIN environments e ON e.id = o.environment_id
@@ -219,6 +219,7 @@ type GetPendingEnvironmentCreateRow struct {
 	EnvironmentID    string
 	Region           string
 	AvailabilityZone string
+	RuntimePreset    string
 }
 
 func (q *Queries) GetPendingEnvironmentCreate(ctx context.Context, operationID string) (GetPendingEnvironmentCreateRow, error) {
@@ -229,6 +230,7 @@ func (q *Queries) GetPendingEnvironmentCreate(ctx context.Context, operationID s
 		&i.EnvironmentID,
 		&i.Region,
 		&i.AvailabilityZone,
+		&i.RuntimePreset,
 	)
 	return i, err
 }
@@ -401,7 +403,7 @@ func (q *Queries) ListEnvironmentSSHKeyIDs(ctx context.Context, environmentID st
 }
 
 const listPendingEnvironmentCreates = `-- name: ListPendingEnvironmentCreates :many
-SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone
+SELECT o.id AS operation_id, e.id AS environment_id, e.region, e.availability_zone, e.runtime_preset
 FROM workflow_outbox outbox
 JOIN operations o ON o.id = outbox.operation_id
 JOIN environments e ON e.id = o.environment_id
@@ -415,6 +417,7 @@ type ListPendingEnvironmentCreatesRow struct {
 	EnvironmentID    string
 	Region           string
 	AvailabilityZone string
+	RuntimePreset    string
 }
 
 func (q *Queries) ListPendingEnvironmentCreates(ctx context.Context, limitCount int32) ([]ListPendingEnvironmentCreatesRow, error) {
@@ -431,6 +434,7 @@ func (q *Queries) ListPendingEnvironmentCreates(ctx context.Context, limitCount 
 			&i.EnvironmentID,
 			&i.Region,
 			&i.AvailabilityZone,
+			&i.RuntimePreset,
 		); err != nil {
 			return nil, err
 		}

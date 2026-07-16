@@ -91,6 +91,10 @@ func (fake *creationRepositoryFake) InventoryEnvironmentState(context.Context, s
 	return fake.state, nil
 }
 
+func (*creationRepositoryFake) ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (domain.Runtime, error) {
+	return domain.Runtime{}, nil
+}
+
 func (*creationRepositoryFake) CompleteEnvironmentCreation(context.Context, string, time.Time) (domain.EnvironmentCreation, error) {
 	return domain.EnvironmentCreation{}, nil
 }

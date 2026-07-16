@@ -16,16 +16,16 @@ import (
 )
 
 func TestEnvironmentCreateWorkflowResumesAfterHandlerTerminationAtEveryDurableBoundary(t *testing.T) {
-	for _, boundary := range []string{"record", "provider", "seed", "inventory", "complete"} {
+	for _, boundary := range []string{"record", "provider", "seed", "inventory", "runtime", "complete"} {
 		t.Run(boundary, func(t *testing.T) {
 			gate := newTerminationGate(boundary)
 			actions := newResumableCreationActions(gate)
 			dataVolumes := &resumableDataVolumeProvider{gate: gate, provider: testfixtures.NewProvider()}
-			ids := &resumableIDs{gate: gate, values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1"}}
-			environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, actions, ids, time.Now))
+			ids := &resumableIDs{gate: gate, values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
+			environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, actions, ids, time.Now, "image-v1"))
 			input := domain.EnvironmentCreateDispatch{
 				OperationID: "operation-" + boundary, EnvironmentID: "environment-" + boundary,
-				Region: "us-east-1", AvailabilityZone: "us-east-1a",
+				Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 			}
 			if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
 				t.Fatalf("submit Environment create workflow: %v", err)
@@ -52,11 +52,11 @@ func TestEnvironmentCreateWorkflowResumesAfterHandlerTerminationAtEveryDurableBo
 			if err != nil {
 				t.Fatalf("resume Environment create workflow: %v", err)
 			}
-			if output.DataVolumeProviderID != "fake-volume-"+input.EnvironmentID {
+			if output.DataVolumeProviderID != "fake-volume-"+input.EnvironmentID || output.RuntimeID != "runtime-1" {
 				t.Fatalf("resumed workflow output = %#v", output)
 			}
-			if record, inventory, complete := actions.appliedCounts(); record != 1 || inventory != 1 || complete != 1 {
-				t.Fatalf("persisted mutations after resume = record:%d inventory:%d complete:%d", record, inventory, complete)
+			if record, inventory, runtime, complete := actions.appliedCounts(); record != 1 || inventory != 1 || runtime != 1 || complete != 1 {
+				t.Fatalf("persisted mutations after resume = record:%d inventory:%d runtime:%d complete:%d", record, inventory, runtime, complete)
 			}
 			if dataVolumes.provider.DataVolumeCreateCount() != 1 {
 				t.Fatalf("provider mutations after resume = %d", dataVolumes.provider.DataVolumeCreateCount())
@@ -76,6 +76,15 @@ func TestEnvironmentCreateWorkflowResumesAfterHandlerTerminationAtEveryDurableBo
 					t.Fatalf("inventory reservation attempt %d changed after resume: %#v", attempt+1, candidate)
 				}
 			}
+			runtime := actions.persistedRuntimeReservation()
+			for attempt, candidate := range actions.runtimeReservations() {
+				if candidate.ID != runtime.ID || candidate.EnvironmentID != runtime.EnvironmentID || candidate.Sequence != runtime.Sequence ||
+					candidate.RuntimePreset != runtime.RuntimePreset || candidate.Region != runtime.Region ||
+					candidate.AvailabilityZone != runtime.AvailabilityZone || candidate.ImageVersion != runtime.ImageVersion ||
+					!candidate.CreatedAt.Equal(runtime.CreatedAt) {
+					t.Fatalf("Runtime reservation attempt %d changed after resume: %#v", attempt+1, candidate)
+				}
+			}
 		})
 	}
 }
@@ -88,7 +97,7 @@ func boundaryAttempts(boundary string, actions *resumableCreationActions, dataVo
 		return dataVolumes.attemptCount()
 	case "seed":
 		return ids.attemptCount()
-	case "inventory", "complete":
+	case "inventory", "runtime", "complete":
 		return actions.attemptCount(boundary)
 	default:
 		return 0
@@ -125,11 +134,13 @@ type resumableCreationActions struct {
 	gate *terminationGate
 	mu   sync.Mutex
 
-	recorded, inventoried, completed                    bool
-	recordApplies, inventoryApplies, completeApplies    int
-	recordAttempts, inventoryAttempts, completeAttempts int
-	reservation                                         domain.EnvironmentStateReservation
-	reservations                                        []domain.EnvironmentStateReservation
+	recorded, inventoried, runtimeReserved, completed                    bool
+	recordApplies, inventoryApplies, runtimeApplies, completeApplies     int
+	recordAttempts, inventoryAttempts, runtimeAttempts, completeAttempts int
+	reservation                                                          domain.EnvironmentStateReservation
+	reservations                                                         []domain.EnvironmentStateReservation
+	runtimeReservation                                                   domain.RuntimeReservation
+	runtimeReservationAttempts                                           []domain.RuntimeReservation
 }
 
 func newResumableCreationActions(gate *terminationGate) *resumableCreationActions {
@@ -162,6 +173,21 @@ func (actions *resumableCreationActions) InventoryEnvironmentState(_ context.Con
 	return reservation.ProviderID, nil
 }
 
+func (actions *resumableCreationActions) ReserveInitialRuntime(_ context.Context, _ string, reservation domain.RuntimeReservation) (string, error) {
+	actions.mu.Lock()
+	actions.runtimeAttempts++
+	actions.runtimeReservationAttempts = append(actions.runtimeReservationAttempts, reservation)
+	if !actions.runtimeReserved {
+		actions.runtimeReserved = true
+		actions.runtimeApplies++
+		actions.runtimeReservation = reservation
+	}
+	persistedID := actions.runtimeReservation.ID
+	actions.mu.Unlock()
+	actions.gate.hit("runtime")
+	return persistedID, nil
+}
+
 func (actions *resumableCreationActions) CompleteEnvironmentCreation(context.Context, string, time.Time) error {
 	actions.mu.Lock()
 	actions.completeAttempts++
@@ -174,10 +200,10 @@ func (actions *resumableCreationActions) CompleteEnvironmentCreation(context.Con
 	return nil
 }
 
-func (actions *resumableCreationActions) appliedCounts() (int, int, int) {
+func (actions *resumableCreationActions) appliedCounts() (int, int, int, int) {
 	actions.mu.Lock()
 	defer actions.mu.Unlock()
-	return actions.recordApplies, actions.inventoryApplies, actions.completeApplies
+	return actions.recordApplies, actions.inventoryApplies, actions.runtimeApplies, actions.completeApplies
 }
 
 func (actions *resumableCreationActions) persistedReservation() domain.EnvironmentStateReservation {
@@ -194,11 +220,25 @@ func (actions *resumableCreationActions) attemptCount(boundary string) int {
 		return actions.recordAttempts
 	case "inventory":
 		return actions.inventoryAttempts
+	case "runtime":
+		return actions.runtimeAttempts
 	case "complete":
 		return actions.completeAttempts
 	default:
 		return 0
 	}
+}
+
+func (actions *resumableCreationActions) persistedRuntimeReservation() domain.RuntimeReservation {
+	actions.mu.Lock()
+	defer actions.mu.Unlock()
+	return actions.runtimeReservation
+}
+
+func (actions *resumableCreationActions) runtimeReservations() []domain.RuntimeReservation {
+	actions.mu.Lock()
+	defer actions.mu.Unlock()
+	return append([]domain.RuntimeReservation(nil), actions.runtimeReservationAttempts...)
 }
 
 func (actions *resumableCreationActions) inventoryReservations() []domain.EnvironmentStateReservation {

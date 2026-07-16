@@ -1,10 +1,77 @@
 package domain_test
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/domain"
 )
+
+func TestEnvironmentCreationReservesItsInitialRuntime(t *testing.T) {
+	createdAt := validEnvironmentReservation().CreatedAt
+	environment, policy, operation := creationParts(t, "env_01", "usr_01", "policy_01")
+	creation, err := domain.NewEnvironmentCreation(environment, policy, operation, "seed_01", []string{"key_01"})
+	if err != nil {
+		t.Fatalf("NewEnvironmentCreation(): %v", err)
+	}
+
+	creation, runtime, err := creation.ReserveInitialRuntime(domain.RuntimeReservation{
+		ID: "runtime_01", EnvironmentID: "env_01", Sequence: 1,
+		RuntimePreset: "standard", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		ImageVersion: "image-v1", CreatedAt: createdAt.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReserveInitialRuntime(): %v", err)
+	}
+	runtimeSnapshot := runtime.Snapshot()
+	if runtimeSnapshot.ID != "runtime_01" || runtimeSnapshot.Status != domain.RuntimeAbsent || runtimeSnapshot.Sequence != 1 {
+		t.Fatalf("reserved Runtime = %#v", runtimeSnapshot)
+	}
+	currentRuntimeID := creation.Environment().Snapshot().CurrentRuntimeID
+	if currentRuntimeID == nil || *currentRuntimeID != runtimeSnapshot.ID {
+		t.Fatalf("Environment current Runtime = %v", currentRuntimeID)
+	}
+}
+
+func TestEnvironmentCreationRejectsRepeatedInitialRuntimeReservation(t *testing.T) {
+	createdAt := validEnvironmentReservation().CreatedAt
+	environment, policy, operation := creationParts(t, "env_01", "usr_01", "policy_01")
+	creation, err := domain.NewEnvironmentCreation(environment, policy, operation, "seed_01", []string{"key_01"})
+	if err != nil {
+		t.Fatalf("NewEnvironmentCreation(): %v", err)
+	}
+	reservation := domain.RuntimeReservation{
+		ID: "runtime_01", EnvironmentID: "env_01", Sequence: 1,
+		RuntimePreset: "standard", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+		ImageVersion: "image-v1", CreatedAt: createdAt.Add(time.Minute),
+	}
+	creation, _, err = creation.ReserveInitialRuntime(reservation)
+	if err != nil {
+		t.Fatalf("first ReserveInitialRuntime(): %v", err)
+	}
+	reservation.ImageVersion = "image-v2"
+	if _, _, err := creation.ReserveInitialRuntime(reservation); !errors.Is(err, domain.ErrInitialRuntimeAlreadyReserved) {
+		t.Fatalf("repeated ReserveInitialRuntime() error = %v", err)
+	}
+}
+
+func TestEnvironmentCreationCannotCompleteWithoutInitialRuntime(t *testing.T) {
+	createdAt := validEnvironmentReservation().CreatedAt
+	environment, policy, operation := creationParts(t, "env_01", "usr_01", "policy_01")
+	creation, err := domain.NewEnvironmentCreation(environment, policy, operation, "seed_01", []string{"key_01"})
+	if err != nil {
+		t.Fatalf("NewEnvironmentCreation(): %v", err)
+	}
+	creation, err = creation.RecordRestateInvocation("invocation_01")
+	if err != nil {
+		t.Fatalf("RecordRestateInvocation(): %v", err)
+	}
+
+	if _, err := creation.Complete(createdAt.Add(time.Minute)); err == nil {
+		t.Fatal("Complete() without initial Runtime error = nil")
+	}
+}
 
 func TestNewEnvironmentCreationOwnsCoherentReservation(t *testing.T) {
 	environment, policy, operation := creationParts(t, "env_01", "usr_01", "policy_01")

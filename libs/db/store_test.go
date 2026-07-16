@@ -298,7 +298,7 @@ func TestStoreTracksEnvironmentCreateInvocationThroughOutbox(t *testing.T) {
 	if err != nil || !present {
 		t.Fatalf("PendingEnvironmentCreate() = %#v, %t, %v", pending, present, err)
 	}
-	if pending.EnvironmentID != "environment-1" || pending.AvailabilityZone != "us-east-1a" {
+	if pending.EnvironmentID != "environment-1" || pending.AvailabilityZone != "us-east-1a" || pending.RuntimePreset != "standard" {
 		t.Fatalf("pending dispatch = %#v", pending)
 	}
 	if _, err := store.RecordEnvironmentCreateInvocation(ctx, "operation-1", "invocation-actual", time.Now().UTC()); err != nil {
@@ -372,11 +372,19 @@ func TestStoreCompletesEnvironmentCreationReplaySafely(t *testing.T) {
 	if _, err := store.InventoryEnvironmentState(ctx, "operation-1", environmentStateReservation(createdAt.Add(30*time.Second), "volume-1")); err != nil {
 		t.Fatalf("inventory Environment State: %v", err)
 	}
+	if _, err := store.CompleteEnvironmentCreation(ctx, "operation-1", completedAt); !errors.Is(err, domain.ErrInitialRuntimeRequired) {
+		t.Fatalf("complete without initial Runtime error = %v", err)
+	} else {
+		requirePermanentRepositoryError(t, err)
+	}
+	if _, err := store.ReserveInitialRuntime(ctx, "operation-1", initialRuntimeReservation(createdAt.Add(45*time.Second))); err != nil {
+		t.Fatalf("reserve initial Runtime: %v", err)
+	}
 	completed, err := store.CompleteEnvironmentCreation(ctx, "operation-1", completedAt)
 	if err != nil {
 		t.Fatalf("complete Environment creation: %v", err)
 	}
-	if got := completed.Environment().Snapshot(); got.Lifecycle != domain.EnvironmentActive || got.Health != domain.EnvironmentHealthHealthy || got.Version != 3 {
+	if got := completed.Environment().Snapshot(); got.Lifecycle != domain.EnvironmentActive || got.Health != domain.EnvironmentHealthHealthy || got.Version != 4 {
 		t.Fatalf("completed Environment = %#v", got)
 	}
 	if got := completed.Operation().Snapshot(); got.Status != domain.OperationSucceeded || got.CompletedAt == nil || !got.CompletedAt.Equal(completedAt) {
@@ -387,7 +395,7 @@ func TestStoreCompletesEnvironmentCreationReplaySafely(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay completion: %v", err)
 	}
-	if got := replayed.Environment().Snapshot(); got.Version != 3 || !got.UpdatedAt.Equal(completedAt) {
+	if got := replayed.Environment().Snapshot(); got.Version != 4 || !got.UpdatedAt.Equal(completedAt) {
 		t.Fatalf("replayed Environment changed = %#v", got)
 	}
 	if got := replayed.Operation().Snapshot(); got.CompletedAt == nil || !got.CompletedAt.Equal(completedAt) {

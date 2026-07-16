@@ -55,8 +55,8 @@ func TestFoundationTracerPersistsAndCompletesThroughRestate(t *testing.T) {
 	restateEnvironment := testfixtures.StartRestate(t,
 		workflows.EnvironmentCreateDefinition(
 			fakeProvider, workflows.NewEnvironmentCreationActions(store),
-			&idsFake{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1"}},
-			func() time.Time { return now.Add(time.Minute) },
+			&idsFake{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
+			func() time.Time { return now.Add(time.Minute) }, "image-v1",
 		),
 	)
 	failedService := application.NewCreateEnvironmentService(
