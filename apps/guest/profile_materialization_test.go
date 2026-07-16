@@ -350,6 +350,29 @@ func TestProfileMaterializationNeverExecutesSelectedExecutableContent(t *testing
 	}
 }
 
+func TestProfileMaterializationAppliesModeWhenContentIsUnchanged(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "tool.sh")
+	content := []byte("#!/bin/sh\necho ok\n")
+	if err := os.WriteFile(target, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := materializationDigest(content)
+	item := directFile("tool", "tool.sh", content, 0o755)
+	item.LastAppliedDigest, item.ObservedDigest = digest, digest
+	item.EffectiveCacheKeyChanged = true
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
+		HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item},
+	})
+	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationUpdate {
+		t.Fatalf("mode-only materialization = %#v, err=%v; want update", results, err)
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("resulting mode = %v/%v, want 0755", info, err)
+	}
+}
+
 func TestHookMaterializationRequiresConsentEvenWhenDeclaredDeclarative(t *testing.T) {
 	home := t.TempDir()
 	item := directFile("hook:format", ".claude/settings.json", []byte(`{"hooks":[]}`), 0o600)
@@ -476,6 +499,26 @@ func TestTOMLSelectorObserveComparesSelectedSubtreeOnly(t *testing.T) {
 	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
 	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationSkip {
 		t.Fatalf("foreign TOML edit registered as managed drift: results=%#v err=%v", results, err)
+	}
+}
+
+func TestTOMLSelectorRoundTripUsesCanonicalDesiredDigest(t *testing.T) {
+	home := t.TempDir()
+	content := []byte("value = \"gpt-5\"\n")
+	item := tomlSelectorItem("codex-model", ".codex/config.toml", "$.model", content, "", "")
+	first, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
+		HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item},
+	})
+	if err != nil || len(first) != 1 || first[0].Operation != profile.OperationCreate {
+		t.Fatalf("initial TOML selector materialization = %#v, err=%v; want create", first, err)
+	}
+
+	item.LastAppliedDigest, item.ObservedDigest = first[0].LastAppliedDigest, first[0].ObservedDigest
+	second, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{
+		HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item},
+	})
+	if err != nil || len(second) != 1 || second[0].Operation != profile.OperationSkip {
+		t.Fatalf("identical TOML selector re-application = %#v, err=%v; want skip without block", second, err)
 	}
 }
 

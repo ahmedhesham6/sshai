@@ -15,6 +15,12 @@ const (
 	codexAdapterVersion = "v1"
 )
 
+var codexSensitiveSurfaces = []sensitiveMaterializationSurface{
+	{Target: ".codex/config.toml", Selector: "$.mcp_servers", Reason: "resolved destination overlaps Codex integration surface and requires explicit consent"},
+	{Target: ".codex/config.toml", Selector: "$.approval_policy", Reason: "resolved destination overlaps Codex permission surface and requires explicit consent"},
+	{Target: ".codex/config.toml", Selector: "$.sandbox_mode", Reason: "resolved destination overlaps Codex permission surface and requires explicit consent"},
+}
+
 type codexAdapter struct{}
 
 func init() {
@@ -82,12 +88,20 @@ func translateCodexComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest 
 	if component.Type == capsule.ComponentTypeIntegration {
 		approvalRequired, approvalReason = true, "integration component is never auto-applied"
 	}
-	transition := !hasInstalled || installed.LastAppliedDigest != contentDigest
+	transition := !hasInstalled || installed.LastAppliedDigest != contentDigest || installed.ComponentDigest != component.Digest
 	if transition && component.TrustClass == capsule.TrustExecutable {
 		approvalRequired, approvalReason = true, "executable Component transition requires renewed review"
 	}
+	if !hasInstalled && len(component.Requirements.Secrets) > 0 {
+		approvalRequired, approvalReason = true, "Credential Requirement requires explicit consent"
+	}
 	if hasInstalled && installed.CredentialRequirementDigest != requirementDigest {
 		approvalRequired, approvalReason = true, "Credential Requirement changed and requires explicit consent"
+	}
+	if !approvalRequired {
+		if required, reason := sensitiveMaterializationApproval(target, selector, codexSensitiveSurfaces); required {
+			approvalRequired, approvalReason = true, reason
+		}
 	}
 	item := ProfileMaterialization{
 		ID: componentID, LockID: snapshot.ID, LockDigest: snapshot.Digest, CapsuleDigest: capsuleDigest, ComponentID: componentID, ComponentDigest: component.Digest,

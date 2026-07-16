@@ -15,6 +15,11 @@ const (
 	claudeAdapterVersion = "v1"
 )
 
+var claudeSensitiveSurfaces = []sensitiveMaterializationSurface{
+	{Target: ".mcp.json", Selector: "$", Reason: "resolved destination overlaps Claude integration surface and requires explicit consent"},
+	{Target: ".claude/settings.json", Selector: "$", Reason: "resolved destination overlaps Claude permission surface and requires explicit consent"},
+}
+
 type claudeAdapter struct{}
 
 func init() {
@@ -102,12 +107,20 @@ func translateClaudeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest
 	if component.Type == capsule.ComponentTypeIntegration {
 		approvalRequired, approvalReason = true, "integration component is never auto-applied"
 	}
-	transition := !hasInstalled || installed.LastAppliedDigest != contentDigest
+	transition := !hasInstalled || installed.LastAppliedDigest != contentDigest || installed.ComponentDigest != component.Digest
 	if transition && component.TrustClass == capsule.TrustExecutable {
 		approvalRequired, approvalReason = true, "executable Component transition requires renewed review"
 	}
+	if !hasInstalled && len(component.Requirements.Secrets) > 0 {
+		approvalRequired, approvalReason = true, "Credential Requirement requires explicit consent"
+	}
 	if hasInstalled && installed.CredentialRequirementDigest != requirementDigest {
 		approvalRequired, approvalReason = true, "Credential Requirement changed and requires explicit consent"
+	}
+	if !approvalRequired {
+		if required, reason := sensitiveMaterializationApproval(target, selector, claudeSensitiveSurfaces); required {
+			approvalRequired, approvalReason = true, reason
+		}
 	}
 	item := ProfileMaterialization{
 		ID: componentID, LockID: snapshot.ID, LockDigest: snapshot.Digest, CapsuleDigest: capsuleDigest, ComponentID: componentID, ComponentDigest: component.Digest,

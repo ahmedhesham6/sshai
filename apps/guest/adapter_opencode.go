@@ -15,6 +15,13 @@ const (
 	opencodeAdapterVersion = "v1"
 )
 
+var opencodeSensitiveSurfaces = []sensitiveMaterializationSurface{
+	{Target: "opencode.json", Selector: "$.mcp", Reason: "resolved destination overlaps OpenCode integration surface and requires explicit consent"},
+	{Target: path.Join(".config", "opencode", "opencode.json"), Selector: "$.mcp", Reason: "resolved destination overlaps OpenCode integration surface and requires explicit consent"},
+	{Target: "opencode.json", Selector: "$.permission", Reason: "resolved destination overlaps OpenCode permission surface and requires explicit consent"},
+	{Target: path.Join(".config", "opencode", "opencode.json"), Selector: "$.permission", Reason: "resolved destination overlaps OpenCode permission surface and requires explicit consent"},
+}
+
 type opencodeAdapter struct{}
 
 func init() {
@@ -85,12 +92,20 @@ func translateOpenCodeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDige
 	if component.Type == capsule.ComponentTypeIntegration {
 		approvalRequired, approvalReason = true, "integration component is never auto-applied"
 	}
-	transition := !hasInstalled || installed.LastAppliedDigest != contentDigest
+	transition := !hasInstalled || installed.LastAppliedDigest != contentDigest || installed.ComponentDigest != component.Digest
 	if transition && component.TrustClass == capsule.TrustExecutable {
 		approvalRequired, approvalReason = true, "executable Component transition requires renewed review"
 	}
+	if !hasInstalled && len(component.Requirements.Secrets) > 0 {
+		approvalRequired, approvalReason = true, "Credential Requirement requires explicit consent"
+	}
 	if hasInstalled && installed.CredentialRequirementDigest != requirementDigest {
 		approvalRequired, approvalReason = true, "Credential Requirement changed and requires explicit consent"
+	}
+	if !approvalRequired {
+		if required, reason := sensitiveMaterializationApproval(target, selector, opencodeSensitiveSurfaces); required {
+			approvalRequired, approvalReason = true, reason
+		}
 	}
 	item := ProfileMaterialization{
 		ID: componentID, LockID: snapshot.ID, LockDigest: snapshot.Digest, CapsuleDigest: capsuleDigest, ComponentID: componentID, ComponentDigest: component.Digest,

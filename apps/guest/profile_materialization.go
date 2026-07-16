@@ -473,6 +473,13 @@ func prepareProfileMaterialization(batch ProfileMaterializationBatch, roots map[
 	if err := validateDesiredMaterialization(item); err != nil {
 		return plannedProfileMaterialization{}, err
 	}
+	if selector := item.Selector; filepathExt(item.Target) == ".toml" && selector != "" && selector != "$" {
+		canonical, err := canonicalTOMLDesiredSelection(item.Content, selector)
+		if err != nil {
+			return plannedProfileMaterialization{}, fmt.Errorf("canonicalize desired TOML selection: %w", err)
+		}
+		item.ContentDigest = materializationContentDigest(canonical)
+	}
 	root, err := batchMaterializationRoot(batch, roots, item.Root)
 	if err != nil {
 		return plannedProfileMaterialization{}, err
@@ -569,6 +576,16 @@ func (plan *plannedProfileMaterialization) apply() error {
 			if err := writeMaterializedFile(plan.root, plan.result.Target, content, plan.mode, !exists); err != nil {
 				return fmt.Errorf("%s %q: %w", operation, plan.result.ID, err)
 			}
+		} else {
+			currentMode, err := materializedFileMode(plan.root, plan.result.Target)
+			if err != nil {
+				return fmt.Errorf("inspect mode %q before mutation: %w", plan.result.ID, err)
+			}
+			if currentMode.Perm() != plan.mode.Perm() {
+				if err := plan.root.Chmod(plan.result.Target, plan.mode); err != nil {
+					return fmt.Errorf("chmod %q: %w", plan.result.ID, err)
+				}
+			}
 		}
 	}
 	plan.result.LastAppliedDigest = plan.result.DesiredDigest
@@ -591,8 +608,7 @@ func recordMaterializationOwnership(owned map[string][]string, item ProfileMater
 	}
 	key := string(item.Root) + "\x00" + item.Target
 	for _, existing := range owned[key] {
-		overlaps := selector == existing || selector == "$" || existing == "$" || strings.HasPrefix(selector, existing+".") || strings.HasPrefix(existing, selector+".")
-		if overlaps {
+		if materializationSelectorsOverlap(selector, existing) {
 			return fmt.Errorf("target %q has overlapping selectors %q and %q", item.Target, existing, selector)
 		}
 	}
@@ -1314,6 +1330,14 @@ func canonicalTOMLSelection(value any, selector string) ([]byte, error) {
 	}
 	fields := strings.Split(strings.TrimPrefix(selector, "$."), ".")
 	return toml.Marshal(map[string]any{fields[len(fields)-1]: value})
+}
+
+func canonicalTOMLDesiredSelection(content []byte, selector string) ([]byte, error) {
+	value, err := decodeTOMLSelection(content, selector)
+	if err != nil {
+		return nil, err
+	}
+	return canonicalTOMLSelection(value, selector)
 }
 
 func materializedFileExists(root *os.Root, target string) (bool, error) {

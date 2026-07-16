@@ -31,7 +31,7 @@ func TestCodexAdapterMapsConfigCommandAndIntegrationComponents(t *testing.T) {
 		{
 			name: "project config", component: capsule.Component{ID: "config:.codex/config.toml", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeProject, TrustClass: capsule.TrustDeclarative},
 			content: "model = \"gpt-5\"\n", wantRoot: MaterializationWorkspace, wantMode: MaterializationSeeded,
-			wantTarget: ".codex/config.toml", wantSelector: "$",
+			wantTarget: ".codex/config.toml", wantSelector: "$", wantApproval: true,
 		},
 		{
 			name: "command", component: capsule.Component{ID: "command:review", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative},
@@ -102,6 +102,34 @@ func TestCodexAdapterIntegrationAlwaysRequiresApproval(t *testing.T) {
 	}
 }
 
+func TestCodexAdapterDeclarativeAliasesSensitiveSurfacesRequireApproval(t *testing.T) {
+	tests := []struct {
+		name         string
+		selector     string
+		wantReason   string
+		wantApproval bool
+	}{
+		{name: "integration alias", selector: "$.mcp_servers.github", wantReason: "integration", wantApproval: true},
+		{name: "permission alias", selector: "$.approval_policy", wantReason: "permission", wantApproval: true},
+		{name: "benign selector", selector: "$.model", wantApproval: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			component := capsule.Component{ID: "config:.codex/config.toml#" + test.selector, Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative}
+			item, err := (codexAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: []byte("model = \"gpt-5\"\n"), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if item.ApprovalRequired != test.wantApproval {
+				t.Fatalf("ApprovalRequired = %t, want %t (reason %q)", item.ApprovalRequired, test.wantApproval, item.ApprovalReason)
+			}
+			if test.wantReason != "" && !strings.Contains(item.ApprovalReason, test.wantReason) {
+				t.Fatalf("ApprovalReason = %q, want it to contain %q", item.ApprovalReason, test.wantReason)
+			}
+		})
+	}
+}
+
 func TestCodexAdapterExecutableTransitionRequiresRenewedReview(t *testing.T) {
 	component := capsule.Component{ID: "command:review", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeUser, TrustClass: capsule.TrustExecutable}
 	item, err := (codexAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Path: "content", Content: []byte("new prompt\n"), Mode: 0o755}}, InstalledMaterialization{
@@ -115,6 +143,38 @@ func TestCodexAdapterExecutableTransitionRequiresRenewedReview(t *testing.T) {
 	}
 	if strings.Contains(item.ApprovalReason, "Codex") {
 		t.Fatal("approval reason unexpectedly changed adapter-independent policy text")
+	}
+}
+
+func TestCodexAdapterExecutableComponentDigestChangeRequiresRenewedReview(t *testing.T) {
+	component := capsule.Component{
+		ID: "command:review", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeUser,
+		TrustClass: capsule.TrustExecutable, Digest: "new-component-digest",
+	}
+	content := []byte("review prompt\n")
+	item, err := (codexAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: content, Mode: 0o755}}, InstalledMaterialization{
+		ComponentID: component.ID, ComponentDigest: "old-component-digest",
+		LastAppliedDigest: materializationContentDigest(content), CredentialRequirementDigest: componentRequirementDigest(component),
+	}, true, CapsuleLockMaterializationBatch{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !item.ApprovalRequired || item.ApprovalReason != "executable Component transition requires renewed review" {
+		t.Fatalf("approval = %t/%q, want renewed review for component-digest transition", item.ApprovalRequired, item.ApprovalReason)
+	}
+}
+
+func TestCodexAdapterFirstInstallCredentialRequirementRequiresConsent(t *testing.T) {
+	component := capsule.Component{
+		ID: "config:.codex/config.toml#$.model", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser,
+		TrustClass: capsule.TrustDeclarative, Requirements: capsule.Requirements{Secrets: []string{"TOKEN"}},
+	}
+	item, err := (codexAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: []byte("model = \"gpt-5\"\n"), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !item.ApprovalRequired || !strings.Contains(item.ApprovalReason, "Credential Requirement") || !strings.Contains(item.ApprovalReason, "explicit consent") {
+		t.Fatalf("approval = %t/%q, want first-install credential consent", item.ApprovalRequired, item.ApprovalReason)
 	}
 }
 

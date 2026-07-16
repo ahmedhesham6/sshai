@@ -47,6 +47,10 @@ func TestMaterializeCapsuleLockClaudeEndToEndUsesVerifiedCacheAndNoOp(t *testing
 				ComponentID: "integration:.mcp.json", ComponentDigest: lock.Snapshot().ResolvedComponents["integration:.mcp.json"].ComponentDigest,
 				LockID: lock.Snapshot().ID, LockDigest: lock.Snapshot().Digest,
 			},
+			"config:.claude/settings.json#$.permissions": {
+				ComponentID: "config:.claude/settings.json#$.permissions", ComponentDigest: lock.Snapshot().ResolvedComponents["config:.claude/settings.json#$.permissions"].ComponentDigest,
+				LockID: lock.Snapshot().ID, LockDigest: lock.Snapshot().Digest,
+			},
 		},
 		TargetAgentVersion: "claude-1",
 	}
@@ -307,6 +311,7 @@ func TestClaudeCredentialRequirementChangeRequiresExplicitConsent(t *testing.T) 
 	provider := newCapsuleObjectProvider(t)
 	publishCapsule(t, provider, firstValue)
 	firstRequest := lockMaterializationRequest(t, provider, firstValue)
+	firstRequest.Approvals = approvalForLock(t, firstRequest.Lock, "config:CLAUDE.md")
 	first, err := guest.MaterializeCapsuleLock(t.Context(), firstRequest)
 	if err != nil {
 		t.Fatalf("initial requirement materialization: %v", err)

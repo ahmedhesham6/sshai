@@ -2,6 +2,7 @@ package guest
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/ahmedhesham6/sshai/libs/capsule"
@@ -224,6 +225,34 @@ func TestOpenCodeAdapterIntegrationAndPermissionAlwaysRequireApproval(t *testing
 	}
 }
 
+func TestOpenCodeAdapterDeclarativeAliasesSensitiveSurfacesRequireApproval(t *testing.T) {
+	tests := []struct {
+		name         string
+		selector     string
+		wantReason   string
+		wantApproval bool
+	}{
+		{name: "integration alias", selector: "$.mcp.github", wantReason: "integration", wantApproval: true},
+		{name: "permission alias", selector: "$.permission", wantReason: "permission", wantApproval: true},
+		{name: "benign selector", selector: "$.theme", wantApproval: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			component := capsule.Component{ID: "config:opencode.json#" + test.selector, Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative}
+			item, err := (opencodeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: []byte(`{"value":true}`), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if item.ApprovalRequired != test.wantApproval {
+				t.Fatalf("ApprovalRequired = %t, want %t (reason %q)", item.ApprovalRequired, test.wantApproval, item.ApprovalReason)
+			}
+			if test.wantReason != "" && !strings.Contains(item.ApprovalReason, test.wantReason) {
+				t.Fatalf("ApprovalReason = %q, want it to contain %q", item.ApprovalReason, test.wantReason)
+			}
+		})
+	}
+}
+
 func TestOpenCodeAdapterExecutableTransitionRequiresRenewedReview(t *testing.T) {
 	adapter, err := capsuleAdapterFor("opencode")
 	if err != nil {
@@ -251,6 +280,46 @@ func TestOpenCodeAdapterExecutableTransitionRequiresRenewedReview(t *testing.T) 
 	}
 	if !got.ApprovalRequired || got.ApprovalReason != "executable Component transition requires renewed review" {
 		t.Fatalf("approval = %t/%q, want executable transition review", got.ApprovalRequired, got.ApprovalReason)
+	}
+}
+
+func TestOpenCodeAdapterExecutableComponentDigestChangeRequiresRenewedReview(t *testing.T) {
+	adapter, err := capsuleAdapterFor("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	component := capsule.Component{
+		ID: "command:deploy.md", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeUser,
+		TrustClass: capsule.TrustExecutable, Digest: "new-component-digest",
+	}
+	content := []byte("deploy prompt\n")
+	item, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: content, Mode: 0o755}}, InstalledMaterialization{
+		ComponentID: component.ID, ComponentDigest: "old-component-digest",
+		LastAppliedDigest: materializationContentDigest(content), CredentialRequirementDigest: componentRequirementDigest(component),
+	}, true, CapsuleLockMaterializationBatch{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !item.ApprovalRequired || item.ApprovalReason != "executable Component transition requires renewed review" {
+		t.Fatalf("approval = %t/%q, want renewed review for component-digest transition", item.ApprovalRequired, item.ApprovalReason)
+	}
+}
+
+func TestOpenCodeAdapterFirstInstallCredentialRequirementRequiresConsent(t *testing.T) {
+	adapter, err := capsuleAdapterFor("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	component := capsule.Component{
+		ID: "config:opencode.json#$.theme", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser,
+		TrustClass: capsule.TrustDeclarative, Requirements: capsule.Requirements{Secrets: []string{"TOKEN"}},
+	}
+	item, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: []byte(`{"value":"dark"}`), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !item.ApprovalRequired || !strings.Contains(item.ApprovalReason, "Credential Requirement") || !strings.Contains(item.ApprovalReason, "explicit consent") {
+		t.Fatalf("approval = %t/%q, want first-install credential consent", item.ApprovalRequired, item.ApprovalReason)
 	}
 }
 
