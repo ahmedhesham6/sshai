@@ -13,6 +13,7 @@ import (
 	"github.com/ahmedhesham6/sshai/apps/guest"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
+	"github.com/pelletier/go-toml/v2"
 )
 
 func TestManagedProfileMaterializationCreatesVerifiedContent(t *testing.T) {
@@ -419,4 +420,207 @@ func assertMaterializedContent(t *testing.T, target string, want []byte) {
 func materializationDigest(content []byte) string {
 	digest := sha256.Sum256(content)
 	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func TestTOMLSelectorMergePreservesForeignKeys(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, ".codex", "config.toml")
+	original := []byte("model = \"gpt-4\"\nforeign = \"keep\"\n\n[user]\nname = \"Ada\"\n")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	desired := tomlScalarContent(t, "gpt-5")
+	item := tomlSelectorItem("codex-model", ".codex/config.toml", "$.model", desired, tomlSelectedDigest(t, original, "$.model"), tomlSelectedDigest(t, original, "$.model"))
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
+	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationUpdate {
+		t.Fatalf("TOML selector update: results=%#v err=%v", results, err)
+	}
+	var document map[string]any
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := toml.Unmarshal(content, &document); err != nil {
+		t.Fatalf("decode materialized TOML: %v", err)
+	}
+	if document["model"] != "gpt-5" || document["foreign"] != "keep" {
+		t.Fatalf("managed or foreign keys changed: %#v", document)
+	}
+	user := document["user"].(map[string]any)
+	if user["name"] != "Ada" {
+		t.Fatalf("foreign table changed: %#v", document)
+	}
+}
+
+func TestTOMLSelectorObserveComparesSelectedSubtreeOnly(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, ".codex", "config.toml")
+	original := []byte("model = \"gpt-5\"\nforeign = \"keep\"\n")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected := tomlSelectedDigest(t, original, "$.model")
+	item := tomlSelectorItem("codex-model", ".codex/config.toml", "$.model", tomlScalarContent(t, "gpt-5"), selected, selected)
+	if results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}}); err != nil || results[0].Operation != profile.OperationSkip {
+		t.Fatalf("initial TOML selector observation: results=%#v err=%v", results, err)
+	}
+	if err := os.WriteFile(target, []byte("model = \"gpt-5\"\nforeign = \"user edit\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
+	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationSkip {
+		t.Fatalf("foreign TOML edit registered as managed drift: results=%#v err=%v", results, err)
+	}
+}
+
+func TestTOMLSelectorThreeWayDriftAndConflictClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		desired   string
+		last      string
+		observed  string
+		operation profile.PlanOperation
+	}{
+		{name: "drift", desired: "gpt-4", last: "gpt-4", observed: "user-edit", operation: profile.OperationDrift},
+		{name: "conflict", desired: "gpt-5", last: "gpt-4", observed: "user-edit", operation: profile.OperationConflict},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			target := filepath.Join(home, ".codex", "config.toml")
+			original := []byte("model = \"" + test.observed + "\"\nforeign = \"keep\"\n")
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			item := tomlSelectorItem("codex-model", ".codex/config.toml", "$.model", tomlScalarContent(t, test.desired), tomlScalarDigest(t, test.last), tomlSelectedDigest(t, original, "$.model"))
+			results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
+			if !errors.Is(err, guest.ErrProfileMaterializationBlocked) || len(results) != 1 || results[0].Operation != test.operation {
+				t.Fatalf("TOML %s classification: results=%#v err=%v", test.name, results, err)
+			}
+		})
+	}
+}
+
+func TestTOMLSelectorRemoveDeletesOnlyManagedSubtree(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, ".codex", "config.toml")
+	original := []byte("model = \"gpt-5\"\nforeign = \"keep\"\n")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected := tomlSelectedDigest(t, original, "$.model")
+	item := guest.ProfileMaterialization{ID: "codex-model", ComponentID: "codex-model", Mode: guest.MaterializationManaged, Root: guest.MaterializationHome, Target: ".codex/config.toml", Selector: "$.model", LastAppliedDigest: selected, ObservedDigest: selected}
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentPrune, Items: []guest.ProfileMaterialization{item}})
+	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationRemove {
+		t.Fatalf("TOML selector remove: results=%#v err=%v", results, err)
+	}
+	var document map[string]any
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := toml.Unmarshal(content, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := document["model"]; exists || document["foreign"] != "keep" {
+		t.Fatalf("TOML selector remove changed unmanaged keys: %#v", document)
+	}
+}
+
+func TestOverlappingTOMLSelectorsRejected(t *testing.T) {
+	home := t.TempDir()
+	first := tomlSelectorItem("mcp", ".codex/config.toml", "$.mcp_servers", tomlMapContent(t, map[string]any{"foo": map[string]any{"command": "first"}}), "", "")
+	second := tomlSelectorItem("mcp-foo", ".codex/config.toml", "$.mcp_servers.foo", tomlMapContent(t, map[string]any{"command": "second"}), "", "")
+	_, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{first, second}})
+	if err == nil || !strings.Contains(err.Error(), `overlapping selectors "$.mcp_servers" and "$.mcp_servers.foo"`) {
+		t.Fatalf("overlapping TOML selectors error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex", "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("overlapping selector partially materialized target: %v", err)
+	}
+}
+
+func TestTOMLSelectorUnchangedSubtreeIsNotRewritten(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, ".codex", "config.toml")
+	original := []byte("model = \"gpt-5\"\nforeign = \"keep\" # preserve user formatting\n")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected := tomlSelectedDigest(t, original, "$.model")
+	item := tomlSelectorItem("codex-model", ".codex/config.toml", "$.model", tomlScalarContent(t, "gpt-5"), selected, selected)
+	item.EffectiveCacheKeyChanged = true
+	results, err := guest.ApplyProfileMaterializations(guest.ProfileMaterializationBatch{HomeRoot: home, Intent: profile.IntentReconcile, Items: []guest.ProfileMaterialization{item}})
+	if err != nil || len(results) != 1 || results[0].Operation != profile.OperationUpdate {
+		t.Fatalf("cache-key TOML update: results=%#v err=%v", results, err)
+	}
+	assertMaterializedContent(t, target, original)
+}
+
+func tomlSelectorItem(id, target, selector string, content []byte, lastApplied, observed string) guest.ProfileMaterialization {
+	item := directFile(id, target, content, 0o600)
+	item.Selector, item.LastAppliedDigest, item.ObservedDigest = selector, lastApplied, observed
+	return item
+}
+
+func tomlScalarContent(t *testing.T, value string) []byte {
+	t.Helper()
+	content, err := toml.Marshal(map[string]any{"model": value})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return content
+}
+
+func tomlMapContent(t *testing.T, value map[string]any) []byte {
+	t.Helper()
+	content, err := toml.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return content
+}
+
+func tomlScalarDigest(t *testing.T, value string) string {
+	return materializationDigest(tomlScalarContent(t, value))
+}
+
+func tomlSelectedDigest(t *testing.T, content []byte, selector string) string {
+	t.Helper()
+	var document map[string]any
+	if err := toml.Unmarshal(content, &document); err != nil {
+		t.Fatal(err)
+	}
+	value := any(document)
+	for _, field := range strings.Split(strings.TrimPrefix(selector, "$."), ".") {
+		object := value.(map[string]any)
+		value = object[field]
+	}
+	var canonical []byte
+	var err error
+	if object, ok := value.(map[string]any); ok {
+		canonical, err = toml.Marshal(object)
+	} else {
+		fields := strings.Split(strings.TrimPrefix(selector, "$."), ".")
+		canonical, err = toml.Marshal(map[string]any{fields[len(fields)-1]: value})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return materializationDigest(canonical)
 }

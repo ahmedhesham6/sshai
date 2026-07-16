@@ -19,6 +19,7 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
+	"github.com/pelletier/go-toml/v2"
 )
 
 type MaterializationMode string
@@ -75,7 +76,7 @@ type ProfileMaterialization struct {
 	Mode   MaterializationMode
 	Root   MaterializationRoot
 	Target string
-	// Selector is retained for JSON key ownership. "$" means the whole file.
+	// Selector is retained for JSON/TOML key ownership. "$" means the whole file.
 	Selector string
 
 	Content       []byte
@@ -532,6 +533,8 @@ func (plan *plannedProfileMaterialization) apply() error {
 			err = plan.root.RemoveAll(plan.result.Target)
 		} else if plan.result.Selector == "$" {
 			err = plan.root.Remove(plan.result.Target)
+		} else if filepathExt(plan.result.Target) == ".toml" {
+			err = removeTOMLSelection(plan.root, plan.result.Target, plan.result.Selector)
 		} else {
 			err = removeJSONSelection(plan.root, plan.result.Target, plan.result.Selector)
 		}
@@ -549,17 +552,23 @@ func (plan *plannedProfileMaterialization) apply() error {
 	} else {
 		content := plan.content
 		if plan.result.Selector != "$" {
-			content, err = mergeJSONSelection(plan.root, plan.result.Target, plan.result.Selector, content)
+			if filepathExt(plan.result.Target) == ".toml" {
+				content, err = mergeTOMLSelection(plan.root, plan.result.Target, plan.result.Selector, content)
+			} else {
+				content, err = mergeJSONSelection(plan.root, plan.result.Target, plan.result.Selector, content)
+			}
 			if err != nil {
 				return fmt.Errorf("merge %q: %w", plan.result.ID, err)
 			}
 		}
-		exists, err := materializedFileExists(plan.root, plan.result.Target)
+		current, exists, err := readMaterializedFile(plan.root, plan.result.Target)
 		if err != nil {
 			return fmt.Errorf("inspect %q before mutation: %w", plan.result.ID, err)
 		}
-		if err := writeMaterializedFile(plan.root, plan.result.Target, content, plan.mode, !exists); err != nil {
-			return fmt.Errorf("%s %q: %w", operation, plan.result.ID, err)
+		if !exists || !bytes.Equal(current, content) {
+			if err := writeMaterializedFile(plan.root, plan.result.Target, content, plan.mode, !exists); err != nil {
+				return fmt.Errorf("%s %q: %w", operation, plan.result.ID, err)
+			}
 		}
 	}
 	plan.result.LastAppliedDigest = plan.result.DesiredDigest
@@ -772,13 +781,29 @@ func validateMaterializationSelector(target, selector string, content []byte) er
 		return err
 	}
 	if selector == "$" {
-		if filepathExt(target) == ".json" && !json.Valid(content) {
-			return errors.New("JSON component has invalid syntax")
+		switch filepathExt(target) {
+		case ".json":
+			if !json.Valid(content) {
+				return errors.New("JSON component has invalid syntax")
+			}
+		case ".toml":
+			if _, err := decodeMaterializationTOML(content); err != nil {
+				return fmt.Errorf("TOML component has invalid syntax: %w", err)
+			}
 		}
 		return nil
 	}
-	if filepathExt(target) != ".json" || !json.Valid(content) {
+	if filepathExt(target) == ".json" {
+		if !json.Valid(content) {
+			return fmt.Errorf("selector %q is unsupported", selector)
+		}
+		return nil
+	}
+	if filepathExt(target) != ".toml" {
 		return fmt.Errorf("selector %q is unsupported", selector)
+	}
+	if _, err := decodeTOMLSelection(content, selector); err != nil {
+		return fmt.Errorf("selector %q is unsupported: %w", selector, err)
 	}
 	return nil
 }
@@ -787,7 +812,7 @@ func validateMaterializationSelectorSyntax(target, selector string) error {
 	if selector == "" || selector == "$" {
 		return nil
 	}
-	if filepathExt(target) != ".json" || !strings.HasPrefix(selector, "$.") {
+	if (filepathExt(target) != ".json" && filepathExt(target) != ".toml") || !strings.HasPrefix(selector, "$.") {
 		return fmt.Errorf("selector %q is unsupported", selector)
 	}
 	for _, field := range strings.Split(strings.TrimPrefix(selector, "$."), ".") {
@@ -967,7 +992,11 @@ func observeMaterializedFile(root *os.Root, target, selector string) (string, er
 		return "", err
 	}
 	if selector != "" && selector != "$" {
-		content, exists, err = selectJSON(content, selector)
+		if filepathExt(target) == ".toml" {
+			content, exists, err = selectTOML(content, selector)
+		} else {
+			content, exists, err = selectJSON(content, selector)
+		}
 		if err != nil || !exists {
 			return "", err
 		}
@@ -1130,6 +1159,161 @@ func removeJSONSelection(root *os.Root, target, selector string) error {
 		return err
 	}
 	return writeMaterializedFile(root, target, updated, mode, false)
+}
+
+func selectTOML(content []byte, selector string) ([]byte, bool, error) {
+	document, err := decodeMaterializationTOML(content)
+	if err != nil {
+		return nil, false, fmt.Errorf("decode TOML target: %w", err)
+	}
+	value, exists, err := lookupTOMLSelection(document, selector)
+	if err != nil || !exists {
+		return nil, exists, err
+	}
+	selected, err := canonicalTOMLSelection(value, selector)
+	return selected, true, err
+}
+
+func mergeTOMLSelection(root *os.Root, target, selector string, desired []byte) ([]byte, error) {
+	content, exists, err := readMaterializedFile(root, target)
+	if err != nil {
+		return nil, err
+	}
+	document := make(map[string]any)
+	if exists {
+		document, err = decodeMaterializationTOML(content)
+		if err != nil {
+			return nil, fmt.Errorf("decode TOML target: %w", err)
+		}
+	}
+	value, err := decodeTOMLSelection(desired, selector)
+	if err != nil {
+		return nil, fmt.Errorf("decode desired TOML value: %w", err)
+	}
+	if exists {
+		currentValue, currentExists, err := lookupTOMLSelection(document, selector)
+		if err != nil {
+			return nil, err
+		}
+		if currentExists {
+			currentCanonical, err := canonicalTOMLSelection(currentValue, selector)
+			if err != nil {
+				return nil, err
+			}
+			desiredCanonical, err := canonicalTOMLSelection(value, selector)
+			if err != nil {
+				return nil, err
+			}
+			if bytes.Equal(currentCanonical, desiredCanonical) {
+				return content, nil
+			}
+		}
+	}
+	fields := strings.Split(strings.TrimPrefix(selector, "$."), ".")
+	current := document
+	for _, field := range fields[:len(fields)-1] {
+		next, present := current[field]
+		if !present {
+			child := make(map[string]any)
+			current[field] = child
+			current = child
+			continue
+		}
+		child, ok := next.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("selector %q crosses a non-object value", selector)
+		}
+		current = child
+	}
+	current[fields[len(fields)-1]] = value
+	return toml.Marshal(document)
+}
+
+func removeTOMLSelection(root *os.Root, target, selector string) error {
+	mode, err := materializedFileMode(root, target)
+	if err != nil {
+		return err
+	}
+	content, exists, err := readMaterializedFile(root, target)
+	if err != nil || !exists {
+		return err
+	}
+	document, err := decodeMaterializationTOML(content)
+	if err != nil {
+		return fmt.Errorf("decode TOML target: %w", err)
+	}
+	fields := strings.Split(strings.TrimPrefix(selector, "$."), ".")
+	current := document
+	for _, field := range fields[:len(fields)-1] {
+		next, ok := current[field].(map[string]any)
+		if !ok {
+			return fmt.Errorf("selector %q crosses a non-object value", selector)
+		}
+		current = next
+	}
+	delete(current, fields[len(fields)-1])
+	updated, err := toml.Marshal(document)
+	if err != nil {
+		return err
+	}
+	return writeMaterializedFile(root, target, updated, mode, false)
+}
+
+func decodeMaterializationTOML(content []byte) (map[string]any, error) {
+	var document map[string]any
+	if err := toml.Unmarshal(content, &document); err != nil {
+		return nil, err
+	}
+	if document == nil {
+		return nil, errors.New("TOML target must contain a document")
+	}
+	return document, nil
+}
+
+func decodeTOMLSelection(content []byte, selector string) (any, error) {
+	document, err := decodeMaterializationTOML(content)
+	if err != nil {
+		return nil, err
+	}
+	if value, exists, lookupErr := lookupTOMLSelection(document, selector); lookupErr != nil {
+		return nil, lookupErr
+	} else if exists {
+		return value, nil
+	}
+	if len(document) == 1 {
+		if value, exists := document["value"]; exists {
+			return value, nil
+		}
+	}
+	fields := strings.Split(strings.TrimPrefix(selector, "$."), ".")
+	if value, exists := document[fields[len(fields)-1]]; exists {
+		return value, nil
+	}
+	return document, nil
+}
+
+func lookupTOMLSelection(document map[string]any, selector string) (any, bool, error) {
+	fields := strings.Split(strings.TrimPrefix(selector, "$."), ".")
+	var value any = document
+	for _, field := range fields {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return nil, false, fmt.Errorf("selector %q crosses a non-object value", selector)
+		}
+		value, ok = object[field]
+		if !ok {
+			return nil, false, nil
+		}
+	}
+	return value, true, nil
+}
+
+func canonicalTOMLSelection(value any, selector string) ([]byte, error) {
+	if object, ok := value.(map[string]any); ok {
+		return toml.Marshal(object)
+	}
+	fields := strings.Split(strings.TrimPrefix(selector, "$."), ".")
+	return toml.Marshal(map[string]any{fields[len(fields)-1]: value})
 }
 
 func materializedFileExists(root *os.Root, target string) (bool, error) {
