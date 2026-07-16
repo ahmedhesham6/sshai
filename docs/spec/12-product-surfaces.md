@@ -15,11 +15,18 @@ devm stop                    stop the current Runtime
 devm delete                  delete an Environment after safety inventory
 devm doctor                  diagnose local, control-plane, proxy, and guest state
 
+devm capsule capture
+devm capsule build
+devm capsule publish
+devm capsule inspect
+devm capsule diff <from> <to>
+
 devm profile list
 devm profile show <name>
 devm profile create <name>
 devm profile fork <source> <name>
-devm profile diff <from> <to>
+devm profile add <capsule-ref>
+devm profile remove <capsule-ref>
 devm profile publish
 devm profile apply <version>
 
@@ -86,7 +93,7 @@ The web application does not contain an editor, terminal, or proprietary agent o
 2. Runtime: status, Runtime Preset, active duration, primary action.
 3. Connection: stable alias, proxy region, SSH-key state.
 4. Activity: connections, Codex/Claude counts, current auto-stop decision.
-5. Profile: pinned version, pending version, drift/conflicts.
+5. Profile: pinned Profile Version, Capsule Lock, pending updates, drift/conflicts.
 6. State: workspace/home/services/cache health and allocated storage.
 7. Billing: current credit consumption and remaining balance.
 8. Operations: current and recent workflows.

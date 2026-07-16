@@ -20,7 +20,7 @@ Required correlation fields:
 - `rate_version`
 - `credit_transaction_id`
 
-Do not place secrets, SSH payload, arbitrary process command lines, or Profile contents in telemetry.
+Do not place secrets, SSH payload, arbitrary process command lines, or Capsule contents in telemetry.
 
 ## Metrics
 
@@ -35,6 +35,12 @@ Do not place secrets, SSH payload, arbitrary process command lines, or Profile c
 - `runtime_resume_success_total`
 - `profile_materializations_total`
 - `profile_conflicts_total`
+- `capsule_pulls_total`
+- `capsule_pull_bytes_total`
+- `lock_resolutions_total`
+- `component_materializations_total`
+- `component_conflicts_total`
+- `capsule_store_availability`
 
 ### Reliability
 
@@ -69,7 +75,7 @@ Compare latest boot ID, image version, mounts, SSH readiness, Docker health, and
 
 ### Profile reconciliation
 
-Compare Materialization last-applied and observed digests/selectors. Report drift; do not overwrite.
+Compare Materialization last-applied and observed digests/selectors, and the Environment's Capsule Lock against installed Component and rendered-output state. Report missing, extra, changed, or conflicting Components as drift; do not overwrite.
 
 ### Billing reconciliation
 
@@ -121,6 +127,7 @@ Ticket-level alerts:
 - Data volume missing or attached to the wrong Runtime.
 - Runtime replacement partially completed.
 - Profile application blocked by drift/conflict.
+- Capsule store unavailable while Environments need cold pulls; warm Environments start from the blob cache.
 - Restate workflow retrying indefinitely.
 - PostgreSQL/Restate authority mismatch.
 - Polar delivery failure or balance mismatch.

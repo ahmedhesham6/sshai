@@ -31,6 +31,14 @@ These items were not accepted during the design session and must not be silently
 16. **CLI token storage implementations** — macOS Keychain and Linux Secret Service/fallback behavior.
 17. **Default existing-key selection rules** — automatic recommendation when multiple Ed25519 public keys exist.
 
+## Capsules and packaging
+
+18. **External-registry support timing** — decide when ghcr and ECR publication and consumption move beyond a power-user path.
+19. **Signing phase** — decide when Capsule signing ships and whether cosign keyless or Notation with bring-your-own-PKI is supported first.
+20. **OpenCode adapter in MVP or after** — decide whether the OpenCode Adapter ships in MVP or after private alpha.
+21. **Drift-adoption defaults** — decide whether guest-observed drift is proposed for adoption by default and how consent and executable-content review apply.
+22. **Hosted-registry multi-tenancy isolation model** — resolved for MVP by per-owner S3 prefixes; multi-tenant registry isolation becomes a sharing-milestone decision.
+
 ## Implementation spikes required
 
 - Verify WSS ProxyCommand behavior with OpenSSH, Codex desktop, VS Code/Cursor Remote SSH, SCP, SFTP, and long-lived idle connections.
@@ -39,3 +47,6 @@ These items were not accepted during the design session and must not be silently
 - Verify WorkOS CLI Auth token refresh and revocation in the Go CLI.
 - Verify Polar single-meter recurring credit grants, idempotent event ingestion, and customer-meter reconciliation.
 - Verify Restate Cloud service versioning and long-running AWS workflow behavior.
+- Verify two-machine determinism for capsule packaging.
+- Verify ECR/GHCR artifact push-pull-fallback conformance.
+- Verify TOML key-level merge ownership in the guest materializer.

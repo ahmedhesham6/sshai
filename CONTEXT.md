@@ -4,24 +4,44 @@ This context defines the language for creating, operating, and closing agent-rea
 
 ## Configuration
 
+**Capsule**:
+An immutable, digest-addressed OCI artifact packaging agent-configuration content as typed Components.
+_Avoid_: package, bundle, agent environment
+
+**Component**:
+One independently updateable item inside a Capsule: `config`, `skill`, `command`, `subagent`, `hook`, `integration` (MCP), `permission-policy`, `template`, or `extension`.
+_Avoid_: configuration item, configuration file
+
+**Capsule Ref**:
+An ordered entry in a Profile Version pointing at a Capsule through a registry reference, freshness policy, and component exclusions.
+_Avoid_: package reference, capsule content
+
+**Capsule Lock**:
+The immutable, content-addressed result of resolving a Profile Version and the Environment's project Capsule into exact Capsule digests and a resolved Component map.
+_Avoid_: pinned Profile Version, environment snapshot
+
+**Adapter**:
+A per-agent compiler backend translating canonical Components into native change plans.
+_Avoid_: agent plugin, materializer
+
+**Freshness policy**:
+The per-Capsule Ref policy `track`, `review`, or `pin` that controls how its Capsule reference may move.
+_Avoid_: update setting, upgrade policy
+
 **Profile**:
-A named, reusable selection of a developer's portable personal configuration across projects.
+A named, reusable, ordered group of Capsule Refs plus their composition rules, with no configuration content of its own.
 _Avoid_: Machine profile, compute profile, dotfiles bundle
 
 **Profile Version**:
-An immutable snapshot of a Profile. An Environment pins one version until an explicit upgrade.
+An immutable snapshot of a Profile's ordered Capsule Refs and composition rules retained in linear history.
 _Avoid_: Current profile, live profile
 
-**Profile Artifact**:
-One selected instruction, skill, setting, tool declaration, or other portable configuration item contained in a Profile Version.
-_Avoid_: Synced file
-
 **Materialization**:
-The recorded application of a Profile Artifact to an Environment, including its target, mode, adapter, and last-applied digest.
+The recorded application of a Component from a Capsule to an Environment through an Adapter, keyed by the Capsule Lock, capsule digest, Component id, and Adapter.
 _Avoid_: Copy, installation
 
 **Materialization Mode**:
-The ownership rule for a Materialization: `managed`, `seeded`, or `referenced`.
+The ownership rule for a Component Materialization: `managed`, `seeded`, or `referenced`.
 _Avoid_: Sync mode
 
 ## Project
@@ -41,7 +61,7 @@ _Avoid_: Repository sync, home archive
 ## Environment and compute
 
 **Environment**:
-A durable logical development workspace that owns one Project Binding, one pinned Profile Version, state components, lifecycle policy, and at most one current Runtime.
+A durable logical development workspace that owns one Project Binding, one pinned Profile Version, one Capsule Lock, state components, lifecycle policy, and at most one current Runtime.
 _Avoid_: Machine, VM, devbox
 
 **State Component**:

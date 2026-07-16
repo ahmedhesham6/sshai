@@ -30,6 +30,7 @@ Run one command in a repository to enter an agent-ready remote development envir
 16. [Repository layout and implementation plan](./16-implementation-plan.md)
 17. [Open decisions](./17-open-decisions.md)
 18. [Decision register](./18-decision-register.md)
+19. [Capsule packaging and distribution](./19-capsule-packaging.md)
 
 The root [CONTEXT.md](../../CONTEXT.md) is the canonical glossary. Hard-to-reverse architectural decisions are recorded in [docs/adr](../adr/).
 
@@ -47,8 +48,8 @@ The root [CONTEXT.md](../../CONTEXT.md) is the canonical glossary. Hard-to-rever
 
 - Individual users only; no shared environments, profiles, or team policy in the MVP.
 - One primary project per Environment.
-- Profiles are explicitly selected allowlists and have immutable versions.
-- Environments pin Profile Versions and upgrade only through explicit operations.
+- Profiles are named, reusable, ordered groups of Capsule Refs (proposed).
+- Environments materialize only from Capsule Locks and upgrade only through explicit operations (proposed).
 - The remote workspace becomes authoritative after creation; there is no automatic bidirectional file synchronization.
 - A Runtime may serve many concurrent connections and processes, but an Environment has at most one current writable Runtime.
 - Auto-stop behavior is selected per Environment, with an optional Profile default.

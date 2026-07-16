@@ -22,6 +22,11 @@ The public HTTP API is contract-first and resource-oriented. The CLI and TanStac
 - `GET /v1/me`
 - `GET /v1/billing`
 - `POST /v1/billing/portal`
+- `POST /v1/capsule-access`
+
+The capsule-access endpoint mints short-lived, owner-scoped presigned pull/push grants
+for the S3 capsule store from the authenticated WorkOS session. The registry-token
+endpoint arrives with the hosted OCI Distribution registry at the sharing milestone.
 
 ### SSH keys
 
@@ -37,7 +42,12 @@ The public HTTP API is contract-first and resource-oriented. The CLI and TanStac
 - `POST /v1/profiles/{profileId}/versions`
 - `GET /v1/profile-versions/{versionId}`
 
-Profile publication includes the expected current head and references previously uploaded content-addressed artifacts.
+Profile publication includes the expected current head and an ordered list of Capsule Refs. Each Capsule Ref contains a registry reference (tag or digest), freshness policy, and component exclusions. Publication payloads reference Capsules rather than embedding content arrays.
+
+MVP Capsules are served from the S3 capsule store through short-lived owner-scoped
+presigned grants minted by the control plane; the control plane does not proxy Capsule
+object traffic through the public API. The hosted OCI Distribution registry arrives at
+the sharing milestone, alongside its registry-token endpoint.
 
 ### Uploads and Project Seeds
 
@@ -57,6 +67,8 @@ The control plane validates object digests, ownership, size, and type before acc
 - `POST /v1/environments/{environmentId}/apply-profile`
 - `PUT /v1/environments/{environmentId}/auto-stop-policy`
 - `DELETE /v1/environments/{environmentId}`
+
+Environment detail includes the pinned `ProfileVersionID`, `LockID`, pending Capsule updates, and drift/conflicts. The Capsule Lock contains exact Capsule digests and the resolved component map; Environments materialize only from a Lock.
 
 ### Connection
 

@@ -40,19 +40,36 @@
 - Run secret detection before packaging.
 - Display every selected path and selector before upload.
 
-## Profile artifacts
+## Capsule supply chain
 
-- Content-addressed immutable object storage.
-- Digests verified before materialization.
-- Executable content separately classified.
-- Selecting content does not authorize execution.
-- No automatic skill/hook/plugin execution.
+Components carry one of three trust classes:
+
+| Trust class | Rule |
+|---|---|
+| `declarative` | Selecting or packaging the Component never authorizes execution. |
+| `executable` | A changed executable digest requires renewed review, with the diff since last approval shown. |
+| `permission` | `permission-policy` Components are always re-consented with explicit itemized consent at apply time; they are never `auto_safe` and never trusted transitively by a signature or `track` policy. |
+
+- Component trust class is digest-bound: it appears in the Capsule manifest and as the `devm.component.trust` layer annotation, so it is covered by the Capsule digest.
+- Integration (MCP) Component changes and any Credential Requirement changes are never `auto_safe` and always require review.
+- Capture uses an explicit allowlist with per-item consent; unknown content is excluded, private keys are never read, and secret scanning runs before packaging.
+- Capture-time secret extraction includes MCP `env` blocks. Names and references become Credential Requirements; values are never copied into Capsule layers, registry metadata, plans, logs, or diffs.
+- Capsule access uses short-lived presigned grants minted by the control plane and scoped per owner prefix. Guest pulls use the Environment's mTLS channel.
+- Until signing ships, Environments may reference only Capsules owned by the authenticated user; the control plane enforces this constraint.
+- Signing is deferred. The sharing milestone may use cosign keyless signing; Notation is the bring-your-own-PKI alternative. Provenance does not equal review, and signing never replaces the consent boundary.
+
+## Capsules and Components
+
+- Capsules are immutable, digest-addressed OCI artifacts with one layer per Component.
+- Components are independently content-addressed and their digests are verified before materialization.
+- No automatic skill, hook, or plugin execution.
+- Environments materialize only from Capsule Locks.
 - Managed updates never overwrite drift.
 - Setup runner has no secrets and no network by default.
 
 ## Credentials
 
-- Profiles store Credential Requirements and references only.
+- Capsules declare Credential Requirements and references only; Environments hold Credential Bindings.
 - Codex/Claude login caches are environment-specific and never exported.
 - Git provider access uses scoped, preferably short-lived credentials.
 - Static secrets are resolved just in time and never written to operation logs.
@@ -87,7 +104,7 @@ Never log:
 - SSH private keys or payload bytes;
 - secret values or agent auth caches;
 - environment variables and arbitrary command lines from Activity Snapshots;
-- profile artifact bodies unless explicitly redacted and access-controlled for support.
+- Capsule layer contents unless explicitly redacted and access-controlled for support.
 
 ## Destructive operations
 

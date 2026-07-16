@@ -22,15 +22,34 @@ This register concludes the design-grilling session. `Accepted` entries are impl
 | Store selectors, not blanket home-directory snapshots | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
 | New CLI installation can read an existing Profile, fork it, or create another | Accepted | [Domain model](./02-domain-model.md) |
 | No Device aggregate in MVP | Accepted | [Domain model](./02-domain-model.md) |
-| Profiles have immutable versions; Environments pin and explicitly upgrade | Accepted | [Domain model](./02-domain-model.md) |
+| Profiles have immutable versions; Environments pin and explicitly upgrade | Superseded | [Capsules and packaging](#capsules-and-packaging): Profile composition and Capsule Lock materialization |
 | Personal Profile and repository-derived Project Spec are separate | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
 | Dirty/unpushed local Git state is supported through Project Seed | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
 | Materialization modes are managed, seeded, and referenced | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
 | Selecting executable content does not authorize its execution | Accepted | [Security](./11-security.md) |
 | `devm` does not execute skills, hooks, or plugins during sync | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
 | Managed targets are drift-protected and never silently overwritten | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
-| Credentials are Environment-specific bindings; Profiles contain requirements/references only | Accepted | [Security](./11-security.md) |
+| Credentials are Environment-specific bindings; Capsules and Project Specs contain requirements/references only | Accepted | [Security](./11-security.md) |
 | Agent version pinning and updater policy | Open | [Open decisions](./17-open-decisions.md) |
+
+## Capsules and packaging
+
+| Decision | Status | Specification |
+|---|---|---|
+| Capsules are OCI artifacts with one layer per Component | Accepted | [Capsule packaging and distribution](./19-capsule-packaging.md) |
+| Profile is redefined as an ordered group of Capsule Refs (ops objection on migration cost recorded and overridden) | Accepted | [Capsules, profiles, and project seeding](./04-profiles-and-projects.md) |
+| Environments materialize only from Capsule Locks | Accepted | [Domain model](./02-domain-model.md) |
+| MVP serves Capsules from content-addressed S3 using the OCI image-layout format behind short-lived presigned GETs minted by the control plane and scoped per owner prefix; hosted OCI Distribution (Zot), external registries, and signing are deferred to the sharing milestone | Accepted | [Capsule packaging and distribution](./19-capsule-packaging.md) |
+| Capsule distribution has no Referrers API dependency | Accepted | [Capsule packaging and distribution](./19-capsule-packaging.md) |
+| Use oras-go v2 | Accepted | [Capsule packaging and distribution](./19-capsule-packaging.md) |
+| Deterministic packaging is a CI gate | Accepted | [Capsule packaging and distribution](./19-capsule-packaging.md) |
+| Permission Components are always re-consented | Accepted | [Security](./11-security.md) |
+| Project-scope Components are seeded only | Accepted | [Capsules, profiles, and project seeding](./04-profiles-and-projects.md) |
+| Signing is deferred | Accepted | [Capsule packaging and distribution](./19-capsule-packaging.md) |
+| Component trust class is digest-bound | Accepted | [Security](./11-security.md) |
+| Integration and Credential Requirement changes are never auto_safe | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
+| Determinism gate pins the Go toolchain and strips xattrs | Accepted | [Capsule packaging and distribution](./19-capsule-packaging.md) |
+| Environments reference only Capsules owned by the authenticated user until signing ships | Accepted | [Security](./11-security.md) |
 
 ## Environment, Runtime, and state
 

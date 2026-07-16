@@ -44,7 +44,8 @@ Each workflow:
 - `runtime.start`
 - `runtime.stop`
 - `runtime.replace`
-- `profile.apply`
+- `capsule.publish`
+- `profile.resolve`
 - `profile.prune`
 - `project.seed`
 - `credential.bind`
@@ -63,7 +64,7 @@ Every Environment mutation, including Auto-stop Policy updates, is represented b
 6. Configure private networking and Environment SSH identity.
 7. Wait for guest boot and mount readiness.
 8. Apply the Project Seed.
-9. Materialize the pinned Profile Version.
+9. Resolve the pinned Profile Version with the reviewed project Capsule, persist the Capsule Lock, and materialize the Lock.
 10. Bind required credentials or mark `requires_input`.
 11. Validate selected agents and project toolchain.
 12. Publish Runtime readiness and complete Environment activation.
@@ -104,16 +105,18 @@ No step after data-volume creation may automatically delete the data volume as c
 8. Boot, reconcile, validate, and mark ready.
 9. Retain historical Runtime and provider-resource records.
 
-## Profile apply workflow
+## Profile resolve workflow
 
-1. Validate target Profile Version is a descendant or explicit cross-Profile switch.
-2. Compile a plan from desired, last applied, and observed state.
-3. Apply safe approved items atomically.
-4. Stage and syntax-check format-aware changes.
-5. Never execute skill scripts, hooks, or plugins.
-6. Stop on drift/conflict without overwriting.
-7. Roll back only managed artifacts modified by the failed operation.
-8. Pin the new Profile Version only after validation succeeds.
+The pipeline is `resolve → lock → plan → apply`. Environments materialize only from a Capsule Lock.
+
+1. Validate the target Profile Version, the Environment's reviewed project Capsule, and the requested upgrade policy.
+2. Resolve the ordered Capsule Refs. `track` follows the ref's tag and may auto-apply through the safe path; `review` requires explicit approval of the diff since last approval; `pin` never moves.
+3. Apply Capsule exclusions and composition rules. Deduplicate identical Component IDs with identical digests, hard-block conflicting Component IDs with different content, merge eligible configuration by Capsule order, and recompute and re-consent permissions when contributors change.
+4. Create and persist an immutable, content-addressed Capsule Lock containing exact Capsule digests and the resolved Component map.
+5. Compile an adapter-specific plan from the Lock and desired, last-applied, and observed state. The Adapter translates canonical Components; the generic materializer enforces atomic writes, conflict detection, ownership, and rollback.
+6. Pull changed layers by digest, verify them, and apply only safe approved operations. Stage and syntax-check format-aware changes. Never execute skill scripts, hooks, or plugins.
+7. Stop on drift or conflict without overwriting. Roll back only managed Components modified by the failed operation.
+8. Persist Materialization state and pin the Profile Version and Capsule Lock together only after validation succeeds.
 
 ## Reconciliation
 
@@ -124,6 +127,7 @@ Periodic Restate workflows compare:
 - persistent data existence and attachment;
 - current private address and boot ID;
 - Materialization last-applied and observed digests;
+- Capsule Lock and resolved Component state versus installed Component state;
 - open compute usage intervals and provider state;
 - undelivered Polar credit events.
 

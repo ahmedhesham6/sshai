@@ -33,7 +33,7 @@ Each service has a distinct task role, security group, scaling policy, and deplo
 
 Encrypted S3 buckets for:
 
-- immutable Profile Artifacts;
+- immutable Capsule blobs and manifests;
 - Project Seed objects;
 - redacted operation diagnostics when necessary;
 - Packer build outputs and manifests where appropriate.
@@ -57,6 +57,15 @@ Every enabled AWS region contains:
 - a region-specific Runtime Preset mapping and credit-rate configuration.
 
 The private alpha enables one regional cell. Adding a region deploys the same module and test suite with new rate and capacity configuration.
+
+### Regional Capsule store
+
+The regional cell stores Capsules in content-addressed S3 using the OCI image-layout
+format. Objects use a bucket layout under per-owner prefixes, and the control plane
+mints short-lived presigned URLs scoped to the owner prefix for Capsule pulls and pushes.
+The S3 gateway endpoint keeps Capsule traffic on AWS networking and reduces NAT cost.
+
+Zot on ECS Fargate is deferred to the sharing milestone.
 
 ## Runtime resources
 

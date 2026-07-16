@@ -29,6 +29,7 @@ Regional data-plane cell
   private subnets ───────────┼── EC2 Runtime
                              ├── system EBS
                              ├── persistent data EBS
+                             ├── capsule store (S3, OCI layout)
                              └── NAT egress
 ```
 
@@ -48,6 +49,8 @@ Regional data-plane cell
 | Documentation site | Undecided; see open decisions | Static public docs |
 | Durable execution | Restate Cloud + Go SDK | Workflow authority |
 | Product database | Amazon RDS PostgreSQL | Product-state authority |
+| Capsule packaging | oras-go v2 (≥2.6.2) | OCI Capsule manifests and layers |
+| Capsule registry | S3-backed OCI image layout with short-lived presigned access | MVP content-addressed Capsule storage; hosted OCI Distribution registry deferred to sharing milestone |
 | Database access | pgx + sqlc | Explicit SQL |
 | Migrations | goose | Ordered SQL migrations |
 | Public API | OpenAPI 3.0, chi, oapi-codegen | Contract-first REST |
@@ -80,7 +83,17 @@ Authenticates a WorkOS access token, authorizes Environment ownership, starts a 
 
 ### Guest supervisor
 
-Runs as a systemd service. It mounts and validates state paths, materializes approved configuration, reports readiness and Activity Snapshots, tracks user/agent processes, and exposes a mutually authenticated control channel. It cannot mutate billing or Environment ownership.
+Runs as a systemd service. It mounts and validates state paths, pulls Capsule layers by digest through the guest's mTLS channel, materializes an approved Capsule Lock, reports readiness and Activity Snapshots, tracks user/agent processes, and exposes a mutually authenticated control channel. It cannot mutate billing or Environment ownership.
+
+### Capsule store
+
+The MVP capsule store is content-addressed S3 using the OCI image-layout format. The
+control plane mints short-lived presigned GETs scoped per owner prefix, and the guest
+pulls Capsule layers by digest through those grants. The oras-go client uses its `Target`
+abstraction so the client is identical across OCI image-layout and remote registry
+backends. The hosted OCI Distribution registry is deferred to the sharing milestone,
+alongside external registries and signing. Profile composition and Capsule Locks remain
+PostgreSQL state.
 
 ### Provider adapter
 
@@ -100,7 +113,8 @@ Converts measured resource quantities through a versioned credit-rate table, app
 | Workflow journal/timers | Restate | Operation projection |
 | Provider resources | AWS observed state | PostgreSQL intent/resource inventory |
 | Environment filesystem | Persistent data volume | State Component health |
-| Profile desired configuration | Profile Version | Materialization observation |
+| Capsule content | S3 capsule store | Content-addressed |
+| Profile composition and Capsule Locks | PostgreSQL | Materialization observation |
 
 ## Availability boundary
 
