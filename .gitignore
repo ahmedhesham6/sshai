@@ -3,6 +3,6 @@ node_modules/
 dist/
 coverage/
 *.out
-apps/cli/cli
+apps/cli/cmd/devm/devm
 .env
 .env.local
