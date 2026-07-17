@@ -3,8 +3,9 @@
 // instance (`restate deployments register <url>`, or the Restate Cloud UI)
 // is an operational step outside this binary.
 //
-// Only the BillingDelivery workflow is served today; see serviceDependencies
-// for the production seams the remaining services are waiting on.
+// BillingDelivery, EnvironmentCreate, and ProfileResolve are served today;
+// see serviceDependencies for the production seam Auto-stop is still
+// waiting on.
 package main
 
 import (
@@ -15,16 +16,28 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/workflows"
 	"github.com/ahmedhesham6/sshai/libs/billing"
+	"github.com/ahmedhesham6/sshai/libs/capsule/oci"
 	"github.com/ahmedhesham6/sshai/libs/db"
+	"github.com/ahmedhesham6/sshai/libs/provideraws"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
 	restate "github.com/restatedev/sdk-go"
 	"github.com/restatedev/sdk-go/server"
 )
+
+// capsuleGrantTTL bounds how long a minted Capsule read/write grant is
+// valid, mirroring apps/control-plane's default capsule access TTL
+// (CapsuleAccessTTL in controlplane.Config).
+const capsuleGrantTTL = 15 * time.Minute
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -52,9 +65,48 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	awsSDKConfig, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(config.defaultRegion))
+	if err != nil {
+		return fmt.Errorf("load AWS configuration: %w", err)
+	}
+	capsuleClient := s3.NewFromConfig(awsSDKConfig, func(options *s3.Options) {
+		if config.s3EndpointURL != "" {
+			options.BaseEndpoint = aws.String(config.s3EndpointURL)
+			options.UsePathStyle = true
+		}
+	})
+	grantProvider, err := oci.NewS3GrantProvider(s3.NewPresignClient(capsuleClient), config.capsuleBucket, capsuleGrantTTL)
+	if err != nil {
+		return fmt.Errorf("construct Capsule grant provider: %w", err)
+	}
+	capsuleResolver := newCapsuleResolverAdapter(oci.NewResolver(grantProvider))
+
+	pinnedResolver := newPinnedProfileVersionResolver(store, store, capsuleResolver, idGenerator{})
+	creationActions, err := workflows.NewEnvironmentCreationActions(store, pinnedResolver)
+	if err != nil {
+		return fmt.Errorf("construct Environment creation actions: %w", err)
+	}
+	dataVolumes, err := provideraws.New(ctx, provideraws.Config{
+		Region: config.defaultRegion, Environment: config.runtimeEnvironmentName,
+		SizeGiB: config.dataVolumeSizeGiB, EndpointURL: config.ec2EndpointURL,
+		Runtime: provideraws.RuntimeConfig{
+			AMI: config.runtimeAMI, Presets: config.runtimePresets,
+			SubnetID: config.runtimeSubnetID, SecurityGroupID: config.runtimeSecurityGroupID,
+			SystemVolumeGiB: config.runtimeSystemVolumeGiB,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("construct Data Volume provider: %w", err)
+	}
+
+	profileResolveActions := workflows.NewProfileResolveActions(&profileResolveStateStore{Store: store})
+
 	restateServer := server.NewRestate()
 	for _, service := range buildServices(serviceDependencies{
 		polarDeliverer: polarClient, polarStore: store, now: time.Now,
+		environmentCreate: workflows.EnvironmentCreateDefinition(dataVolumes, creationActions, idGenerator{}, time.Now, config.imageVersion),
+		profileResolve:    workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolver, idGenerator{}, time.Now),
 	}) {
 		restateServer.Bind(service)
 	}
@@ -65,21 +117,18 @@ func run(ctx context.Context) error {
 }
 
 // serviceDependencies carries the production implementations behind each
-// workflow service. Only BillingDelivery has a complete production dependency
-// set today; each pending service joins by populating its field with a
-// definition built from production implementations — buildServices already
-// binds any non-nil field.
+// workflow service. BillingDelivery, EnvironmentCreate, and ProfileResolve
+// have complete production dependency sets; autoStop joins once its
+// production seams (workflows.AutoStopSnapshotSource and
+// workflows.RuntimeStopDispatcher) exist — buildServices already binds any
+// non-nil field.
 type serviceDependencies struct {
 	polarDeliverer workflows.PolarEventDeliverer
 	polarStore     workflows.PolarDeliveryStore
 	now            func() time.Time
 
-	// environmentCreate is pending a production
-	// workflows.PinnedProfileVersionResolver (test fakes only today).
 	environmentCreate restate.ServiceDefinition
-	// profileResolve is pending a production workflows.CapsuleResolver.
-	// db.Store now implements LoadProfileResolveState (slice S1b).
-	profileResolve restate.ServiceDefinition
+	profileResolve    restate.ServiceDefinition
 	// autoStop is pending production workflows.AutoStopSnapshotSource and
 	// workflows.RuntimeStopDispatcher implementations.
 	autoStop restate.ServiceDefinition
@@ -104,19 +153,100 @@ type config struct {
 	polarEventsEndpoint string
 	polarAccessToken    string
 	listenAddress       string
+
+	defaultRegion string
+	s3EndpointURL string
+	capsuleBucket string
+
+	ec2EndpointURL         string
+	runtimeEnvironmentName string
+	dataVolumeSizeGiB      int32
+	runtimeAMI             string
+	runtimeSubnetID        string
+	runtimeSecurityGroupID string
+	runtimeSystemVolumeGiB int32
+	runtimePresets         map[string]string
+	imageVersion           string
 }
 
 func loadConfig() (config, error) {
+	presets, err := parseRuntimePresets(os.Getenv("RUNTIME_PRESETS"))
+	if err != nil {
+		return config{}, err
+	}
+	dataVolumeSizeGiB, err := int32OrDefault("DATA_VOLUME_SIZE_GIB", 20)
+	if err != nil {
+		return config{}, err
+	}
+	runtimeSystemVolumeGiB, err := int32OrDefault("RUNTIME_SYSTEM_VOLUME_GIB", 20)
+	if err != nil {
+		return config{}, err
+	}
 	config := config{
 		databaseURL:         os.Getenv("DATABASE_URL"),
 		polarEventsEndpoint: os.Getenv("POLAR_EVENTS_ENDPOINT"),
 		polarAccessToken:    os.Getenv("POLAR_ACCESS_TOKEN"),
 		listenAddress:       valueOrDefault("LISTEN_ADDR", ":9080"),
+
+		defaultRegion: valueOrDefault("DEFAULT_REGION", "us-east-1"),
+		s3EndpointURL: os.Getenv("AWS_ENDPOINT_URL_S3"),
+		capsuleBucket: os.Getenv("CAPSULE_BUCKET"),
+
+		ec2EndpointURL:         os.Getenv("AWS_ENDPOINT_URL_EC2"),
+		runtimeEnvironmentName: os.Getenv("RUNTIME_ENVIRONMENT_NAME"),
+		dataVolumeSizeGiB:      dataVolumeSizeGiB,
+		runtimeAMI:             os.Getenv("RUNTIME_AMI"),
+		runtimeSubnetID:        os.Getenv("RUNTIME_SUBNET_ID"),
+		runtimeSecurityGroupID: os.Getenv("RUNTIME_SECURITY_GROUP_ID"),
+		runtimeSystemVolumeGiB: runtimeSystemVolumeGiB,
+		runtimePresets:         presets,
+		imageVersion:           os.Getenv("IMAGE_VERSION"),
 	}
-	if config.databaseURL == "" || config.polarEventsEndpoint == "" || config.polarAccessToken == "" {
-		return config, errors.New("DATABASE_URL, POLAR_EVENTS_ENDPOINT, and POLAR_ACCESS_TOKEN are required")
+	if config.databaseURL == "" || config.polarEventsEndpoint == "" || config.polarAccessToken == "" ||
+		config.capsuleBucket == "" || config.runtimeEnvironmentName == "" || config.runtimeAMI == "" ||
+		config.runtimeSubnetID == "" || config.runtimeSecurityGroupID == "" || config.imageVersion == "" || len(config.runtimePresets) == 0 {
+		return config, errors.New(
+			"DATABASE_URL, POLAR_EVENTS_ENDPOINT, POLAR_ACCESS_TOKEN, CAPSULE_BUCKET, RUNTIME_ENVIRONMENT_NAME, " +
+				"RUNTIME_AMI, RUNTIME_SUBNET_ID, RUNTIME_SECURITY_GROUP_ID, RUNTIME_PRESETS, and IMAGE_VERSION are required",
+		)
 	}
 	return config, nil
+}
+
+// parseRuntimePresets decodes a "name=instanceType,name2=instanceType2"
+// value into a Runtime preset map, as consumed by
+// provideraws.RuntimeConfig.Presets.
+func parseRuntimePresets(value string) (map[string]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	presets := make(map[string]string)
+	for _, pair := range strings.Split(value, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		name, instanceType, found := strings.Cut(pair, "=")
+		name, instanceType = strings.TrimSpace(name), strings.TrimSpace(instanceType)
+		if !found || name == "" || instanceType == "" {
+			return nil, fmt.Errorf("RUNTIME_PRESETS entry %q must have the form name=instanceType", pair)
+		}
+		presets[name] = instanceType
+	}
+	return presets, nil
+}
+
+func int32OrDefault(name string, fallback int32) (int32, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
+	}
+	return int32(parsed), nil
 }
 
 func valueOrDefault(name, fallback string) string {
