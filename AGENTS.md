@@ -42,6 +42,16 @@ scripts). The root gate is `pnpm check`, which expands to
 `pnpm generate` for codegen (`go generate ./...` per package plus
 `tsr generate` for TanStack Start routes in `apps/web`).
 
+## Running the surfaces
+
+- CLI: `go run ./apps/cli/cmd/devm <command>`. Reads two env vars
+  (`apps/cli/cmd/devm/main.go`): `DEVM_WORKOS_CLIENT_ID` and
+  `DEVM_CONTROL_PLANE_URL`.
+- Web: `cd apps/web && cp .env.example .env`, then `pnpm dev` (Vite).
+  `.env.example` names the four WorkOS vars — `WORKOS_REDIRECT_URI`,
+  `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_COOKIE_PASSWORD` — with
+  placeholder values; substitute real ones.
+
 ## Testing gotchas
 
 - Guest tests require `umask 077` before running (`apps/guest`'s
