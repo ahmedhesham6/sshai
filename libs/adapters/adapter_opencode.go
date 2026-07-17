@@ -1,4 +1,4 @@
-package guest
+package adapters
 
 import (
 	"errors"
@@ -8,6 +8,7 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/capsule"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 const (
@@ -25,7 +26,7 @@ var opencodeSensitiveSurfaces = []sensitiveMaterializationSurface{
 type opencodeAdapter struct{}
 
 func init() {
-	registerCapsuleAdapter(opencodeAdapter{})
+	Register(opencodeAdapter{})
 }
 
 func (opencodeAdapter) ID() string {
@@ -36,19 +37,19 @@ func (opencodeAdapter) Version() string {
 	return opencodeAdapterVersion
 }
 
-func (opencodeAdapter) Translate(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []capsuleFile, installed InstalledMaterialization, hasInstalled bool, batch CapsuleLockMaterializationBatch) (ProfileMaterialization, error) {
+func (opencodeAdapter) Translate(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []profile.CapsuleFile, installed profile.InstalledMaterialization, hasInstalled bool, batch profile.CapsuleLockMaterializationBatch) (profile.ProfileMaterialization, error) {
 	return translateOpenCodeComponent(snapshot, capsuleDigest, component, files, installed, hasInstalled, batch)
 }
 
-func translateOpenCodeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []capsuleFile, installed InstalledMaterialization, hasInstalled bool, batch CapsuleLockMaterializationBatch) (ProfileMaterialization, error) {
+func translateOpenCodeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []profile.CapsuleFile, installed profile.InstalledMaterialization, hasInstalled bool, batch profile.CapsuleLockMaterializationBatch) (profile.ProfileMaterialization, error) {
 	if len(files) == 0 {
-		return ProfileMaterialization{}, errors.New("OpenCode Component has no files")
+		return profile.ProfileMaterialization{}, errors.New("OpenCode Component has no files")
 	}
 	componentID := component.ID
 	scope := domain.ComponentScope(component.Scope)
-	root := MaterializationHome
+	root := profile.MaterializationHome
 	if scope == domain.ScopeProject {
-		root = MaterializationWorkspace
+		root = profile.MaterializationWorkspace
 	}
 	selector := "$"
 	target := ""
@@ -70,15 +71,15 @@ func translateOpenCodeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDige
 		target = openCodeConfigPath(scope)
 		selector = "$.permission"
 	} else {
-		return ProfileMaterialization{}, fmt.Errorf("OpenCode adapter does not support Component type %q", component.Type)
+		return profile.ProfileMaterialization{}, fmt.Errorf("OpenCode adapter does not support Component type %q", component.Type)
 	}
 
 	if target == "" {
-		return ProfileMaterialization{}, errors.New("OpenCode adapter produced an empty target")
+		return profile.ProfileMaterialization{}, errors.New("OpenCode adapter produced an empty target")
 	}
-	contentDigest := materializationContentDigest(content)
-	requirementDigest := componentRequirementDigest(component)
-	key := EffectiveCacheKeyFields{
+	contentDigest := profile.MaterializationContentDigest(content)
+	requirementDigest := profile.ComponentRequirementDigest(component)
+	key := profile.EffectiveCacheKeyFields{
 		ComponentDigest: component.Digest, AdapterID: opencodeAdapterID, AdapterVersion: opencodeAdapterVersion,
 		TargetAgentVersion: batch.TargetAgentVersion, Scope: scope, NonSecretOverridesDigest: batch.NonSecretOverridesDigest,
 		SecretVersionIdentifiers: append([]string(nil), batch.SecretVersionIdentifiers...),
@@ -107,18 +108,18 @@ func translateOpenCodeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDige
 			approvalRequired, approvalReason = true, reason
 		}
 	}
-	item := ProfileMaterialization{
+	item := profile.ProfileMaterialization{
 		ID: componentID, LockID: snapshot.ID, LockDigest: snapshot.Digest, CapsuleDigest: capsuleDigest, ComponentID: componentID, ComponentDigest: component.Digest,
 		AdapterID: opencodeAdapterID, AdapterVersion: opencodeAdapterVersion, TargetAgentVersion: batch.TargetAgentVersion,
 		NonSecretOverridesDigest: batch.NonSecretOverridesDigest, SecretVersionIdentifiers: append([]string(nil), batch.SecretVersionIdentifiers...),
 		Scope: scope, Kind: domain.ComponentType(component.Type), TrustClass: domain.TrustClass(component.TrustClass),
 		Requirements: domain.ComponentRequirements{Commands: append([]string(nil), component.Requirements.Commands...), Secrets: append([]string(nil), component.Requirements.Secrets...)},
-		Mode:         MaterializationManaged, Root: root, Target: target, Selector: selector, Content: append([]byte(nil), content...), ContentSize: int64(len(content)), ContentDigest: contentDigest,
-		FileMode: mode, FilePaths: materializationFilePaths(toMaterializationFiles(files)), LastAppliedDigest: installed.LastAppliedDigest, ObservedDigest: installed.ObservedDigest, CredentialRequirementDigest: requirementDigest,
+		Mode:         profile.MaterializationManaged, Root: root, Target: target, Selector: selector, Content: append([]byte(nil), content...), ContentSize: int64(len(content)), ContentDigest: contentDigest,
+		FileMode: mode, FilePaths: profile.MaterializationFilePaths(profile.ToMaterializationFiles(files)), LastAppliedDigest: installed.LastAppliedDigest, ObservedDigest: installed.ObservedDigest, CredentialRequirementDigest: requirementDigest,
 		ApprovalRequired: approvalRequired, ApprovalReason: approvalReason, EffectiveCacheKeyChanged: effectiveCacheKeyChanged,
 	}
 	if scope == domain.ScopeProject {
-		item.Mode = MaterializationSeeded
+		item.Mode = profile.MaterializationSeeded
 	}
 	item.EffectiveCacheKey = effectiveCacheKey
 	return item, nil

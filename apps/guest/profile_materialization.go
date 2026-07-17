@@ -3,7 +3,6 @@ package guest
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,10 +12,10 @@ import (
 	"os"
 	"path"
 	"regexp"
-	"sort"
 	"strings"
 	"unicode"
 
+	"github.com/ahmedhesham6/sshai/libs/adapters"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 	"github.com/pelletier/go-toml/v2"
@@ -28,59 +27,6 @@ const (
 	materializationAdapterVersion   = "v1"
 )
 
-// MaterializationFile is one regular file in a native directory plan. Path is
-// relative to the plan's Target and is never an absolute filesystem path.
-type MaterializationFile struct {
-	Path    string
-	Content []byte
-	Mode    os.FileMode
-}
-
-// ProfileMaterialization is the canonical Component-to-native plan consumed
-// by the generic safety engine. It contains no legacy profile artifact.
-type ProfileMaterialization struct {
-	ID                       string
-	LockID                   string
-	LockDigest               string
-	CapsuleDigest            string
-	ComponentID              string
-	ComponentDigest          string
-	AdapterID                string
-	AdapterVersion           string
-	TargetAgentVersion       string
-	Scope                    domain.ComponentScope
-	NonSecretOverridesDigest string
-	SecretVersionIdentifiers []string
-	EffectiveCacheKey        string
-	EffectiveCacheKeyChanged bool
-
-	Kind         domain.ComponentType
-	TrustClass   domain.TrustClass
-	Requirements domain.ComponentRequirements
-
-	Mode   MaterializationMode
-	Root   MaterializationRoot
-	Target string
-	// Selector is retained for JSON/TOML key ownership. "$" means the whole file.
-	Selector string
-
-	Content       []byte
-	ContentSize   int64
-	ContentDigest string
-	FileMode      os.FileMode
-	Files         []MaterializationFile
-	Directory     bool
-	FilePaths     []string
-
-	LastAppliedDigest string
-	ObservedDigest    string
-	RequirementState  profile.RequirementState
-
-	CredentialRequirementDigest string
-	ApprovalRequired            bool
-	ApprovalReason              string
-}
-
 type ProfileMaterializationBatch struct {
 	HomeRoot      string
 	WorkspaceRoot string
@@ -88,15 +34,6 @@ type ProfileMaterializationBatch struct {
 	Items         []ProfileMaterialization
 	Approvals     map[string]ApprovalMarker
 	Metrics       domain.Metrics
-}
-
-// ApprovalMarker is an explicit user decision for one exact Component
-// digest. A marker never authorizes a different digest.
-type ApprovalMarker struct {
-	ComponentID     string
-	ComponentDigest string
-	LockID          string
-	LockDigest      string
 }
 
 var profileSHA256 = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -513,7 +450,7 @@ func recordMaterializationOwnership(owned map[string][]string, item ProfileMater
 	}
 	key := string(item.Root) + "\x00" + item.Target
 	for _, existing := range owned[key] {
-		if materializationSelectorsOverlap(selector, existing) {
+		if adapters.MaterializationSelectorsOverlap(selector, existing) {
 			return fmt.Errorf("target %q has overlapping selectors %q and %q", item.Target, existing, selector)
 		}
 	}
@@ -742,14 +679,6 @@ func validateMaterializationSelectorSyntax(target, selector string) error {
 		}
 	}
 	return nil
-}
-
-func filepathExt(name string) string {
-	index := strings.LastIndexByte(name, '.')
-	if index < 0 || strings.Contains(name[index:], "/") {
-		return ""
-	}
-	return name[index:]
 }
 
 func validateMaterializationTarget(target string) error {
@@ -1292,42 +1221,8 @@ func materializationDigestState(value string) (profile.DigestState, error) {
 	return profile.PresentDigest(value)
 }
 
-func materializationContentDigest(content []byte) string {
-	digest := sha256.Sum256(content)
-	return "sha256:" + hex.EncodeToString(digest[:])
-}
-
-func directoryMaterializationDigest(files []MaterializationFile) string {
-	ordered := cloneMaterializationFiles(files)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Path < ordered[j].Path })
-	hash := sha256.New()
-	for _, file := range ordered {
-		fmt.Fprintf(hash, "%s\x00%o\x00", file.Path, file.Mode.Perm())
-		hash.Write(file.Content)
-		hash.Write([]byte{0})
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
-}
-
-func cloneMaterializationFiles(files []MaterializationFile) []MaterializationFile {
-	cloned := make([]MaterializationFile, len(files))
-	for index, file := range files {
-		cloned[index] = MaterializationFile{Path: file.Path, Content: append([]byte(nil), file.Content...), Mode: file.Mode}
-	}
-	return cloned
-}
-
 func materializationIsDirectory(item ProfileMaterialization) bool {
 	return item.Directory || len(item.Files) > 0
-}
-
-func materializationFilePaths(files []MaterializationFile) []string {
-	paths := make([]string, len(files))
-	for index, file := range files {
-		paths[index] = file.Path
-	}
-	sort.Strings(paths)
-	return paths
 }
 
 func materializationResult(item ProfileMaterialization, operation profile.PlanOperation, lastApplied, observed string) ProfileMaterializationResult {

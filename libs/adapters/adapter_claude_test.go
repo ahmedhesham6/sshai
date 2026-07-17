@@ -1,4 +1,4 @@
-package guest
+package adapters
 
 import (
 	"strings"
@@ -6,6 +6,7 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/capsule"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 func TestClaudeAdapterDeclarativeAliasesSensitiveSurfacesRequireApproval(t *testing.T) {
@@ -44,7 +45,7 @@ func TestClaudeAdapterDeclarativeAliasesSensitiveSurfacesRequireApproval(t *test
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			item, err := (claudeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", test.component, []capsuleFile{{Content: []byte("content"), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+			item, err := (claudeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", test.component, []profile.CapsuleFile{{Content: []byte("content"), Mode: 0o644}}, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -70,10 +71,10 @@ func TestClaudeAdapterExecutableComponentDigestChangeRequiresRenewedReview(t *te
 		TrustClass: capsule.TrustExecutable, Digest: "new-component-digest",
 	}
 	content := []byte("review prompt\n")
-	item, err := (claudeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: content, Mode: 0o755}}, InstalledMaterialization{
+	item, err := (claudeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []profile.CapsuleFile{{Content: content, Mode: 0o755}}, profile.InstalledMaterialization{
 		ComponentID: component.ID, ComponentDigest: "old-component-digest",
-		LastAppliedDigest: materializationContentDigest(content), CredentialRequirementDigest: componentRequirementDigest(component),
-	}, true, CapsuleLockMaterializationBatch{})
+		LastAppliedDigest: profile.MaterializationContentDigest(content), CredentialRequirementDigest: profile.ComponentRequirementDigest(component),
+	}, true, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +88,7 @@ func TestClaudeAdapterFirstInstallCredentialRequirementRequiresConsent(t *testin
 		ID: "config:CLAUDE.md", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser,
 		TrustClass: capsule.TrustDeclarative, Requirements: capsule.Requirements{Secrets: []string{"TOKEN"}},
 	}
-	item, err := (claudeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: []byte("instructions\n"), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+	item, err := (claudeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []profile.CapsuleFile{{Content: []byte("instructions\n"), Mode: 0o644}}, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}

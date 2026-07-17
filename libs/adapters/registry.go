@@ -1,4 +1,6 @@
-package guest
+// Package adapters holds the per-agent compiler backends translating
+// canonical Components into native change plans (spec/16).
+package adapters
 
 import (
 	"fmt"
@@ -6,6 +8,7 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/capsule"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 type sensitiveMaterializationSurface struct {
@@ -27,7 +30,7 @@ func sensitiveMaterializationApproval(target, selector string, surfaces []sensit
 		if surfaceSelector == "" {
 			surfaceSelector = "$"
 		}
-		if !materializationSelectorsOverlap(selector, surfaceSelector) {
+		if !MaterializationSelectorsOverlap(selector, surfaceSelector) {
 			continue
 		}
 		duplicate := false
@@ -44,23 +47,23 @@ func sensitiveMaterializationApproval(target, selector string, surfaces []sensit
 	return len(reasons) > 0, strings.Join(reasons, "; ")
 }
 
-func materializationSelectorsOverlap(left, right string) bool {
+func MaterializationSelectorsOverlap(left, right string) bool {
 	return left == right || left == "$" || right == "$" || strings.HasPrefix(left, right+".") || strings.HasPrefix(right, left+".")
 }
 
-type capsuleComponentAdapter interface {
+type Adapter interface {
 	ID() string
 	Version() string
-	Translate(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []capsuleFile, installed InstalledMaterialization, hasInstalled bool, batch CapsuleLockMaterializationBatch) (ProfileMaterialization, error)
+	Translate(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []profile.CapsuleFile, installed profile.InstalledMaterialization, hasInstalled bool, batch profile.CapsuleLockMaterializationBatch) (profile.ProfileMaterialization, error)
 }
 
-var capsuleComponentAdapters = map[string]capsuleComponentAdapter{}
+var capsuleComponentAdapters = map[string]Adapter{}
 
-func registerCapsuleAdapter(a capsuleComponentAdapter) {
+func Register(a Adapter) {
 	capsuleComponentAdapters[a.ID()] = a
 }
 
-func capsuleAdapterFor(id string) (capsuleComponentAdapter, error) {
+func For(id string) (Adapter, error) {
 	adapter, ok := capsuleComponentAdapters[id]
 	if !ok {
 		return nil, fmt.Errorf("unknown capsule component adapter %q", id)

@@ -5,9 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,54 +14,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ahmedhesham6/sshai/libs/adapters"
 	"github.com/ahmedhesham6/sshai/libs/capsule"
 	capsuleoci "github.com/ahmedhesham6/sshai/libs/capsule/oci"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 	orasoci "oras.land/oras-go/v2/content/oci"
 )
-
-// CapsuleLockMaterializationBatch is the guest input for a complete
-// lock-derived materialization. Grants are consulted only when the local OCI
-// cache does not already contain a verified Capsule.
-type CapsuleLockMaterializationBatch struct {
-	Lock      domain.CapsuleLock
-	OwnerID   string
-	Grants    capsuleoci.GrantProvider
-	CacheRoot string
-
-	HomeRoot      string
-	WorkspaceRoot string
-	Intent        profile.PlanIntent
-	Installed     []InstalledMaterialization
-	Approvals     map[string]ApprovalMarker
-
-	AdapterID                string `json:"adapterId"`
-	TargetAgentVersion       string
-	NonSecretOverridesDigest string
-	SecretVersionIdentifiers []string
-	Metrics                  domain.Metrics
-}
-
-// EffectiveCacheKeyFields is the non-secret cache identity specified by
-// spec/19. Resolved secret values are never accepted here.
-type EffectiveCacheKeyFields struct {
-	ComponentDigest          string                `json:"componentDigest"`
-	AdapterID                string                `json:"adapterId"`
-	AdapterVersion           string                `json:"adapterVersion"`
-	TargetAgentVersion       string                `json:"targetAgentVersion"`
-	Scope                    domain.ComponentScope `json:"scope"`
-	NonSecretOverridesDigest string                `json:"nonSecretOverridesDigest"`
-	SecretVersionIdentifiers []string              `json:"secretVersionIdentifiers"`
-}
-
-func (key EffectiveCacheKeyFields) Digest() string {
-	key.SecretVersionIdentifiers = append([]string(nil), key.SecretVersionIdentifiers...)
-	sort.Strings(key.SecretVersionIdentifiers)
-	encoded, _ := json.Marshal(key)
-	digest := sha256.Sum256(encoded)
-	return "sha256:" + hex.EncodeToString(digest[:])
-}
 
 // MaterializeCapsuleLock pulls or loads each Capsule referenced by the Lock,
 // verifies the resolved Component and its layer contents, lets the Claude
@@ -102,7 +58,7 @@ func MaterializeCapsuleLock(ctx context.Context, batch CapsuleLockMaterializatio
 	if adapterID == "" {
 		adapterID = "claude"
 	}
-	adapter, err := capsuleAdapterFor(adapterID)
+	adapter, err := adapters.For(adapterID)
 	if err != nil {
 		return nil, fmt.Errorf("materialize Capsule Lock: %w", err)
 	}
@@ -255,12 +211,6 @@ func loadOrPullCapsule(ctx context.Context, cache *orasoci.Store, capsuleDigest 
 		batch.Metrics.AddCounter(domain.MetricCapsulePullsTotal, 1)
 	}
 	return value, nil
-}
-
-type capsuleFile struct {
-	Path    string
-	Content []byte
-	Mode    os.FileMode
 }
 
 func resolvedComponentContent(capsules map[string]capsule.Capsule, locked domain.ResolvedComponent) (capsule.Component, []capsuleFile, error) {
@@ -443,19 +393,4 @@ func extractCapsuleLayer(layer capsule.Layer) ([]capsuleFile, error) {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	return files, nil
-}
-
-func toMaterializationFiles(files []capsuleFile) []MaterializationFile {
-	result := make([]MaterializationFile, len(files))
-	for index, file := range files {
-		result[index] = MaterializationFile{Path: file.Path, Content: append([]byte(nil), file.Content...), Mode: file.Mode}
-	}
-	return result
-}
-
-func componentRequirementDigest(component capsule.Component) string {
-	secrets := append([]string(nil), component.Requirements.Secrets...)
-	sort.Strings(secrets)
-	encoded, _ := json.Marshal(secrets)
-	return materializationContentDigest(encoded)
 }

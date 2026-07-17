@@ -1,4 +1,4 @@
-package guest
+package adapters
 
 import (
 	"errors"
@@ -8,6 +8,7 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/capsule"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 const (
@@ -23,7 +24,7 @@ var claudeSensitiveSurfaces = []sensitiveMaterializationSurface{
 type claudeAdapter struct{}
 
 func init() {
-	registerCapsuleAdapter(claudeAdapter{})
+	Register(claudeAdapter{})
 }
 
 func (claudeAdapter) ID() string {
@@ -34,19 +35,19 @@ func (claudeAdapter) Version() string {
 	return claudeAdapterVersion
 }
 
-func (claudeAdapter) Translate(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []capsuleFile, installed InstalledMaterialization, hasInstalled bool, batch CapsuleLockMaterializationBatch) (ProfileMaterialization, error) {
+func (claudeAdapter) Translate(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []profile.CapsuleFile, installed profile.InstalledMaterialization, hasInstalled bool, batch profile.CapsuleLockMaterializationBatch) (profile.ProfileMaterialization, error) {
 	return translateClaudeComponent(snapshot, capsuleDigest, component, files, installed, hasInstalled, batch)
 }
 
-func translateClaudeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []capsuleFile, installed InstalledMaterialization, hasInstalled bool, batch CapsuleLockMaterializationBatch) (ProfileMaterialization, error) {
+func translateClaudeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest string, component capsule.Component, files []profile.CapsuleFile, installed profile.InstalledMaterialization, hasInstalled bool, batch profile.CapsuleLockMaterializationBatch) (profile.ProfileMaterialization, error) {
 	if len(files) == 0 {
-		return ProfileMaterialization{}, errors.New("Claude Component has no files")
+		return profile.ProfileMaterialization{}, errors.New("Claude Component has no files")
 	}
 	componentID := component.ID
 	scope := domain.ComponentScope(component.Scope)
-	root := MaterializationHome
+	root := profile.MaterializationHome
 	if scope == domain.ScopeProject {
-		root = MaterializationWorkspace
+		root = profile.MaterializationWorkspace
 	}
 	selector := "$"
 	target := ""
@@ -82,18 +83,18 @@ func translateClaudeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest
 		target = pathName
 		selector = claudeSelector(componentID)
 	} else {
-		return ProfileMaterialization{}, fmt.Errorf("Claude adapter does not support Component type %q", component.Type)
+		return profile.ProfileMaterialization{}, fmt.Errorf("Claude adapter does not support Component type %q", component.Type)
 	}
 
 	if target == "" {
-		return ProfileMaterialization{}, errors.New("Claude adapter produced an empty target")
+		return profile.ProfileMaterialization{}, errors.New("Claude adapter produced an empty target")
 	}
-	contentDigest := materializationContentDigest(content)
+	contentDigest := profile.MaterializationContentDigest(content)
 	if directory {
-		contentDigest = directoryMaterializationDigest(toMaterializationFiles(files))
+		contentDigest = profile.DirectoryMaterializationDigest(profile.ToMaterializationFiles(files))
 	}
-	requirementDigest := componentRequirementDigest(component)
-	key := EffectiveCacheKeyFields{
+	requirementDigest := profile.ComponentRequirementDigest(component)
+	key := profile.EffectiveCacheKeyFields{
 		ComponentDigest: component.Digest, AdapterID: claudeAdapterID, AdapterVersion: claudeAdapterVersion,
 		TargetAgentVersion: batch.TargetAgentVersion, Scope: scope, NonSecretOverridesDigest: batch.NonSecretOverridesDigest,
 		SecretVersionIdentifiers: append([]string(nil), batch.SecretVersionIdentifiers...),
@@ -122,15 +123,15 @@ func translateClaudeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest
 			approvalRequired, approvalReason = true, reason
 		}
 	}
-	item := ProfileMaterialization{
+	item := profile.ProfileMaterialization{
 		ID: componentID, LockID: snapshot.ID, LockDigest: snapshot.Digest, CapsuleDigest: capsuleDigest, ComponentID: componentID, ComponentDigest: component.Digest,
 		AdapterID: claudeAdapterID, AdapterVersion: claudeAdapterVersion, TargetAgentVersion: batch.TargetAgentVersion,
 		NonSecretOverridesDigest: batch.NonSecretOverridesDigest, SecretVersionIdentifiers: append([]string(nil), batch.SecretVersionIdentifiers...),
 		Scope: scope, Kind: domain.ComponentType(component.Type), TrustClass: domain.TrustClass(component.TrustClass),
 		Requirements: domain.ComponentRequirements{Commands: append([]string(nil), component.Requirements.Commands...), Secrets: append([]string(nil), component.Requirements.Secrets...)},
-		Mode:         MaterializationManaged, Root: root, Target: target, Selector: selector, Content: append([]byte(nil), content...), ContentSize: int64(len(content)), ContentDigest: contentDigest,
+		Mode:         profile.MaterializationManaged, Root: root, Target: target, Selector: selector, Content: append([]byte(nil), content...), ContentSize: int64(len(content)), ContentDigest: contentDigest,
 		FileMode:  mode,
-		Directory: directory, FilePaths: materializationFilePaths(toMaterializationFiles(files)),
+		Directory: directory, FilePaths: profile.MaterializationFilePaths(profile.ToMaterializationFiles(files)),
 		LastAppliedDigest: installed.LastAppliedDigest, ObservedDigest: installed.ObservedDigest, CredentialRequirementDigest: requirementDigest,
 		ApprovalRequired: approvalRequired, ApprovalReason: approvalReason,
 		EffectiveCacheKeyChanged: effectiveCacheKeyChanged,
@@ -138,18 +139,18 @@ func translateClaudeComponent(snapshot domain.CapsuleLockSnapshot, capsuleDigest
 	if directory {
 		item.Content = nil
 		item.ContentSize = 0
-		item.Files = toMaterializationFiles(files)
+		item.Files = profile.ToMaterializationFiles(files)
 	}
 	if scope == domain.ScopeProject {
-		item.Mode = MaterializationSeeded
+		item.Mode = profile.MaterializationSeeded
 	}
 	item.EffectiveCacheKey = effectiveCacheKey
 	return item, nil
 }
 
-func claudeSkillFiles(name string, files []capsuleFile) []capsuleFile {
+func claudeSkillFiles(name string, files []profile.CapsuleFile) []profile.CapsuleFile {
 	prefixes := []string{path.Join(".claude", "skills", name) + "/", path.Join("skills", name) + "/", name + "/"}
-	result := make([]capsuleFile, len(files))
+	result := make([]profile.CapsuleFile, len(files))
 	for index, file := range files {
 		result[index] = file
 		for _, prefix := range prefixes {
@@ -185,7 +186,7 @@ func claudeComponentPath(id, fallback string) string {
 	_, suffix, _ := strings.Cut(id, ":")
 	suffix, _, _ = strings.Cut(suffix, "#")
 	if suffix == "" || !strings.Contains(suffix, "/") && !strings.HasSuffix(suffix, ".md") {
-		if filepathExt(fallback) != "" {
+		if profile.FilepathExt(fallback) != "" {
 			return fallback
 		}
 		return suffix

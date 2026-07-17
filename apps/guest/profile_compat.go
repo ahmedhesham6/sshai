@@ -13,6 +13,13 @@ type (
 	DriftAdoptionProposal        = profile.DriftAdoptionProposal
 	DriftAdoptionConsent         = profile.DriftAdoptionConsent
 	AcceptedDriftAdoption        = profile.AcceptedDriftAdoption
+
+	MaterializationFile             = profile.MaterializationFile
+	ProfileMaterialization          = profile.ProfileMaterialization
+	ApprovalMarker                  = profile.ApprovalMarker
+	CapsuleLockMaterializationBatch = profile.CapsuleLockMaterializationBatch
+	EffectiveCacheKeyFields         = profile.EffectiveCacheKeyFields
+	capsuleFile                     = profile.CapsuleFile
 )
 
 const (
@@ -27,4 +34,12 @@ var (
 	InstalledMaterializationsFromResults = profile.InstalledMaterializationsFromResults
 	ProposeDriftAdoption                 = profile.ProposeDriftAdoption
 	AcceptDriftAdoption                  = profile.AcceptDriftAdoption
+
+	materializationContentDigest   = profile.MaterializationContentDigest
+	directoryMaterializationDigest = profile.DirectoryMaterializationDigest
+	cloneMaterializationFiles      = profile.CloneMaterializationFiles
+	toMaterializationFiles         = profile.ToMaterializationFiles
+	componentRequirementDigest     = profile.ComponentRequirementDigest
+	materializationFilePaths       = profile.MaterializationFilePaths
+	filepathExt                    = profile.FilepathExt
 )

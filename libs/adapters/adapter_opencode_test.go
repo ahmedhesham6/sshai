@@ -1,4 +1,4 @@
-package guest
+package adapters
 
 import (
 	"os"
@@ -7,57 +7,58 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/capsule"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 func TestOpenCodeAdapterMapsConfigSubagentCommandIntegrationAndPermission(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	snapshot := domain.CapsuleLockSnapshot{ID: "lock-1", Digest: "lock-digest"}
-	batch := CapsuleLockMaterializationBatch{TargetAgentVersion: "opencode-1"}
+	batch := profile.CapsuleLockMaterializationBatch{TargetAgentVersion: "opencode-1"}
 	tests := []struct {
 		name      string
 		component capsule.Component
 		content   string
-		want      ProfileMaterialization
+		want      profile.ProfileMaterialization
 	}{
 		{
 			name:      "config",
 			component: capsule.Component{ID: "config:settings#$.theme", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "config-digest"},
 			content:   `"dark"`,
-			want:      ProfileMaterialization{Root: MaterializationHome, Target: ".config/opencode/opencode.json", Selector: "$.theme", Mode: MaterializationManaged},
+			want:      profile.ProfileMaterialization{Root: profile.MaterializationHome, Target: ".config/opencode/opencode.json", Selector: "$.theme", Mode: profile.MaterializationManaged},
 		},
 		{
 			name:      "subagent",
 			component: capsule.Component{ID: "subagent:reviewer.md", Type: capsule.ComponentTypeSubagent, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "subagent-digest"},
 			content:   "Review changes\n",
-			want:      ProfileMaterialization{Root: MaterializationHome, Target: ".config/opencode/agent/reviewer.md", Selector: "$", Mode: MaterializationManaged},
+			want:      profile.ProfileMaterialization{Root: profile.MaterializationHome, Target: ".config/opencode/agent/reviewer.md", Selector: "$", Mode: profile.MaterializationManaged},
 		},
 		{
 			name:      "command",
 			component: capsule.Component{ID: "command:deploy.md", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "command-digest"},
 			content:   "Deploy safely\n",
-			want:      ProfileMaterialization{Root: MaterializationHome, Target: ".config/opencode/command/deploy.md", Selector: "$", Mode: MaterializationManaged},
+			want:      profile.ProfileMaterialization{Root: profile.MaterializationHome, Target: ".config/opencode/command/deploy.md", Selector: "$", Mode: profile.MaterializationManaged},
 		},
 		{
 			name:      "integration",
 			component: capsule.Component{ID: "integration:github", Type: capsule.ComponentTypeIntegration, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "integration-digest"},
 			content:   `{"type":"remote","url":"https://example.test/mcp"}`,
-			want:      ProfileMaterialization{Root: MaterializationHome, Target: ".config/opencode/opencode.json", Selector: "$.mcp.github", Mode: MaterializationManaged},
+			want:      profile.ProfileMaterialization{Root: profile.MaterializationHome, Target: ".config/opencode/opencode.json", Selector: "$.mcp.github", Mode: profile.MaterializationManaged},
 		},
 		{
 			name:      "permission",
 			component: capsule.Component{ID: "permission-policy:workspace", Type: capsule.ComponentTypePermissionPolicy, Scope: capsule.ScopeUser, TrustClass: capsule.TrustPermission, Digest: "permission-digest"},
 			content:   `{"read":true}`,
-			want:      ProfileMaterialization{Root: MaterializationHome, Target: ".config/opencode/opencode.json", Selector: "$.permission", Mode: MaterializationManaged},
+			want:      profile.ProfileMaterialization{Root: profile.MaterializationHome, Target: ".config/opencode/opencode.json", Selector: "$.permission", Mode: profile.MaterializationManaged},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := adapter.Translate(snapshot, "capsule-digest", test.component, []capsuleFile{{Path: "content", Content: []byte(test.content), Mode: 0o644}}, InstalledMaterialization{}, false, batch)
+			got, err := adapter.Translate(snapshot, "capsule-digest", test.component, []profile.CapsuleFile{{Path: "content", Content: []byte(test.content), Mode: 0o644}}, profile.InstalledMaterialization{}, false, batch)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -73,7 +74,7 @@ func TestOpenCodeAdapterMapsConfigSubagentCommandIntegrationAndPermission(t *tes
 			if got.AdapterID != "opencode" || got.AdapterVersion != "v1" {
 				t.Fatalf("adapter metadata = %q/%q, want opencode/v1", got.AdapterID, got.AdapterVersion)
 			}
-			wantCacheKey := (EffectiveCacheKeyFields{
+			wantCacheKey := (profile.EffectiveCacheKeyFields{
 				ComponentDigest:          test.component.Digest,
 				AdapterID:                "opencode",
 				AdapterVersion:           "v1",
@@ -90,67 +91,67 @@ func TestOpenCodeAdapterMapsConfigSubagentCommandIntegrationAndPermission(t *tes
 }
 
 func TestOpenCodeAdapterScopeSelectsProjectVsHomeTargets(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	snapshot := domain.CapsuleLockSnapshot{ID: "lock-1", Digest: "lock-digest"}
-	batch := CapsuleLockMaterializationBatch{TargetAgentVersion: "opencode-1"}
+	batch := profile.CapsuleLockMaterializationBatch{TargetAgentVersion: "opencode-1"}
 	tests := []struct {
 		name      string
 		component capsule.Component
-		wantRoot  MaterializationRoot
-		wantMode  MaterializationMode
+		wantRoot  profile.MaterializationRoot
+		wantMode  profile.MaterializationMode
 		wantPath  string
 	}{
 		{
 			name:      "project config",
 			component: capsule.Component{ID: "config:settings", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeProject, TrustClass: capsule.TrustDeclarative, Digest: "config-project"},
-			wantRoot:  MaterializationWorkspace,
-			wantMode:  MaterializationSeeded,
+			wantRoot:  profile.MaterializationWorkspace,
+			wantMode:  profile.MaterializationSeeded,
 			wantPath:  "opencode.json",
 		},
 		{
 			name:      "project subagent",
 			component: capsule.Component{ID: "subagent:reviewer.md", Type: capsule.ComponentTypeSubagent, Scope: capsule.ScopeProject, TrustClass: capsule.TrustDeclarative, Digest: "subagent-project"},
-			wantRoot:  MaterializationWorkspace,
-			wantMode:  MaterializationSeeded,
+			wantRoot:  profile.MaterializationWorkspace,
+			wantMode:  profile.MaterializationSeeded,
 			wantPath:  ".opencode/agent/reviewer.md",
 		},
 		{
 			name:      "project command",
 			component: capsule.Component{ID: "command:deploy.md", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeProject, TrustClass: capsule.TrustDeclarative, Digest: "command-project"},
-			wantRoot:  MaterializationWorkspace,
-			wantMode:  MaterializationSeeded,
+			wantRoot:  profile.MaterializationWorkspace,
+			wantMode:  profile.MaterializationSeeded,
 			wantPath:  ".opencode/command/deploy.md",
 		},
 		{
 			name:      "home config",
 			component: capsule.Component{ID: "config:settings", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "config-home"},
-			wantRoot:  MaterializationHome,
-			wantMode:  MaterializationManaged,
+			wantRoot:  profile.MaterializationHome,
+			wantMode:  profile.MaterializationManaged,
 			wantPath:  ".config/opencode/opencode.json",
 		},
 		{
 			name:      "home subagent",
 			component: capsule.Component{ID: "subagent:reviewer.md", Type: capsule.ComponentTypeSubagent, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "subagent-home"},
-			wantRoot:  MaterializationHome,
-			wantMode:  MaterializationManaged,
+			wantRoot:  profile.MaterializationHome,
+			wantMode:  profile.MaterializationManaged,
 			wantPath:  ".config/opencode/agent/reviewer.md",
 		},
 		{
 			name:      "home command",
 			component: capsule.Component{ID: "command:deploy.md", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "command-home"},
-			wantRoot:  MaterializationHome,
-			wantMode:  MaterializationManaged,
+			wantRoot:  profile.MaterializationHome,
+			wantMode:  profile.MaterializationManaged,
 			wantPath:  ".config/opencode/command/deploy.md",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := adapter.Translate(snapshot, "capsule-digest", test.component, []capsuleFile{{Path: "content", Content: []byte("content"), Mode: 0o644}}, InstalledMaterialization{}, false, batch)
+			got, err := adapter.Translate(snapshot, "capsule-digest", test.component, []profile.CapsuleFile{{Path: "content", Content: []byte("content"), Mode: 0o644}}, profile.InstalledMaterialization{}, false, batch)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -162,14 +163,14 @@ func TestOpenCodeAdapterScopeSelectsProjectVsHomeTargets(t *testing.T) {
 }
 
 func TestOpenCodeAdapterRejectsUnsupportedComponentTypes(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, componentType := range []capsule.ComponentType{capsule.ComponentTypeSkill, capsule.ComponentTypeHook, capsule.ComponentTypeExtension} {
 		component := capsule.Component{ID: string(componentType) + ":unsupported", Type: componentType, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "component-digest"}
-		_, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "capsule-digest", component, []capsuleFile{{Path: "content", Content: []byte("content"), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+		_, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "capsule-digest", component, []profile.CapsuleFile{{Path: "content", Content: []byte("content"), Mode: 0o644}}, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 		want := `OpenCode adapter does not support Component type "` + string(componentType) + `"`
 		if err == nil || err.Error() != want {
 			t.Fatalf("Translate(%q) error = %v, want %q", componentType, err, want)
@@ -178,7 +179,7 @@ func TestOpenCodeAdapterRejectsUnsupportedComponentTypes(t *testing.T) {
 }
 
 func TestOpenCodeAdapterIntegrationAndPermissionAlwaysRequireApproval(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,13 +209,13 @@ func TestOpenCodeAdapterIntegrationAndPermissionAlwaysRequireApproval(t *testing
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			files := []capsuleFile{{Path: "content", Content: []byte(test.content), Mode: 0o644}}
-			installed := InstalledMaterialization{}
+			files := []profile.CapsuleFile{{Path: "content", Content: []byte(test.content), Mode: 0o644}}
+			installed := profile.InstalledMaterialization{}
 			if test.installedMode {
-				installed.LastAppliedDigest = materializationContentDigest(files[0].Content)
-				installed.CredentialRequirementDigest = componentRequirementDigest(test.component)
+				installed.LastAppliedDigest = profile.MaterializationContentDigest(files[0].Content)
+				installed.CredentialRequirementDigest = profile.ComponentRequirementDigest(test.component)
 			}
-			got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "capsule-digest", test.component, files, installed, test.installedMode, CapsuleLockMaterializationBatch{})
+			got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "capsule-digest", test.component, files, installed, test.installedMode, profile.CapsuleLockMaterializationBatch{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -239,7 +240,7 @@ func TestOpenCodeAdapterDeclarativeAliasesSensitiveSurfacesRequireApproval(t *te
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			component := capsule.Component{ID: "config:opencode.json#" + test.selector, Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative}
-			item, err := (opencodeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: []byte(`{"value":true}`), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+			item, err := (opencodeAdapter{}).Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []profile.CapsuleFile{{Content: []byte(`{"value":true}`), Mode: 0o644}}, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -254,27 +255,27 @@ func TestOpenCodeAdapterDeclarativeAliasesSensitiveSurfacesRequireApproval(t *te
 }
 
 func TestOpenCodeAdapterExecutableTransitionRequiresRenewedReview(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	component := capsule.Component{ID: "command:deploy.md", Type: capsule.ComponentTypeCommand, Scope: capsule.ScopeUser, TrustClass: capsule.TrustExecutable, Digest: "first-component-digest"}
-	oldFiles := []capsuleFile{{Path: "deploy.md", Content: []byte("deploy first\n"), Mode: 0o644}}
-	old, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "first-capsule-digest", component, oldFiles, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+	oldFiles := []profile.CapsuleFile{{Path: "deploy.md", Content: []byte("deploy first\n"), Mode: 0o644}}
+	old, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "first-capsule-digest", component, oldFiles, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	component.Digest = "second-component-digest"
-	newFiles := []capsuleFile{{Path: "deploy.md", Content: []byte("deploy second\n"), Mode: 0o644}}
-	installed := InstalledMaterialization{
+	newFiles := []profile.CapsuleFile{{Path: "deploy.md", Content: []byte("deploy second\n"), Mode: 0o644}}
+	installed := profile.InstalledMaterialization{
 		ComponentID:                 component.ID,
 		EffectiveCacheKey:           old.EffectiveCacheKey,
 		LastAppliedDigest:           old.ContentDigest,
 		CredentialRequirementDigest: old.CredentialRequirementDigest,
 	}
-	got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "second-capsule-digest", component, newFiles, installed, true, CapsuleLockMaterializationBatch{})
+	got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "second-capsule-digest", component, newFiles, installed, true, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +285,7 @@ func TestOpenCodeAdapterExecutableTransitionRequiresRenewedReview(t *testing.T) 
 }
 
 func TestOpenCodeAdapterExecutableComponentDigestChangeRequiresRenewedReview(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,10 +294,10 @@ func TestOpenCodeAdapterExecutableComponentDigestChangeRequiresRenewedReview(t *
 		TrustClass: capsule.TrustExecutable, Digest: "new-component-digest",
 	}
 	content := []byte("deploy prompt\n")
-	item, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: content, Mode: 0o755}}, InstalledMaterialization{
+	item, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []profile.CapsuleFile{{Content: content, Mode: 0o755}}, profile.InstalledMaterialization{
 		ComponentID: component.ID, ComponentDigest: "old-component-digest",
-		LastAppliedDigest: materializationContentDigest(content), CredentialRequirementDigest: componentRequirementDigest(component),
-	}, true, CapsuleLockMaterializationBatch{})
+		LastAppliedDigest: profile.MaterializationContentDigest(content), CredentialRequirementDigest: profile.ComponentRequirementDigest(component),
+	}, true, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +307,7 @@ func TestOpenCodeAdapterExecutableComponentDigestChangeRequiresRenewedReview(t *
 }
 
 func TestOpenCodeAdapterFirstInstallCredentialRequirementRequiresConsent(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +315,7 @@ func TestOpenCodeAdapterFirstInstallCredentialRequirementRequiresConsent(t *test
 		ID: "config:opencode.json#$.theme", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser,
 		TrustClass: capsule.TrustDeclarative, Requirements: capsule.Requirements{Secrets: []string{"TOKEN"}},
 	}
-	item, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []capsuleFile{{Content: []byte(`{"value":"dark"}`), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+	item, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "sha256:capsule", component, []profile.CapsuleFile{{Content: []byte(`{"value":"dark"}`), Mode: 0o644}}, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +325,7 @@ func TestOpenCodeAdapterFirstInstallCredentialRequirementRequiresConsent(t *test
 }
 
 func TestOpenCodeAdapterCredentialRequirementChangeRequiresConsent(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,20 +334,20 @@ func TestOpenCodeAdapterCredentialRequirementChangeRequiresConsent(t *testing.T)
 		ID: "config:settings#$.auth", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative,
 		Digest: "first-component-digest", Requirements: capsule.Requirements{Secrets: []string{"TOKEN_ONE"}},
 	}
-	old, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "first-capsule-digest", component, []capsuleFile{{Path: "settings.json", Content: []byte(`{"token":"one"}`), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+	old, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "first-capsule-digest", component, []profile.CapsuleFile{{Path: "settings.json", Content: []byte(`{"token":"one"}`), Mode: 0o644}}, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	component.Digest = "second-component-digest"
 	component.Requirements = capsule.Requirements{Secrets: []string{"TOKEN_TWO"}}
-	installed := InstalledMaterialization{
+	installed := profile.InstalledMaterialization{
 		ComponentID:                 component.ID,
 		EffectiveCacheKey:           old.EffectiveCacheKey,
 		LastAppliedDigest:           old.ContentDigest,
 		CredentialRequirementDigest: old.CredentialRequirementDigest,
 	}
-	got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "second-capsule-digest", component, []capsuleFile{{Path: "settings.json", Content: []byte(`{"token":"two"}`), Mode: 0o644}}, installed, true, CapsuleLockMaterializationBatch{})
+	got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "second-capsule-digest", component, []profile.CapsuleFile{{Path: "settings.json", Content: []byte(`{"token":"two"}`), Mode: 0o644}}, installed, true, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,13 +357,13 @@ func TestOpenCodeAdapterCredentialRequirementChangeRequiresConsent(t *testing.T)
 }
 
 func TestOpenCodeAdapterIntegrationSelectorUsesDeclaredName(t *testing.T) {
-	adapter, err := capsuleAdapterFor("opencode")
+	adapter, err := For("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	component := capsule.Component{ID: "integration:opencode.json#$.mcp.github", Type: capsule.ComponentTypeIntegration, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative, Digest: "integration-digest"}
-	got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "capsule-digest", component, []capsuleFile{{Path: "opencode.json", Content: []byte(`{"type":"remote"}`), Mode: 0o644}}, InstalledMaterialization{}, false, CapsuleLockMaterializationBatch{})
+	got, err := adapter.Translate(domain.CapsuleLockSnapshot{}, "capsule-digest", component, []profile.CapsuleFile{{Path: "opencode.json", Content: []byte(`{"type":"remote"}`), Mode: 0o644}}, profile.InstalledMaterialization{}, false, profile.CapsuleLockMaterializationBatch{})
 	if err != nil {
 		t.Fatal(err)
 	}
