@@ -1,4 +1,5 @@
 .turbo/
+.tanstack/
 node_modules/
 dist/
 coverage/
