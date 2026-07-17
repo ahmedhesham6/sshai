@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ahmedhesham6/sshai/apps/guest"
 	"github.com/ahmedhesham6/sshai/apps/workflows"
 	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 func TestEnvironmentCreationCapsuleActionsPersistsLockPinAndApplyResults(t *testing.T) {
@@ -33,7 +33,7 @@ func TestEnvironmentCreationCapsuleActionsPersistsLockPinAndApplyResults(t *test
 	snapshot = lock.Snapshot()
 	state := workflows.EnvironmentCapsuleState{
 		CapsuleLock: snapshot, UpgradePolicy: domain.UpgradeNotify,
-		Materializations: []guest.InstalledMaterialization{{
+		Materializations: []profile.InstalledMaterialization{{
 			ID: "editor", LockID: snapshot.ID, LockDigest: snapshot.Digest, CapsuleDigest: digest,
 			ComponentID: "config:editor", ComponentDigest: digest, AdapterID: "file", AdapterVersion: "v1",
 			TargetAgentVersion: "agent-1", Scope: domain.ScopeUser, NonSecretOverridesDigest: workflowTestDigest('b'),

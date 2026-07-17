@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ahmedhesham6/sshai/apps/guest"
 	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 var errInvalidEnvironmentCapsuleState = errors.New("invalid Environment Capsule state")
@@ -52,7 +52,7 @@ func (actions *environmentCreationCapsuleActions) PersistEnvironmentCapsuleState
 
 // EnvironmentMaterializationRecords enriches guest state with Component type
 // and trust identity from the validated Capsule Lock before persistence.
-func EnvironmentMaterializationRecords(lock domain.CapsuleLockSnapshot, installed []guest.InstalledMaterialization) ([]dbstore.EnvironmentMaterialization, error) {
+func EnvironmentMaterializationRecords(lock domain.CapsuleLockSnapshot, installed []profile.InstalledMaterialization) ([]dbstore.EnvironmentMaterialization, error) {
 	records := make([]dbstore.EnvironmentMaterialization, len(installed))
 	for index, materialization := range installed {
 		component, ok := lock.ResolvedComponents[materialization.ComponentID]

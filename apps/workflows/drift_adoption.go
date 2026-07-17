@@ -4,19 +4,19 @@ import (
 	"context"
 	"errors"
 
-	"github.com/ahmedhesham6/sshai/apps/guest"
 	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
 // DriftAdoptionActions is the durable boundary for proposal recording and
 // accepted-proposal consumption. It does not expose a Capsule mutation API.
 type DriftAdoptionActions interface {
-	RecordDriftAdoptionProposal(context.Context, guest.DriftAdoptionProposal) error
-	AcceptDriftAdoption(context.Context, guest.AcceptedDriftAdoption) error
+	RecordDriftAdoptionProposal(context.Context, profile.DriftAdoptionProposal) error
+	AcceptDriftAdoption(context.Context, profile.AcceptedDriftAdoption) error
 }
 
-func SubmitDriftAdoptionProposal(ctx context.Context, ownerID string, proposal guest.DriftAdoptionProposal, actions DriftAdoptionActions) error {
+func SubmitDriftAdoptionProposal(ctx context.Context, ownerID string, proposal profile.DriftAdoptionProposal, actions DriftAdoptionActions) error {
 	if actions == nil {
 		return errors.New("drift adoption actions are required")
 	}
@@ -35,11 +35,11 @@ func SubmitDriftAdoptionProposal(ctx context.Context, ownerID string, proposal g
 
 // ConsumeDriftAdoption validates consent at the workflow seam before any
 // durable mutation is handed to the repository.
-func ConsumeDriftAdoption(ctx context.Context, ownerID string, lock domain.CapsuleLockSnapshot, proposal guest.DriftAdoptionProposal, consent guest.DriftAdoptionConsent, actions DriftAdoptionActions) error {
+func ConsumeDriftAdoption(ctx context.Context, ownerID string, lock domain.CapsuleLockSnapshot, proposal profile.DriftAdoptionProposal, consent profile.DriftAdoptionConsent, actions DriftAdoptionActions) error {
 	if actions == nil {
 		return errors.New("drift adoption actions are required")
 	}
-	accepted, err := guest.AcceptDriftAdoption(lock, ownerID, proposal, consent)
+	accepted, err := profile.AcceptDriftAdoption(lock, ownerID, proposal, consent)
 	if err != nil {
 		return err
 	}

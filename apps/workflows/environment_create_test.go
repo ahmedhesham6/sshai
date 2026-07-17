@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ahmedhesham6/sshai/apps/guest"
 	"github.com/ahmedhesham6/sshai/apps/workflows"
 	"github.com/ahmedhesham6/sshai/libs/application"
 	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	"github.com/ahmedhesham6/sshai/libs/testfixtures"
 	"github.com/restatedev/sdk-go/ingress"
@@ -92,7 +92,7 @@ func TestEnvironmentCreateWorkflowResolvesAndPinsCapsuleStateAfterRuntime(t *tes
 		state: workflows.EnvironmentCapsuleState{
 			CapsuleLock:   domain.CapsuleLockSnapshot{ID: "lock-1", EnvironmentID: "environment-1", ProfileVersionID: "version-1"},
 			UpgradePolicy: domain.UpgradeNotify,
-			ApplyResults:  []guest.ProfileMaterializationResult{{ComponentID: "config:editor", LockID: "lock-1", LockDigest: "sha256:lock", ComponentDigest: "sha256:component"}},
+			ApplyResults:  []profile.ProfileMaterializationResult{{ComponentID: "config:editor", LockID: "lock-1", LockDigest: "sha256:lock", ComponentDigest: "sha256:component"}},
 		},
 	}
 	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
@@ -171,7 +171,7 @@ func TestEnvironmentCreateWorkflowDoesNotResolveCapsuleStateAfterProviderValidat
 }
 
 func TestInstalledMaterializationsFromApplyResultsPreservesCacheIdentity(t *testing.T) {
-	results := []guest.ProfileMaterializationResult{{
+	results := []profile.ProfileMaterializationResult{{
 		ID: "editor", LockID: "lock-1", LockDigest: "sha256:lock", CapsuleDigest: "sha256:capsule", ComponentID: "config:editor",
 		ComponentDigest: "sha256:component", Adapter: "file", AdapterVersion: "v1", TargetAgentVersion: "agent-1",
 		Scope: domain.ScopeUser, NonSecretOverridesDigest: "sha256:overrides", SecretVersionIdentifiers: []string{"secret-1"}, EffectiveCacheKey: "sha256:key",
