@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ahmedhesham6/sshai/apps/guest"
 	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	restate "github.com/restatedev/sdk-go"
 	"github.com/restatedev/sdk-go/ingress"
@@ -32,10 +32,10 @@ type EnvironmentCreationActions interface {
 // pathway and the guest apply-results seam. The workflow persists it only
 // after runtime validation has completed.
 type EnvironmentCapsuleState struct {
-	CapsuleLock      domain.CapsuleLockSnapshot           `json:"capsuleLock"`
-	UpgradePolicy    domain.UpgradePolicy                 `json:"upgradePolicy"`
-	ApplyResults     []guest.ProfileMaterializationResult `json:"applyResults,omitempty"`
-	Materializations []guest.InstalledMaterialization     `json:"materializations,omitempty"`
+	CapsuleLock      domain.CapsuleLockSnapshot             `json:"capsuleLock"`
+	UpgradePolicy    domain.UpgradePolicy                   `json:"upgradePolicy"`
+	ApplyResults     []profile.ProfileMaterializationResult `json:"applyResults,omitempty"`
+	Materializations []profile.InstalledMaterialization     `json:"materializations,omitempty"`
 }
 
 type EnvironmentCreationCapsuleActions interface {
@@ -236,8 +236,8 @@ func validateEnvironmentCapsuleState(input domain.EnvironmentCreateDispatch, sta
 	return nil
 }
 
-func InstalledMaterializationsFromApplyResults(results []guest.ProfileMaterializationResult) []guest.InstalledMaterialization {
-	return guest.InstalledMaterializationsFromResults(results)
+func InstalledMaterializationsFromApplyResults(results []profile.ProfileMaterializationResult) []profile.InstalledMaterialization {
+	return profile.InstalledMaterializationsFromResults(results)
 }
 
 func validateDataVolume(input domain.EnvironmentCreateDispatch, volume provider.DataVolume) error {

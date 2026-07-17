@@ -1,4 +1,4 @@
-package guest
+package profile
 
 import (
 	"errors"
