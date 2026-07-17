@@ -66,6 +66,36 @@ type CreditTransaction struct {
 	CreatedAt      pgtype.Timestamptz
 }
 
+type EnvironmentMaterialization struct {
+	EnvironmentID               string
+	LockID                      string
+	ID                          *string
+	LockDigest                  string
+	CapsuleDigest               string
+	ComponentID                 string
+	ComponentDigest             string
+	AdapterID                   string
+	AdapterVersion              string
+	TargetAgentVersion          string
+	Scope                       string
+	ComponentType               string
+	TrustClass                  string
+	NonSecretOverridesDigest    *string
+	SecretVersionIdentifiers    []byte
+	EffectiveCacheKey           string
+	Mode                        *string
+	Root                        *string
+	Target                      *string
+	Selector                    *string
+	Directory                   bool
+	FilePaths                   []byte
+	LastAppliedDigest           *string
+	ObservedDigest              *string
+	CredentialRequirementDigest *string
+	CreatedAt                   pgtype.Timestamptz
+	UpdatedAt                   pgtype.Timestamptz
+}
+
 type PolarCustomer struct {
 	UserID          string
 	PolarCustomerID string

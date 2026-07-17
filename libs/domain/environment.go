@@ -49,6 +49,8 @@ type EnvironmentSnapshot struct {
 	AvailabilityZone       string
 	RuntimePreset          string
 	PinnedProfileVersionID string
+	CapsuleLockID          *string
+	UpgradePolicy          UpgradePolicy
 	CurrentRuntimeID       *string
 	AutoStopPolicyID       string
 	CreatedAt              time.Time
@@ -72,6 +74,7 @@ type EnvironmentCreation struct {
 var (
 	ErrInitialRuntimeAlreadyReserved = errors.New("initial Runtime is already reserved")
 	ErrInitialRuntimeRequired        = errors.New("initial Runtime is required before activation")
+	ErrCapsuleLockAlreadyPinned      = errors.New("Environment already has a pinned Capsule Lock")
 )
 
 type EnvironmentCreateDispatch struct {
@@ -184,6 +187,7 @@ func ReserveEnvironment(reservation EnvironmentReservation) (Environment, error)
 		AvailabilityZone:       reservation.AvailabilityZone,
 		RuntimePreset:          reservation.RuntimePreset,
 		PinnedProfileVersionID: reservation.PinnedProfileVersionID,
+		UpgradePolicy:          UpgradeManual,
 		AutoStopPolicyID:       reservation.AutoStopPolicyID,
 		CreatedAt:              reservation.CreatedAt,
 		UpdatedAt:              reservation.CreatedAt,
@@ -196,6 +200,9 @@ func ReserveEnvironment(reservation EnvironmentReservation) (Environment, error)
 }
 
 func RestoreEnvironment(snapshot EnvironmentSnapshot) (Environment, error) {
+	if snapshot.UpgradePolicy == "" {
+		snapshot.UpgradePolicy = UpgradeManual
+	}
 	if err := validateEnvironmentSnapshot(snapshot); err != nil {
 		return Environment{}, fmt.Errorf("restore Environment: %w", err)
 	}
@@ -229,6 +236,12 @@ func validateEnvironmentSnapshot(snapshot EnvironmentSnapshot) error {
 	}
 	if !snapshot.Health.valid() {
 		return fmt.Errorf("invalid Environment: unknown health %q", snapshot.Health)
+	}
+	if !snapshot.UpgradePolicy.Valid() {
+		return fmt.Errorf("invalid Environment: unknown upgrade policy %q", snapshot.UpgradePolicy)
+	}
+	if snapshot.CapsuleLockID != nil && (strings.TrimSpace(*snapshot.CapsuleLockID) == "" || *snapshot.CapsuleLockID != strings.TrimSpace(*snapshot.CapsuleLockID)) {
+		return errors.New("invalid Environment: Capsule Lock ID cannot be empty")
 	}
 	if snapshot.CurrentRuntimeID != nil && (*snapshot.CurrentRuntimeID == "" || *snapshot.CurrentRuntimeID != strings.TrimSpace(*snapshot.CurrentRuntimeID)) {
 		return errors.New("invalid Environment: current Runtime ID cannot be empty")
@@ -345,6 +358,46 @@ func (environment Environment) UpdateHealth(health EnvironmentHealth, at time.Ti
 	}
 
 	next.Health = health
+	return finalizeEnvironmentTransition(next, at)
+}
+
+func (environment Environment) PinCapsuleLock(lock CapsuleLock, policy UpgradePolicy, at time.Time) (Environment, error) {
+	if environment.snapshot.CapsuleLockID != nil {
+		return Environment{}, ErrCapsuleLockAlreadyPinned
+	}
+	return environment.setCapsuleLock(lock, policy, at, false)
+}
+
+func (environment Environment) RepinCapsuleLock(lock CapsuleLock, policy UpgradePolicy, at time.Time) (Environment, error) {
+	return environment.setCapsuleLock(lock, policy, at, true)
+}
+
+func (environment Environment) setCapsuleLock(lock CapsuleLock, policy UpgradePolicy, at time.Time, repin bool) (Environment, error) {
+	lockSnapshot := lock.Snapshot()
+	if strings.TrimSpace(lockSnapshot.ID) == "" {
+		return Environment{}, errors.New("set Capsule Lock: Capsule Lock ID is required")
+	}
+	if lockSnapshot.EnvironmentID != environment.snapshot.ID {
+		return Environment{}, errors.New("set Capsule Lock: Capsule Lock does not belong to Environment")
+	}
+	if !repin && environment.snapshot.CapsuleLockID != nil {
+		return Environment{}, ErrCapsuleLockAlreadyPinned
+	}
+	if policy == "" {
+		policy = UpgradeManual
+	}
+	if !policy.Valid() {
+		return Environment{}, fmt.Errorf("set Capsule Lock: unknown upgrade policy %q", policy)
+	}
+	next, err := environment.transitionSnapshot(at)
+	if err != nil {
+		return Environment{}, fmt.Errorf("set Capsule Lock: %w", err)
+	}
+	if next.Lifecycle == EnvironmentDeleted {
+		return Environment{}, errors.New("set Capsule Lock: deleted Environment is immutable")
+	}
+	next.CapsuleLockID = &lockSnapshot.ID
+	next.UpgradePolicy = policy
 	return finalizeEnvironmentTransition(next, at)
 }
 
@@ -503,6 +556,10 @@ func finalizeEnvironmentTransition(next EnvironmentSnapshot, at time.Time) (Envi
 
 func cloneEnvironmentSnapshot(snapshot EnvironmentSnapshot) EnvironmentSnapshot {
 	clone := snapshot
+	if snapshot.CapsuleLockID != nil {
+		value := *snapshot.CapsuleLockID
+		clone.CapsuleLockID = &value
+	}
 	if snapshot.CurrentRuntimeID != nil {
 		value := *snapshot.CurrentRuntimeID
 		clone.CurrentRuntimeID = &value

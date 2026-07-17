@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
+	"github.com/ahmedhesham6/sshai/apps/guest"
+	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	restate "github.com/restatedev/sdk-go"
@@ -25,6 +28,21 @@ type EnvironmentCreationActions interface {
 	CompleteEnvironmentCreation(context.Context, string, time.Time) error
 }
 
+// EnvironmentCapsuleState is the result of the existing profile.resolve
+// pathway and the guest apply-results seam. The workflow persists it only
+// after runtime validation has completed.
+type EnvironmentCapsuleState struct {
+	CapsuleLock      domain.CapsuleLockSnapshot           `json:"capsuleLock"`
+	UpgradePolicy    domain.UpgradePolicy                 `json:"upgradePolicy"`
+	ApplyResults     []guest.ProfileMaterializationResult `json:"applyResults,omitempty"`
+	Materializations []guest.InstalledMaterialization     `json:"materializations,omitempty"`
+}
+
+type EnvironmentCreationCapsuleActions interface {
+	ResolvePinnedProfileVersion(context.Context, string, time.Time) (EnvironmentCapsuleState, error)
+	PersistEnvironmentCapsuleState(context.Context, string, EnvironmentCapsuleState) error
+}
+
 type EnvironmentCreationRepository interface {
 	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) (domain.EnvironmentCreation, error)
 	InventoryEnvironmentState(context.Context, string, domain.EnvironmentStateReservation) (domain.EnvironmentState, error)
@@ -36,8 +54,33 @@ type environmentCreationActions struct {
 	repository EnvironmentCreationRepository
 }
 
-func NewEnvironmentCreationActions(repository EnvironmentCreationRepository) EnvironmentCreationActions {
-	return &environmentCreationActions{repository: repository}
+func NewEnvironmentCreationActions(repository EnvironmentCreationRepository, resolver PinnedProfileVersionResolver) (EnvironmentCreationActions, error) {
+	if repository == nil {
+		return nil, errors.New("new Environment creation actions: repository is required")
+	}
+	if resolver == nil {
+		return nil, errors.New("new Environment creation actions: pinned Profile Version resolver is required")
+	}
+	capsuleRepository, ok := any(repository).(EnvironmentCapsuleStateRepository)
+	if !ok {
+		return nil, errors.New("new Environment creation actions: Capsule state repository is required")
+	}
+	actions := &environmentCreationActions{repository: repository}
+	capsuleActions := NewEnvironmentCreationCapsuleActions(resolver, capsuleRepository)
+	return &environmentCreationActionsWithCapsules{EnvironmentCreationActions: actions, capsuleActions: capsuleActions}, nil
+}
+
+type environmentCreationActionsWithCapsules struct {
+	EnvironmentCreationActions
+	capsuleActions EnvironmentCreationCapsuleActions
+}
+
+func (actions *environmentCreationActionsWithCapsules) ResolvePinnedProfileVersion(ctx context.Context, operationID string, at time.Time) (EnvironmentCapsuleState, error) {
+	return actions.capsuleActions.ResolvePinnedProfileVersion(ctx, operationID, at)
+}
+
+func (actions *environmentCreationActionsWithCapsules) PersistEnvironmentCapsuleState(ctx context.Context, operationID string, state EnvironmentCapsuleState) error {
+	return actions.capsuleActions.PersistEnvironmentCapsuleState(ctx, operationID, state)
 }
 
 func (actions *environmentCreationActions) RecordEnvironmentCreateInvocation(ctx context.Context, operationID, invocationID string, at time.Time) error {
@@ -154,12 +197,47 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	if err != nil {
 		return EnvironmentCreateOutput{}, err
 	}
+	if capsuleActions, ok := workflow.actions.(EnvironmentCreationCapsuleActions); ok {
+		state, err := restate.Run(ctx, func(runCtx restate.RunContext) (EnvironmentCapsuleState, error) {
+			state, err := capsuleActions.ResolvePinnedProfileVersion(runCtx, input.OperationID, workflow.now().UTC())
+			return state, classifyDurableError(err)
+		}, restate.WithName("resolve-profile-version"))
+		if err != nil {
+			return EnvironmentCreateOutput{}, classifyDurableError(err)
+		}
+		if state.UpgradePolicy == "" {
+			state.UpgradePolicy = domain.UpgradeManual
+		}
+		if err := validateEnvironmentCapsuleState(input, state); err != nil {
+			return EnvironmentCreateOutput{}, restate.ToTerminalError(err)
+		}
+		state.Materializations = InstalledMaterializationsFromApplyResults(state.ApplyResults)
+		if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
+			return classifyDurableError(capsuleActions.PersistEnvironmentCapsuleState(runCtx, input.OperationID, state))
+		}, restate.WithName("persist-capsule-state")); err != nil {
+			return EnvironmentCreateOutput{}, classifyDurableError(err)
+		}
+	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(workflow.actions.CompleteEnvironmentCreation(runCtx, input.OperationID, workflow.now()))
 	}, restate.WithName("complete-projection")); err != nil {
 		return EnvironmentCreateOutput{}, err
 	}
 	return EnvironmentCreateOutput{DataVolumeProviderID: inventory.DataVolumeProviderID, RuntimeID: runtimeID}, nil
+}
+
+func validateEnvironmentCapsuleState(input domain.EnvironmentCreateDispatch, state EnvironmentCapsuleState) error {
+	if state.CapsuleLock.ID == "" || state.CapsuleLock.EnvironmentID != input.EnvironmentID || state.CapsuleLock.ProfileVersionID == "" {
+		return errors.New("Environment Capsule state has an invalid Capsule Lock")
+	}
+	if !state.UpgradePolicy.Valid() {
+		return fmt.Errorf("Environment Capsule state has invalid upgrade policy %q", state.UpgradePolicy)
+	}
+	return nil
+}
+
+func InstalledMaterializationsFromApplyResults(results []guest.ProfileMaterializationResult) []guest.InstalledMaterialization {
+	return guest.InstalledMaterializationsFromResults(results)
 }
 
 func validateDataVolume(input domain.EnvironmentCreateDispatch, volume provider.DataVolume) error {
@@ -172,6 +250,11 @@ func validateDataVolume(input domain.EnvironmentCreateDispatch, volume provider.
 }
 
 func classifyDurableError(err error) error {
+	if errors.Is(err, errInvalidEnvironmentCapsuleState) ||
+		errors.Is(err, dbstore.ErrEnvironmentMaterializationLockMismatch) ||
+		errors.Is(err, dbstore.ErrCapsuleLockConflict) {
+		return restate.ToTerminalError(err)
+	}
 	var classified interface{ Transient() bool }
 	if errors.As(err, &classified) && !classified.Transient() {
 		return restate.ToTerminalError(err)

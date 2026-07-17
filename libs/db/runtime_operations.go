@@ -108,6 +108,7 @@ func loadRuntimeOperation(ctx context.Context, queries *dbsql.Queries, operation
 		Lifecycle: domain.EnvironmentLifecycle(row.Lifecycle), Health: domain.EnvironmentHealth(row.Health),
 		Region: row.EnvironmentRegion, AvailabilityZone: row.EnvironmentAvailabilityZone,
 		RuntimePreset: row.EnvironmentRuntimePreset, PinnedProfileVersionID: row.PinnedProfileVersionID,
+		CapsuleLockID: row.CapsuleLockID, UpgradePolicy: domain.UpgradePolicy(row.UpgradePolicy),
 		CurrentRuntimeID: row.CurrentRuntimeID, AutoStopPolicyID: row.AutoStopPolicyID,
 		CreatedAt: row.EnvironmentCreatedAt.Time, UpdatedAt: row.EnvironmentUpdatedAt.Time,
 		DeletedAt: optionalTime(row.DeletedAt), Version: row.EnvironmentVersion,

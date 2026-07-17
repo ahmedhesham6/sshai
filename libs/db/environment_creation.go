@@ -296,7 +296,7 @@ func restoreEnvironmentCreation(ctx context.Context, queries *dbsql.Queries, row
 		ID: row.EnvironmentID, OwnerUserID: row.OwnerUserID, Name: row.Name, Slug: row.Slug,
 		Lifecycle: domain.EnvironmentLifecycle(row.Lifecycle), Health: domain.EnvironmentHealth(row.Health),
 		Region: row.Region, AvailabilityZone: row.AvailabilityZone, RuntimePreset: row.RuntimePreset,
-		PinnedProfileVersionID: row.PinnedProfileVersionID, CurrentRuntimeID: row.CurrentRuntimeID,
+		PinnedProfileVersionID: row.PinnedProfileVersionID, CapsuleLockID: row.CapsuleLockID, UpgradePolicy: domain.UpgradePolicy(row.UpgradePolicy), CurrentRuntimeID: row.CurrentRuntimeID,
 		AutoStopPolicyID: row.PolicyID, CreatedAt: row.EnvironmentCreatedAt.Time,
 		UpdatedAt: row.EnvironmentUpdatedAt.Time, DeletedAt: deletedAt, Version: row.Version,
 	})

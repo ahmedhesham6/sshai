@@ -15,6 +15,8 @@ SELECT
     e.availability_zone,
     e.runtime_preset,
     e.pinned_profile_version_id,
+    e.capsule_lock_id,
+    e.upgrade_policy,
     e.current_runtime_id,
     e.created_at AS environment_created_at,
     e.updated_at AS environment_updated_at,

@@ -11,8 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ahmedhesham6/sshai/apps/guest"
 	"github.com/ahmedhesham6/sshai/apps/workflows"
 	"github.com/ahmedhesham6/sshai/libs/application"
+	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	"github.com/ahmedhesham6/sshai/libs/testfixtures"
@@ -79,6 +81,105 @@ func TestEnvironmentCreateWorkflowRunsDurableProviderAndCompletionActionsOnce(t 
 	}
 	if events := completion.eventLog(); len(events) != 4 || events[0] != "record" || events[1] != "inventory" || events[2] != "reserve-runtime" || events[3] != "complete" {
 		t.Fatalf("durable store action order = %#v", events)
+	}
+}
+
+func TestEnvironmentCreateWorkflowResolvesAndPinsCapsuleStateAfterRuntime(t *testing.T) {
+	provider := testfixtures.NewProvider()
+	completion := &completionFake{persistedProviderID: "persisted-volume-1"}
+	capsule := &capsuleStateFake{
+		completionFake: completion,
+		state: workflows.EnvironmentCapsuleState{
+			CapsuleLock:   domain.CapsuleLockSnapshot{ID: "lock-1", EnvironmentID: "environment-1", ProfileVersionID: "version-1"},
+			UpgradePolicy: domain.UpgradeNotify,
+			ApplyResults:  []guest.ProfileMaterializationResult{{ComponentID: "config:editor", LockID: "lock-1", LockDigest: "sha256:lock", ComponentDigest: "sha256:component"}},
+		},
+	}
+	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(provider, capsule, ids, time.Now, "image-v1"))
+	input := application.EnvironmentCreateWorkflowInput{
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
+	}
+	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
+		t.Fatalf("submit Environment create workflow: %v", err)
+	}
+	if _, err := ingress.WorkflowHandle[workflows.EnvironmentCreateOutput](environment.Ingress(), workflows.EnvironmentCreateService, input.OperationID).Attach(t.Context()); err != nil {
+		t.Fatalf("await Environment create workflow: %v", err)
+	}
+	if capsule.resolveCalls != 1 || capsule.persistCalls != 1 {
+		t.Fatalf("Capsule state calls = resolve:%d persist:%d", capsule.resolveCalls, capsule.persistCalls)
+	}
+	if capsule.persistedState.CapsuleLock.ID != "lock-1" || capsule.persistedState.UpgradePolicy != domain.UpgradeNotify || len(capsule.persistedState.ApplyResults) != 1 {
+		t.Fatalf("persisted Capsule state = %#v", capsule.persistedState)
+	}
+	if events := capsule.eventLog(); len(events) != 6 || events[2] != "reserve-runtime" || events[3] != "resolve-profile-version" || events[4] != "persist-capsule-state" || events[5] != "complete" {
+		t.Fatalf("Capsule state action order = %#v", events)
+	}
+}
+
+func TestEnvironmentCreateWorkflowTreatsCapsuleLockConflictAsTerminal(t *testing.T) {
+	provider := testfixtures.NewProvider()
+	capsule := &capsuleStateFake{
+		completionFake: &completionFake{persistedProviderID: "persisted-volume-1"},
+		state: workflows.EnvironmentCapsuleState{
+			CapsuleLock: domain.CapsuleLockSnapshot{
+				ID: "lock-conflict", EnvironmentID: "environment-1", ProfileVersionID: "version-1",
+			},
+			UpgradePolicy: domain.UpgradeManual,
+		},
+		persistErr: dbstore.ErrCapsuleLockConflict,
+	}
+	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(provider, capsule, ids, time.Now, "image-v1"))
+	input := application.EnvironmentCreateWorkflowInput{
+		OperationID: "operation-conflict", EnvironmentID: "environment-1",
+		Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
+	}
+	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
+		t.Fatalf("submit Environment create workflow: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if _, err := ingress.WorkflowHandle[workflows.EnvironmentCreateOutput](
+		environment.Ingress(), workflows.EnvironmentCreateService, input.OperationID,
+	).Attach(ctx); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Capsule Lock conflict workflow error = %v, want terminal failure", err)
+	}
+	if capsule.persistCalls != 1 {
+		t.Fatalf("Capsule Lock conflict persistence calls = %d, want one terminal attempt", capsule.persistCalls)
+	}
+}
+
+func TestEnvironmentCreateWorkflowDoesNotResolveCapsuleStateAfterProviderValidationFailure(t *testing.T) {
+	dataVolumes := fixedDataVolumeProvider{volume: provider.DataVolume{
+		Provider: "aws", ProviderID: "volume-1", EnvironmentID: "environment-other", Region: "us-east-1", AvailabilityZone: "us-east-1a",
+	}}
+	capsule := &capsuleStateFake{completionFake: &completionFake{}}
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, capsule, &workflowIDs{values: []string{"unused"}}, time.Now, "image-v1"))
+	input := application.EnvironmentCreateWorkflowInput{
+		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
+	}
+	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
+		t.Fatalf("submit Environment create workflow: %v", err)
+	}
+	if _, err := ingress.WorkflowHandle[workflows.EnvironmentCreateOutput](environment.Ingress(), workflows.EnvironmentCreateService, input.OperationID).Attach(t.Context()); err == nil {
+		t.Fatal("provider validation failure completed successfully")
+	}
+	if capsule.resolveCalls != 0 || capsule.persistCalls != 0 {
+		t.Fatalf("Capsule state calls after provider validation failure = resolve:%d persist:%d", capsule.resolveCalls, capsule.persistCalls)
+	}
+}
+
+func TestInstalledMaterializationsFromApplyResultsPreservesCacheIdentity(t *testing.T) {
+	results := []guest.ProfileMaterializationResult{{
+		ID: "editor", LockID: "lock-1", LockDigest: "sha256:lock", CapsuleDigest: "sha256:capsule", ComponentID: "config:editor",
+		ComponentDigest: "sha256:component", Adapter: "file", AdapterVersion: "v1", TargetAgentVersion: "agent-1",
+		Scope: domain.ScopeUser, NonSecretOverridesDigest: "sha256:overrides", SecretVersionIdentifiers: []string{"secret-1"}, EffectiveCacheKey: "sha256:key",
+		Mode: "managed", Root: "home", Target: ".config/editor", Selector: "$", LastAppliedDigest: "sha256:last", ObservedDigest: "sha256:observed", CredentialRequirementDigest: "sha256:requirements",
+	}}
+	installed := workflows.InstalledMaterializationsFromApplyResults(results)
+	if len(installed) != 1 || installed[0].ComponentID != "config:editor" || installed[0].EffectiveCacheKey != "sha256:key" || installed[0].SecretVersionIdentifiers[0] != "secret-1" {
+		t.Fatalf("installed materializations = %#v", installed)
 	}
 }
 
@@ -376,6 +477,28 @@ func (fake *completionFake) eventLog() []string {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	return append([]string(nil), fake.events...)
+}
+
+type capsuleStateFake struct {
+	*completionFake
+	state          workflows.EnvironmentCapsuleState
+	persistErr     error
+	resolveCalls   int
+	persistCalls   int
+	persistedState workflows.EnvironmentCapsuleState
+}
+
+func (fake *capsuleStateFake) ResolvePinnedProfileVersion(context.Context, string, time.Time) (workflows.EnvironmentCapsuleState, error) {
+	fake.resolveCalls++
+	fake.completionFake.events = append(fake.completionFake.events, "resolve-profile-version")
+	return fake.state, nil
+}
+
+func (fake *capsuleStateFake) PersistEnvironmentCapsuleState(_ context.Context, _ string, state workflows.EnvironmentCapsuleState) error {
+	fake.persistCalls++
+	fake.persistedState = state
+	fake.completionFake.events = append(fake.completionFake.events, "persist-capsule-state")
+	return fake.persistErr
 }
 
 type inventoryFailureStore struct {

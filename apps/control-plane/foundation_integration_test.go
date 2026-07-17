@@ -19,6 +19,7 @@ import (
 	"github.com/ahmedhesham6/sshai/apps/workflows"
 	"github.com/ahmedhesham6/sshai/libs/application"
 	"github.com/ahmedhesham6/sshai/libs/db"
+	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/testfixtures"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/restatedev/sdk-go/ingress"
@@ -52,9 +53,13 @@ func TestFoundationTracerPersistsAndCompletesThroughRestate(t *testing.T) {
 		}
 	}
 	fakeProvider := testfixtures.NewProvider()
+	creationActions, err := workflows.NewEnvironmentCreationActions(store, foundationPinnedProfileResolver{})
+	if err != nil {
+		t.Fatalf("construct Environment creation actions: %v", err)
+	}
 	restateEnvironment := testfixtures.StartRestate(t,
 		workflows.EnvironmentCreateDefinition(
-			fakeProvider, workflows.NewEnvironmentCreationActions(store),
+			fakeProvider, creationActions,
 			&idsFake{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
 			func() time.Time { return now.Add(time.Minute) }, "image-v1",
 		),
@@ -216,4 +221,19 @@ type failedDispatcher struct{}
 
 func (failedDispatcher) DispatchEnvironmentCreate(context.Context, string) error {
 	return errors.New("simulated crash before Restate send")
+}
+
+type foundationPinnedProfileResolver struct{}
+
+func (foundationPinnedProfileResolver) ResolvePinnedProfileVersion(_ context.Context, _ string, at time.Time) (workflows.EnvironmentCapsuleState, error) {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	return workflows.EnvironmentCapsuleState{
+		CapsuleLock: domain.CapsuleLockSnapshot{
+			ID: "lock-1", EnvironmentID: "environment-1", ProfileVersionID: "profile-version-1",
+			ProjectCapsuleDigest: digest,
+			Capsules:             []domain.LockedCapsule{{Ref: "owner/user-1/capsule@" + digest, Digest: digest}},
+			ResolvedComponents:   map[string]domain.ResolvedComponent{}, CreatedAt: at.UTC(),
+		},
+		UpgradePolicy: domain.UpgradeManual,
+	}, nil
 }

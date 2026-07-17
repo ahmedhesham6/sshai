@@ -3,8 +3,7 @@ package domain
 import "strings"
 
 // UpgradePolicy controls whether a resolved candidate may be applied without
-// a separate user action. Persistence of the Environment policy is owned by a
-// later database slice.
+// a separate user action.
 type UpgradePolicy string
 
 const (

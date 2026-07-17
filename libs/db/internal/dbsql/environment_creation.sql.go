@@ -90,6 +90,8 @@ SELECT
     e.availability_zone,
     e.runtime_preset,
     e.pinned_profile_version_id,
+    e.capsule_lock_id,
+    e.upgrade_policy,
     e.current_runtime_id,
     e.created_at AS environment_created_at,
     e.updated_at AS environment_updated_at,
@@ -131,6 +133,8 @@ type GetEnvironmentCreationByKeyRow struct {
 	AvailabilityZone       string
 	RuntimePreset          string
 	PinnedProfileVersionID string
+	CapsuleLockID          *string
+	UpgradePolicy          string
 	CurrentRuntimeID       *string
 	EnvironmentCreatedAt   pgtype.Timestamptz
 	EnvironmentUpdatedAt   pgtype.Timestamptz
@@ -164,6 +168,8 @@ func (q *Queries) GetEnvironmentCreationByKey(ctx context.Context, arg GetEnviro
 		&i.AvailabilityZone,
 		&i.RuntimePreset,
 		&i.PinnedProfileVersionID,
+		&i.CapsuleLockID,
+		&i.UpgradePolicy,
 		&i.CurrentRuntimeID,
 		&i.EnvironmentCreatedAt,
 		&i.EnvironmentUpdatedAt,

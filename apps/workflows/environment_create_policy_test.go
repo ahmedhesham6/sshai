@@ -29,7 +29,7 @@ func TestClassifyDurableErrorTerminatesOnlyClassifiedPermanentFailures(t *testin
 func TestEnvironmentCreationActionsReturnsPersistedProviderIdentity(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
 	repository := &creationRepositoryFake{state: validEnvironmentState(t, createdAt, "persisted-volume-1")}
-	actions := NewEnvironmentCreationActions(repository)
+	actions := &environmentCreationActions{repository: repository}
 
 	providerID, err := actions.InventoryEnvironmentState(t.Context(), "operation-1", domain.EnvironmentStateReservation{})
 	if err != nil {
@@ -37,6 +37,13 @@ func TestEnvironmentCreationActionsReturnsPersistedProviderIdentity(t *testing.T
 	}
 	if providerID != "persisted-volume-1" {
 		t.Fatalf("authoritative provider ID = %q", providerID)
+	}
+}
+
+func TestNewEnvironmentCreationActionsRequiresPinnedProfileResolver(t *testing.T) {
+	actions, err := NewEnvironmentCreationActions(&creationRepositoryFake{}, nil)
+	if err == nil || actions != nil {
+		t.Fatalf("NewEnvironmentCreationActions() = actions:%T error:%v, want loud missing-resolver failure", actions, err)
 	}
 }
 

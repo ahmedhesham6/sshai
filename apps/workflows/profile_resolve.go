@@ -39,6 +39,7 @@ type ProfileResolveInput struct {
 type ProfileResolveState struct {
 	ManagedTargets             []domain.ManagedTargetState
 	LastApprovedCapsuleDigests map[string]string
+	PersistedUpgradePolicy     *domain.UpgradePolicy
 }
 
 type ProfileResolveOutput struct {
@@ -168,7 +169,7 @@ func (workflow *profileResolveWorkflow) Run(ctx restate.WorkflowContext, input P
 	}
 	upgradePolicy := input.UpgradePolicy
 	if upgradePolicy == "" {
-		upgradePolicy = domain.UpgradeAutoSafe
+		upgradePolicy = domain.UpgradeManual
 	}
 	if !upgradePolicy.Valid() {
 		return ProfileResolveOutput{}, restate.TerminalErrorf("Profile resolve workflow upgrade policy %q is invalid", upgradePolicy)
@@ -190,6 +191,12 @@ func (workflow *profileResolveWorkflow) Run(ctx restate.WorkflowContext, input P
 	}, restate.WithName("load-profile-resolve-state"))
 	if err != nil {
 		return ProfileResolveOutput{}, classifyDurableError(err)
+	}
+	if state.PersistedUpgradePolicy != nil {
+		if !state.PersistedUpgradePolicy.Valid() {
+			return ProfileResolveOutput{}, restate.TerminalErrorf("persisted Environment upgrade policy %q is invalid", *state.PersistedUpgradePolicy)
+		}
+		upgradePolicy = narrowerUpgradePolicy(upgradePolicy, *state.PersistedUpgradePolicy)
 	}
 	resolved, err := restate.Run(ctx, func(runCtx restate.RunContext) (resolvedCapsuleSet, error) {
 		return workflow.resolveCapsules(runCtx, input.OwnerID, version, input.ProjectCapsuleDigest, state.LastApprovedCapsuleDigests)
@@ -234,6 +241,23 @@ func (workflow *profileResolveWorkflow) Run(ctx restate.WorkflowContext, input P
 		RequiresReview: requiresReview, Applyable: applyable, UpgradeReason: upgradeReason,
 		DiffSinceLastApproval: formatApprovalDiffs(resolved.DiffSinceLastApproval),
 	}, nil
+}
+
+func narrowerUpgradePolicy(first, second domain.UpgradePolicy) domain.UpgradePolicy {
+	rank := func(policy domain.UpgradePolicy) int {
+		switch policy {
+		case domain.UpgradeManual:
+			return 0
+		case domain.UpgradeNotify:
+			return 1
+		default:
+			return 2
+		}
+	}
+	if rank(first) <= rank(second) {
+		return first
+	}
+	return second
 }
 
 type resolvedCapsuleSet struct {

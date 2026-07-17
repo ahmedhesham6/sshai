@@ -137,6 +137,52 @@ func TestProfileResolveIgnoresCallerManagedTargetsCleanWhenPersistedStateIsDirty
 	}
 }
 
+func TestProfileResolvePersistedManualPolicyCannotBeWidenedByCaller(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		policy domain.UpgradePolicy
+	}{
+		{name: "omitted policy", policy: ""},
+		{name: "auto safe policy", policy: domain.UpgradeAutoSafe},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+			persistedPolicy := domain.UpgradeManual
+			actions := &profileResolveActionsFake{
+				version: profileVersionFixture(t, now),
+				state: workflows.ProfileResolveState{
+					PersistedUpgradePolicy: &persistedPolicy,
+				},
+			}
+			resolver := &policyResolverFake{resolution: workflows.CapsuleResolution{
+				OwnerID: "user-1", Digest: sha256Digest('a'),
+				Components: []domain.Component{{
+					ID: "config:editor", Type: domain.ComponentConfig, MediaType: "application/json",
+					Digest: sha256Digest('c'), Scope: domain.ScopeUser, TrustClass: domain.TrustDeclarative,
+				}},
+			}}
+			environment := testfixtures.StartRestate(t, workflows.ProfileResolveDefinition(
+				actions, resolver, &resolveIDs{values: []string{"lock-persisted-policy-" + strings.ReplaceAll(test.name, " ", "-")}}, func() time.Time { return now },
+			))
+			input := workflows.ProfileResolveInput{
+				OperationID:   "operation-persisted-policy-" + strings.ReplaceAll(test.name, " ", "-"),
+				EnvironmentID: "environment-1", ProfileVersionID: "version-1", OwnerID: "user-1",
+				UpgradePolicy: test.policy,
+			}
+			if err := workflows.NewProfileResolveClient(environment.Ingress()).SendProfileResolve(t.Context(), input); err != nil {
+				t.Fatalf("submit persisted-policy Profile resolve: %v", err)
+			}
+			output, err := ingress.WorkflowHandle[workflows.ProfileResolveOutput](environment.Ingress(), workflows.ProfileResolveService, input.OperationID).Attach(t.Context())
+			if err != nil {
+				t.Fatalf("await persisted-policy Profile resolve: %v", err)
+			}
+			if output.Applyable || !output.RequiresReview || output.UpgradeReason != "manual_upgrade" {
+				t.Fatalf("persisted manual policy output = %#v, want non-applyable manual review", output)
+			}
+		})
+	}
+}
+
 func TestProfileResolveReviewCandidateEchoCannotAuthorizeWithoutPersistedApproval(t *testing.T) {
 	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	version := profileVersionFixture(t, now)
