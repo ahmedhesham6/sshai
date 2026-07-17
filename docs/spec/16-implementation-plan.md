@@ -4,13 +4,13 @@
 
 ```text
 apps/
-  cli/                    Go devm binary and local scanner
+  cli/                    Go devm binary, building from cmd/devm/
   control-plane/          Go chi/OpenAPI HTTP API
   workflows/              Go Restate services and workflows
   ssh-proxy/              Go regional WSS-to-SSH bridge
   guest/                  Go Runtime supervisor
   web/                    TanStack Start product application
-  docs/                   Public documentation site
+  docs/                   Public documentation site (planned — not yet created)
 
 libs/
   domain/                 aggregates, value types, invariants
@@ -25,7 +25,7 @@ libs/
   provideraws/            EC2/EBS/VPC implementation
   billing/                rates, credit ledger, Polar integration
   auth/                   WorkOS verification and claims mapping
-  observability/          OpenTelemetry conventions
+  observability/          OpenTelemetry conventions (planned — not yet created)
   testfixtures/           fake provider, fake guest, deterministic fixtures
 
 api/
@@ -48,6 +48,14 @@ package.json
 pnpm-workspace.yaml
 turbo.json
 ```
+
+`apps/guest`, `apps/workflows`, and `apps/ssh-proxy` are library packages today —
+they have no `cmd/` entrypoint yet, and building one for each is phase-pending.
+As an interim arrangement, the control-plane binary
+(`apps/control-plane/cmd/control-plane/main.go`) embeds the workflows service
+directly. The binary convention, once each service gets its own entrypoint, is
+`apps/<svc>/cmd/<binary-name>/main.go` — as already followed by
+`apps/cli/cmd/devm/` and `apps/control-plane/cmd/control-plane/`.
 
 Use one root Go module unless a concrete tooling limitation requires `go.work`.
 

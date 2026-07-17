@@ -115,18 +115,19 @@ Cloud-init performs only Environment enrollment, authorized-key configuration, g
 ```text
 infra/terraform/
   modules/
-    global-networking/
+    global-networking/     (planned — not yet created)
     regional-cell/
-    ecs-service/
+    ecs-service/            (planned — not yet created)
     rds/
     object-storage/
-    iam/
-    image-pipeline/
-    observability/
+    capsule-store/          S3 OCI image-layout Capsule store; owner-scoped presigned access — ADR 0009
+    iam/                    (planned — not yet created)
+    image-pipeline/         (planned — not yet created)
+    observability/          (planned — not yet created)
   environments/
     development/
-    staging/
-    production/
+    staging/                (planned — not yet created)
+    production/             (planned — not yet created)
 ```
 
 Platform Terraform creates shared infrastructure only. Per-Environment resources are created through the AWS provider adapter and Restate workflows, not one Terraform state per Environment.
