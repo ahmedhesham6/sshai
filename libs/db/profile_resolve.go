@@ -203,6 +203,72 @@ func (store *Store) loadCapsuleLockAfterConcurrentInsert(ctx context.Context, sn
 	return lock, nil
 }
 
+// ProfileResolveState is the durable Environment-scoped input to the
+// profile.resolve safety decision: the currently managed installs
+// (Environment Materializations), the Capsule Ref digests approved by the
+// Environment's pinned Capsule Lock (if any), and the Environment's
+// persisted upgrade policy. Field shapes mirror
+// workflows.ProfileResolveState so callers can copy them across the package
+// boundary without loss.
+type ProfileResolveState struct {
+	ManagedTargets             []domain.ManagedTargetState
+	LastApprovedCapsuleDigests map[string]string
+	PersistedUpgradePolicy     *domain.UpgradePolicy
+}
+
+// LoadProfileResolveState loads the Environment's current pin and managed
+// install state. An Environment with no pinned Capsule Lock yet (a brand-new
+// Environment) reports an empty approved-digest map and managed-target list
+// alongside its persisted (default "manual") upgrade policy.
+func (store *Store) LoadProfileResolveState(ctx context.Context, environmentID string) (ProfileResolveState, error) {
+	pin, err := store.GetEnvironmentPin(ctx, environmentID)
+	if err != nil {
+		return ProfileResolveState{}, err
+	}
+	policy := pin.UpgradePolicy
+	state := ProfileResolveState{PersistedUpgradePolicy: &policy}
+
+	if pin.CapsuleLockID != nil {
+		lockRow, err := store.queries.GetCapsuleLockForEnvironment(ctx, dbsql.GetCapsuleLockForEnvironmentParams{
+			LockID: *pin.CapsuleLockID, EnvironmentID: environmentID,
+		})
+		if err != nil {
+			return ProfileResolveState{}, fmt.Errorf("load Profile resolve state: load pinned Capsule Lock: %w", err)
+		}
+		lock, err := restoreCapsuleLock(lockRow)
+		if err != nil {
+			return ProfileResolveState{}, err
+		}
+		capsules := lock.Snapshot().Capsules
+		if len(capsules) > 0 {
+			approved := make(map[string]string, len(capsules))
+			for _, capsule := range capsules {
+				approved[capsule.Ref] = capsule.Digest
+			}
+			state.LastApprovedCapsuleDigests = approved
+		}
+	}
+
+	materializations, err := store.ListEnvironmentMaterializations(ctx, environmentID)
+	if err != nil {
+		return ProfileResolveState{}, fmt.Errorf("load Profile resolve state: %w", err)
+	}
+	if len(materializations) > 0 {
+		managedTargets := make([]domain.ManagedTargetState, len(materializations))
+		for index, materialization := range materializations {
+			managedTargets[index] = domain.ManagedTargetState{
+				ComponentID:       materialization.ComponentID,
+				DesiredDigest:     materialization.ComponentDigest,
+				LastAppliedDigest: materialization.LastAppliedDigest,
+				ObservedDigest:    materialization.ObservedDigest,
+			}
+		}
+		state.ManagedTargets = managedTargets
+	}
+
+	return state, nil
+}
+
 func (store *Store) CompleteProfileResolve(ctx context.Context, operationID string, at time.Time) error {
 	tx, err := store.pool.Begin(ctx)
 	if err != nil {

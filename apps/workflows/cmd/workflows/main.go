@@ -77,8 +77,8 @@ type serviceDependencies struct {
 	// environmentCreate is pending a production
 	// workflows.PinnedProfileVersionResolver (test fakes only today).
 	environmentCreate restate.ServiceDefinition
-	// profileResolve is pending a production workflows.CapsuleResolver and a
-	// db.Store implementation of LoadProfileResolveState.
+	// profileResolve is pending a production workflows.CapsuleResolver.
+	// db.Store now implements LoadProfileResolveState (slice S1b).
 	profileResolve restate.ServiceDefinition
 	// autoStop is pending production workflows.AutoStopSnapshotSource and
 	// workflows.RuntimeStopDispatcher implementations.
