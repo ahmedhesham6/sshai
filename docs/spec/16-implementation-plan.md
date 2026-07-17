@@ -49,13 +49,16 @@ pnpm-workspace.yaml
 turbo.json
 ```
 
-`apps/guest`, `apps/workflows`, and `apps/ssh-proxy` are library packages today —
-they have no `cmd/` entrypoint yet, and building one for each is phase-pending.
-As an interim arrangement, the control-plane binary
-(`apps/control-plane/cmd/control-plane/main.go`) embeds the workflows service
-directly. The binary convention, once each service gets its own entrypoint, is
+`apps/guest` and `apps/ssh-proxy` are library packages today — they have no
+`cmd/` entrypoint yet, and building one for each is phase-pending. The
+control-plane binary (`apps/control-plane/cmd/control-plane/main.go`) submits
+workflow invocations through a Restate ingress client, and
+`apps/workflows/cmd/workflows` serves the BillingDelivery workflow; the
+EnvironmentCreate, ProfileResolve, and Auto-stop services join that binary
+once their production dependencies exist. The binary convention is
 `apps/<svc>/cmd/<binary-name>/main.go` — as already followed by
-`apps/cli/cmd/devm/` and `apps/control-plane/cmd/control-plane/`.
+`apps/cli/cmd/devm/`, `apps/control-plane/cmd/control-plane/`, and
+`apps/workflows/cmd/workflows/`.
 
 Use one root Go module unless a concrete tooling limitation requires `go.work`.
 
