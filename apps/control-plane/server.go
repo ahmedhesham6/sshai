@@ -44,6 +44,36 @@ type CapsuleObjectOwnership interface {
 	OwnsObject(context.Context, string, contracts.CapsuleAccessObjectKind, string) (bool, error)
 }
 
+// EnvironmentReader serves owner-scoped Environment read models: single
+// Environment lookups, full listings, and an Environment's Operation
+// timeline.
+type EnvironmentReader interface {
+	GetOwnedEnvironment(context.Context, string, string) (db.EnvironmentDetail, error)
+	ListOwnedEnvironments(context.Context, string) ([]db.EnvironmentDetail, error)
+	ListOwnedEnvironmentEvents(context.Context, string, string) ([]db.EnvironmentEvent, error)
+}
+
+// OperationReader serves owner-scoped Operation read models.
+type OperationReader interface {
+	GetOwnedOperation(context.Context, string, string) (db.OperationDetail, error)
+}
+
+// ProfileReader serves owner-scoped Profile read models: single Profile
+// lookups, full listings, and immutable Profile Version lookups.
+type ProfileReader interface {
+	GetOwnedProfile(context.Context, string, string) (db.ProfileDetail, error)
+	ListOwnedProfiles(context.Context, string) ([]db.ProfileDetail, error)
+	GetOwnedProfileVersion(context.Context, string, string) (domain.ProfileVersion, error)
+}
+
+// BillingReader serves the authenticated User's billing projection: credit
+// balance (always present) and subscription (present once a Polar
+// subscription has been observed).
+type BillingReader interface {
+	CreditBalance(context.Context, string) (db.CreditBalanceProjection, error)
+	Subscription(context.Context, string) (db.SubscriptionProjection, bool, error)
+}
+
 type Config struct {
 	CreateEnvironment   *application.CreateEnvironmentService
 	RegisterProjectSeed *application.RegisterProjectSeedService
@@ -60,6 +90,10 @@ type Config struct {
 	CapsuleOwnership    CapsuleOwnership
 	CapsuleBucket       string
 	CapsuleAccessTTL    time.Duration
+	EnvironmentReads    EnvironmentReader
+	OperationReads      OperationReader
+	ProfileReads        ProfileReader
+	BillingReads        BillingReader
 }
 
 type server struct {
@@ -74,6 +108,10 @@ type server struct {
 	capsuleBucket       string
 	capsuleAccessTTL    time.Duration
 	now                 func() time.Time
+	environmentReads    EnvironmentReader
+	operationReads      OperationReader
+	profileReads        ProfileReader
+	billingReads        BillingReader
 }
 
 func NewHandler(config Config) http.Handler {
@@ -82,7 +120,9 @@ func NewHandler(config Config) http.Handler {
 		profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys,
 		capsulePresigner: config.CapsulePresigner, capsuleOwnership: config.CapsuleOwnership,
 		capsuleBucket: config.CapsuleBucket, capsuleAccessTTL: config.CapsuleAccessTTL,
-		now: config.Now,
+		now:              config.Now,
+		environmentReads: config.EnvironmentReads, operationReads: config.OperationReads,
+		profileReads: config.ProfileReads, billingReads: config.BillingReads,
 	}
 	router := chi.NewRouter()
 	router.Use(requestIDMiddleware(config.RequestIDs))

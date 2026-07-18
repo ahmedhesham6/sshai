@@ -114,6 +114,7 @@ func run(ctx context.Context) error {
 		CreateEnvironment: createEnvironment, RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
 		Verifier: verifier, Users: store, CapsulePresigner: capsulePresigner, CapsuleOwnership: controlplane.NewS3CapsuleOwnership(capsuleClient, config.capsuleBucket), CapsuleBucket: config.capsuleBucket, CapsuleAccessTTL: 15 * time.Minute,
 		UserIDs: ids, RequestIDs: ids, DefaultRegion: config.defaultRegion, Now: time.Now,
+		EnvironmentReads: store, OperationReads: store, ProfileReads: store, BillingReads: store,
 	})
 	server := &http.Server{Addr: config.listenAddress, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
