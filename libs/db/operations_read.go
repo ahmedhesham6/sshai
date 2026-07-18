@@ -10,6 +10,7 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/db/internal/dbsql"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // OperationStepProjection is the read-only projection of a single Operation
@@ -78,33 +79,54 @@ type EnvironmentEvent struct {
 	CreatedAt     time.Time
 }
 
-// ListOwnedEnvironmentEvents loads the Operation timeline for a single
-// Environment owned by ownerID, ordered by creation time then ID. An absent
-// or foreign Environment reports ErrReferenceNotOwned.
-func (store *Store) ListOwnedEnvironmentEvents(ctx context.Context, ownerID, environmentID string) ([]EnvironmentEvent, error) {
+// ListOwnedEnvironmentEvents loads a page of the Operation timeline for a
+// single Environment owned by ownerID, ordered by creation time then ID
+// (stable keyset pagination: identical created_at values are disambiguated
+// by id). cursor resumes immediately after a previously returned position;
+// nil selects the first page. pageSize is clamped to (DefaultPageSize,
+// MaxPageSize] via ClampPageSize. The returned Cursor is non-nil exactly
+// when another page follows. An absent or foreign Environment reports
+// ErrReferenceNotOwned.
+func (store *Store) ListOwnedEnvironmentEvents(ctx context.Context, ownerID, environmentID string, cursor *Cursor, pageSize int) ([]EnvironmentEvent, *Cursor, error) {
 	if strings.TrimSpace(ownerID) == "" || strings.TrimSpace(environmentID) == "" {
-		return nil, errors.New("list owned Environment events: canonical owner and Environment IDs are required")
+		return nil, nil, errors.New("list owned Environment events: canonical owner and Environment IDs are required")
 	}
 	owner, err := store.queries.GetEnvironmentOwner(ctx, environmentID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrReferenceNotOwned
+		return nil, nil, ErrReferenceNotOwned
 	}
 	if err != nil {
-		return nil, fmt.Errorf("list owned Environment events: check ownership: %w", err)
+		return nil, nil, fmt.Errorf("list owned Environment events: check ownership: %w", err)
 	}
 	if owner != ownerID {
-		return nil, ErrReferenceNotOwned
+		return nil, nil, ErrReferenceNotOwned
 	}
-	rows, err := store.queries.ListOwnedEnvironmentOperations(ctx, dbsql.ListOwnedEnvironmentOperationsParams{
-		EnvironmentID: environmentID, OwnerUserID: ownerID,
-	})
+	pageSize = ClampPageSize(pageSize)
+	params := dbsql.ListOwnedEnvironmentOperationsParams{
+		EnvironmentID: environmentID, OwnerUserID: ownerID, RowLimit: int32(pageSize + 1),
+	}
+	if cursor != nil {
+		params.HasCursor = true
+		params.CursorCreatedAt = pgtype.Timestamptz{Time: cursor.CreatedAt, Valid: true}
+		params.CursorID = cursor.ID
+	}
+	rows, err := store.queries.ListOwnedEnvironmentOperations(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("list owned Environment events: %w", err)
+		return nil, nil, fmt.Errorf("list owned Environment events: %w", err)
+	}
+	var nextCursor *Cursor
+	if len(rows) > pageSize {
+		last := rows[pageSize-1]
+		if !last.CreatedAt.Valid {
+			return nil, nil, errors.New("list owned Environment events: database returned invalid creation time")
+		}
+		nextCursor = &Cursor{CreatedAt: last.CreatedAt.Time, ID: last.ID}
+		rows = rows[:pageSize]
 	}
 	events := make([]EnvironmentEvent, len(rows))
 	for index, row := range rows {
 		if !row.CreatedAt.Valid {
-			return nil, errors.New("list owned Environment events: database returned invalid creation time")
+			return nil, nil, errors.New("list owned Environment events: database returned invalid creation time")
 		}
 		operationID := row.ID
 		events[index] = EnvironmentEvent{
@@ -112,5 +134,5 @@ func (store *Store) ListOwnedEnvironmentEvents(ctx context.Context, ownerID, env
 			Type: row.Type, Summary: fmt.Sprintf("%s %s", row.Type, row.Status), CreatedAt: row.CreatedAt.Time,
 		}
 	}
-	return events, nil
+	return events, nextCursor, nil
 }

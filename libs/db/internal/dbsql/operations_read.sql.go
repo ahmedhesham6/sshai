@@ -92,12 +92,21 @@ SELECT o.id, o.environment_id, o.type, o.status, o.created_at
 FROM operations o
 JOIN environments e ON e.id = o.environment_id
 WHERE e.id = $1 AND e.owner_user_id = $2
+  AND (
+    NOT $3::bool
+    OR (o.created_at, o.id) > ($4::timestamptz, $5::text)
+  )
 ORDER BY o.created_at, o.id
+LIMIT $6::int
 `
 
 type ListOwnedEnvironmentOperationsParams struct {
-	EnvironmentID string
-	OwnerUserID   string
+	EnvironmentID   string
+	OwnerUserID     string
+	HasCursor       bool
+	CursorCreatedAt pgtype.Timestamptz
+	CursorID        string
+	RowLimit        int32
 }
 
 type ListOwnedEnvironmentOperationsRow struct {
@@ -108,8 +117,20 @@ type ListOwnedEnvironmentOperationsRow struct {
 	CreatedAt     pgtype.Timestamptz
 }
 
+// Keyset pagination: rows are ordered by (o.created_at, o.id), the same
+// tuple the WHERE predicate compares against the caller's decoded cursor.
+// Passing has_cursor = false selects the first page; row_limit is the
+// caller's effective page size plus one, letting the store detect a next
+// page without a second round trip.
 func (q *Queries) ListOwnedEnvironmentOperations(ctx context.Context, arg ListOwnedEnvironmentOperationsParams) ([]ListOwnedEnvironmentOperationsRow, error) {
-	rows, err := q.db.Query(ctx, listOwnedEnvironmentOperations, arg.EnvironmentID, arg.OwnerUserID)
+	rows, err := q.db.Query(ctx, listOwnedEnvironmentOperations,
+		arg.EnvironmentID,
+		arg.OwnerUserID,
+		arg.HasCursor,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

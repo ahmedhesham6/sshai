@@ -15,6 +15,11 @@ LEFT JOIN operations active_op
 WHERE e.id = sqlc.arg(environment_id) AND e.owner_user_id = sqlc.arg(owner_user_id);
 
 -- name: ListOwnedEnvironmentDetails :many
+-- Keyset pagination: rows are ordered by (e.created_at, e.id), the same
+-- tuple the WHERE predicate compares against the caller's decoded cursor.
+-- Passing has_cursor = false selects the first page; row_limit is the
+-- caller's effective page size plus one, letting the store detect a next
+-- page without a second round trip.
 SELECT
     e.id, e.owner_user_id, e.name, e.slug, e.lifecycle, e.health,
     e.region AS environment_region, e.availability_zone AS environment_availability_zone,
@@ -29,7 +34,12 @@ JOIN auto_stop_policies p ON p.environment_id = e.id
 LEFT JOIN operations active_op
     ON active_op.environment_id = e.id AND active_op.status IN ('queued', 'running')
 WHERE e.owner_user_id = sqlc.arg(owner_user_id)
-ORDER BY e.created_at, e.id;
+  AND (
+    NOT sqlc.arg(has_cursor)::bool
+    OR (e.created_at, e.id) > (sqlc.arg(cursor_created_at)::timestamptz, sqlc.arg(cursor_id)::text)
+  )
+ORDER BY e.created_at, e.id
+LIMIT sqlc.arg(row_limit)::int;
 
 -- name: GetRuntimeByID :one
 SELECT id, environment_id, sequence, status, runtime_preset, region, availability_zone,

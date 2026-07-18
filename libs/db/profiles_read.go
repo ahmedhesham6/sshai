@@ -9,6 +9,7 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/db/internal/dbsql"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // ProfileDetail is the read-only projection an owner-scoped Profile query
@@ -44,29 +45,49 @@ func (store *Store) GetOwnedProfile(ctx context.Context, ownerID, profileID stri
 	return ProfileDetail{Profile: profile, HeadVersionID: headVersionID}, nil
 }
 
-// ListOwnedProfiles loads every Profile owned by ownerID, ordered by creation
-// time then ID.
-func (store *Store) ListOwnedProfiles(ctx context.Context, ownerID string) ([]ProfileDetail, error) {
+// ListOwnedProfiles loads a page of Profiles owned by ownerID, ordered by
+// creation time then ID (stable keyset pagination: identical created_at
+// values are disambiguated by id). cursor resumes immediately after a
+// previously returned position; nil selects the first page. pageSize is
+// clamped to (DefaultPageSize, MaxPageSize] via ClampPageSize. The returned
+// Cursor is non-nil exactly when another page follows.
+func (store *Store) ListOwnedProfiles(ctx context.Context, ownerID string, cursor *Cursor, pageSize int) ([]ProfileDetail, *Cursor, error) {
 	if strings.TrimSpace(ownerID) == "" {
-		return nil, errors.New("list owned Profiles: canonical owner User ID is required")
+		return nil, nil, errors.New("list owned Profiles: canonical owner User ID is required")
 	}
-	rows, err := store.queries.ListOwnedProfiles(ctx, ownerID)
+	pageSize = ClampPageSize(pageSize)
+	params := dbsql.ListOwnedProfilesParams{OwnerUserID: ownerID, RowLimit: int32(pageSize + 1)}
+	if cursor != nil {
+		params.HasCursor = true
+		params.CursorCreatedAt = pgtype.Timestamptz{Time: cursor.CreatedAt, Valid: true}
+		params.CursorID = cursor.ID
+	}
+	rows, err := store.queries.ListOwnedProfiles(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("list owned Profiles: %w", err)
+		return nil, nil, fmt.Errorf("list owned Profiles: %w", err)
+	}
+	var nextCursor *Cursor
+	if len(rows) > pageSize {
+		last := rows[pageSize-1]
+		if !last.CreatedAt.Valid {
+			return nil, nil, errors.New("list owned Profiles: database returned invalid creation time")
+		}
+		nextCursor = &Cursor{CreatedAt: last.CreatedAt.Time, ID: last.ID}
+		rows = rows[:pageSize]
 	}
 	details := make([]ProfileDetail, len(rows))
 	for index, row := range rows {
 		profile, err := restoreProfile(row.ID, row.OwnerUserID, row.Name, row.Slug, row.CreatedAt, row.ArchivedAt)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		headVersionID, err := store.profileHeadVersionID(ctx, row.ID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		details[index] = ProfileDetail{Profile: profile, HeadVersionID: headVersionID}
 	}
-	return details, nil
+	return details, nextCursor, nil
 }
 
 func (store *Store) profileHeadVersionID(ctx context.Context, profileID string) (*string, error) {

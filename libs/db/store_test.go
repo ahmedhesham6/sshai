@@ -448,8 +448,21 @@ func insertCreationPrerequisites(t *testing.T, ctx context.Context, pool *pgxpoo
 
 func newEnvironmentCreation(t *testing.T, environmentID, policyID, operationID string, input []byte, createdAt time.Time) domain.EnvironmentCreation {
 	t.Helper()
+	return newEnvironmentCreationWithSeed(t, environmentID, policyID, operationID, "project-seed-1", "workspace", "request-key-0001", input, createdAt)
+}
+
+// newEnvironmentCreationWithSeed is newEnvironmentCreation generalized to a
+// caller-chosen Project Seed ID, Slug, and idempotency key, for tests that
+// reserve more than one Environment for the same owner:
+// project_seeds.environment_id and environments' (owner_user_id, slug) are
+// both unique, so every Environment beyond the first needs its own Project
+// Seed row and Slug; every Environment also needs its own idempotency key,
+// since ReserveEnvironmentCreation treats a repeated key as a replay of the
+// first Environment it reserved.
+func newEnvironmentCreationWithSeed(t *testing.T, environmentID, policyID, operationID, projectSeedID, slug, idempotencyKey string, input []byte, createdAt time.Time) domain.EnvironmentCreation {
+	t.Helper()
 	environment, err := domain.ReserveEnvironment(domain.EnvironmentReservation{
-		ID: environmentID, OwnerUserID: "user-1", Name: "Workspace", Slug: "workspace", Region: "us-east-1",
+		ID: environmentID, OwnerUserID: "user-1", Name: "Workspace", Slug: slug, Region: "us-east-1",
 		AvailabilityZone: "us-east-1a", RuntimePreset: "standard", PinnedProfileVersionID: "profile-version-1",
 		AutoStopPolicyID: policyID, CreatedAt: createdAt,
 	})
@@ -462,13 +475,13 @@ func newEnvironmentCreation(t *testing.T, environmentID, policyID, operationID s
 	}
 	operation, err := domain.QueueOperation(domain.OperationRequest{
 		ID: operationID, EnvironmentID: environmentID, Type: domain.OperationEnvironmentCreate,
-		RequestedByUserID: "user-1", IdempotencyKey: "request-key-0001",
+		RequestedByUserID: "user-1", IdempotencyKey: idempotencyKey,
 		Input: input, CreatedAt: createdAt,
 	})
 	if err != nil {
 		t.Fatalf("queue domain Operation: %v", err)
 	}
-	creation, err := domain.NewEnvironmentCreation(environment, policy, operation, "project-seed-1", []string{"ssh-key-1"})
+	creation, err := domain.NewEnvironmentCreation(environment, policy, operation, projectSeedID, []string{"ssh-key-1"})
 	if err != nil {
 		t.Fatalf("create domain Environment reservation: %v", err)
 	}

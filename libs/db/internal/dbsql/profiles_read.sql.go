@@ -7,6 +7,8 @@ package dbsql
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const getOwnedProfile = `-- name: GetOwnedProfile :one
@@ -79,11 +81,35 @@ const listOwnedProfiles = `-- name: ListOwnedProfiles :many
 SELECT id, owner_user_id, name, slug, created_at, archived_at
 FROM profiles
 WHERE owner_user_id = $1
+  AND (
+    NOT $2::bool
+    OR (created_at, id) > ($3::timestamptz, $4::text)
+  )
 ORDER BY created_at, id
+LIMIT $5::int
 `
 
-func (q *Queries) ListOwnedProfiles(ctx context.Context, ownerUserID string) ([]Profile, error) {
-	rows, err := q.db.Query(ctx, listOwnedProfiles, ownerUserID)
+type ListOwnedProfilesParams struct {
+	OwnerUserID     string
+	HasCursor       bool
+	CursorCreatedAt pgtype.Timestamptz
+	CursorID        string
+	RowLimit        int32
+}
+
+// Keyset pagination: rows are ordered by (created_at, id), the same tuple
+// the WHERE predicate compares against the caller's decoded cursor. Passing
+// has_cursor = false selects the first page; row_limit is the caller's
+// effective page size plus one, letting the store detect a next page
+// without a second round trip.
+func (q *Queries) ListOwnedProfiles(ctx context.Context, arg ListOwnedProfilesParams) ([]Profile, error) {
+	rows, err := q.db.Query(ctx, listOwnedProfiles,
+		arg.OwnerUserID,
+		arg.HasCursor,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -8,13 +8,18 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/db"
 )
 
-func (server *server) ListProfiles(response http.ResponseWriter, request *http.Request, _ contracts.ListProfilesParams) {
+func (server *server) ListProfiles(response http.ResponseWriter, request *http.Request, params contracts.ListProfilesParams) {
 	user, present := userFromContext(request.Context())
 	if !present {
 		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
 		return
 	}
-	details, err := server.profileReads.ListOwnedProfiles(request.Context(), user.ID)
+	cursor, pageSize, ok := decodePageParams(params.Cursor, params.PageSize)
+	if !ok {
+		writeInvalidCursor(response, request)
+		return
+	}
+	details, nextCursor, err := server.profileReads.ListOwnedProfiles(request.Context(), user.ID, cursor, pageSize)
 	if err != nil {
 		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "Profiles could not be listed safely.")
 		return
@@ -23,9 +28,14 @@ func (server *server) ListProfiles(response http.ResponseWriter, request *http.R
 	for index, detail := range details {
 		items[index] = profileSummaryResponse(detail)
 	}
+	page := contracts.ProfilePage{Items: items}
+	if nextCursor != nil {
+		encoded := db.EncodeCursor(*nextCursor)
+		page.NextCursor = &encoded
+	}
 	result := contracts.ListProfiles200JSONResponse{
 		Headers: contracts.ListProfiles200ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
-		Body:    contracts.ProfilePage{Items: items},
+		Body:    page,
 	}
 	if err := result.VisitListProfilesResponse(response); err != nil {
 		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")

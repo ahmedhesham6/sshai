@@ -8,13 +8,18 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/db"
 )
 
-func (server *server) ListEnvironments(response http.ResponseWriter, request *http.Request, _ contracts.ListEnvironmentsParams) {
+func (server *server) ListEnvironments(response http.ResponseWriter, request *http.Request, params contracts.ListEnvironmentsParams) {
 	user, present := userFromContext(request.Context())
 	if !present {
 		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
 		return
 	}
-	details, err := server.environmentReads.ListOwnedEnvironments(request.Context(), user.ID)
+	cursor, pageSize, ok := decodePageParams(params.Cursor, params.PageSize)
+	if !ok {
+		writeInvalidCursor(response, request)
+		return
+	}
+	details, nextCursor, err := server.environmentReads.ListOwnedEnvironments(request.Context(), user.ID, cursor, pageSize)
 	if err != nil {
 		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "Environments could not be listed safely.")
 		return
@@ -23,9 +28,14 @@ func (server *server) ListEnvironments(response http.ResponseWriter, request *ht
 	for index, detail := range details {
 		items[index] = environmentResponse(detail)
 	}
+	page := contracts.EnvironmentPage{Items: items}
+	if nextCursor != nil {
+		encoded := db.EncodeCursor(*nextCursor)
+		page.NextCursor = &encoded
+	}
 	result := contracts.ListEnvironments200JSONResponse{
 		Headers: contracts.ListEnvironments200ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
-		Body:    contracts.EnvironmentPage{Items: items},
+		Body:    page,
 	}
 	if err := result.VisitListEnvironmentsResponse(response); err != nil {
 		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
@@ -56,13 +66,18 @@ func (server *server) GetEnvironment(response http.ResponseWriter, request *http
 	}
 }
 
-func (server *server) ListEnvironmentEvents(response http.ResponseWriter, request *http.Request, environmentID contracts.EnvironmentID, _ contracts.ListEnvironmentEventsParams) {
+func (server *server) ListEnvironmentEvents(response http.ResponseWriter, request *http.Request, environmentID contracts.EnvironmentID, params contracts.ListEnvironmentEventsParams) {
 	user, present := userFromContext(request.Context())
 	if !present {
 		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
 		return
 	}
-	events, err := server.environmentReads.ListOwnedEnvironmentEvents(request.Context(), user.ID, string(environmentID))
+	cursor, pageSize, ok := decodePageParams(params.Cursor, params.PageSize)
+	if !ok {
+		writeInvalidCursor(response, request)
+		return
+	}
+	events, nextCursor, err := server.environmentReads.ListOwnedEnvironmentEvents(request.Context(), user.ID, string(environmentID), cursor, pageSize)
 	if err != nil {
 		if errors.Is(err, db.ErrReferenceNotOwned) {
 			writeError(response, request, http.StatusNotFound, "ENVIRONMENT_NOT_FOUND", "The Environment was not found.")
@@ -78,9 +93,14 @@ func (server *server) ListEnvironmentEvents(response http.ResponseWriter, reques
 			Type: event.Type, Summary: event.Summary, CreatedAt: event.CreatedAt,
 		}
 	}
+	page := contracts.EnvironmentEventPage{Items: items}
+	if nextCursor != nil {
+		encoded := db.EncodeCursor(*nextCursor)
+		page.NextCursor = &encoded
+	}
 	result := contracts.ListEnvironmentEvents200JSONResponse{
 		Headers: contracts.ListEnvironmentEvents200ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
-		Body:    contracts.EnvironmentEventPage{Items: items},
+		Body:    page,
 	}
 	if err := result.VisitListEnvironmentEventsResponse(response); err != nil {
 		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")

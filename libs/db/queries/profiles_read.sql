@@ -4,10 +4,20 @@ FROM profiles
 WHERE id = sqlc.arg(profile_id) AND owner_user_id = sqlc.arg(owner_user_id);
 
 -- name: ListOwnedProfiles :many
+-- Keyset pagination: rows are ordered by (created_at, id), the same tuple
+-- the WHERE predicate compares against the caller's decoded cursor. Passing
+-- has_cursor = false selects the first page; row_limit is the caller's
+-- effective page size plus one, letting the store detect a next page
+-- without a second round trip.
 SELECT id, owner_user_id, name, slug, created_at, archived_at
 FROM profiles
 WHERE owner_user_id = sqlc.arg(owner_user_id)
-ORDER BY created_at, id;
+  AND (
+    NOT sqlc.arg(has_cursor)::bool
+    OR (created_at, id) > (sqlc.arg(cursor_created_at)::timestamptz, sqlc.arg(cursor_id)::text)
+  )
+ORDER BY created_at, id
+LIMIT sqlc.arg(row_limit)::int;
 
 -- name: GetProfileHeadVersionID :one
 SELECT pv.id

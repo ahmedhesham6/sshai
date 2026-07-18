@@ -46,11 +46,13 @@ type CapsuleObjectOwnership interface {
 
 // EnvironmentReader serves owner-scoped Environment read models: single
 // Environment lookups, full listings, and an Environment's Operation
-// timeline.
+// timeline. The listings are keyset-paginated: a nil cursor selects the
+// first page, and the returned Cursor is non-nil exactly when another page
+// follows.
 type EnvironmentReader interface {
 	GetOwnedEnvironment(context.Context, string, string) (db.EnvironmentDetail, error)
-	ListOwnedEnvironments(context.Context, string) ([]db.EnvironmentDetail, error)
-	ListOwnedEnvironmentEvents(context.Context, string, string) ([]db.EnvironmentEvent, error)
+	ListOwnedEnvironments(ctx context.Context, ownerID string, cursor *db.Cursor, pageSize int) ([]db.EnvironmentDetail, *db.Cursor, error)
+	ListOwnedEnvironmentEvents(ctx context.Context, ownerID, environmentID string, cursor *db.Cursor, pageSize int) ([]db.EnvironmentEvent, *db.Cursor, error)
 }
 
 // OperationReader serves owner-scoped Operation read models.
@@ -59,10 +61,12 @@ type OperationReader interface {
 }
 
 // ProfileReader serves owner-scoped Profile read models: single Profile
-// lookups, full listings, and immutable Profile Version lookups.
+// lookups, full listings, and immutable Profile Version lookups. The
+// listing is keyset-paginated: a nil cursor selects the first page, and the
+// returned Cursor is non-nil exactly when another page follows.
 type ProfileReader interface {
 	GetOwnedProfile(context.Context, string, string) (db.ProfileDetail, error)
-	ListOwnedProfiles(context.Context, string) ([]db.ProfileDetail, error)
+	ListOwnedProfiles(ctx context.Context, ownerID string, cursor *db.Cursor, pageSize int) ([]db.ProfileDetail, *db.Cursor, error)
 	GetOwnedProfileVersion(context.Context, string, string) (domain.ProfileVersion, error)
 }
 

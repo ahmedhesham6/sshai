@@ -154,8 +154,21 @@ JOIN auto_stop_policies p ON p.environment_id = e.id
 LEFT JOIN operations active_op
     ON active_op.environment_id = e.id AND active_op.status IN ('queued', 'running')
 WHERE e.owner_user_id = $1
+  AND (
+    NOT $2::bool
+    OR (e.created_at, e.id) > ($3::timestamptz, $4::text)
+  )
 ORDER BY e.created_at, e.id
+LIMIT $5::int
 `
+
+type ListOwnedEnvironmentDetailsParams struct {
+	OwnerUserID     string
+	HasCursor       bool
+	CursorCreatedAt pgtype.Timestamptz
+	CursorID        string
+	RowLimit        int32
+}
 
 type ListOwnedEnvironmentDetailsRow struct {
 	ID                          string
@@ -181,8 +194,19 @@ type ListOwnedEnvironmentDetailsRow struct {
 	ActiveOperationID           *string
 }
 
-func (q *Queries) ListOwnedEnvironmentDetails(ctx context.Context, ownerUserID string) ([]ListOwnedEnvironmentDetailsRow, error) {
-	rows, err := q.db.Query(ctx, listOwnedEnvironmentDetails, ownerUserID)
+// Keyset pagination: rows are ordered by (e.created_at, e.id), the same
+// tuple the WHERE predicate compares against the caller's decoded cursor.
+// Passing has_cursor = false selects the first page; row_limit is the
+// caller's effective page size plus one, letting the store detect a next
+// page without a second round trip.
+func (q *Queries) ListOwnedEnvironmentDetails(ctx context.Context, arg ListOwnedEnvironmentDetailsParams) ([]ListOwnedEnvironmentDetailsRow, error) {
+	rows, err := q.db.Query(ctx, listOwnedEnvironmentDetails,
+		arg.OwnerUserID,
+		arg.HasCursor,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

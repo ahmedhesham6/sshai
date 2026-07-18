@@ -3,6 +3,8 @@ package db_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -185,7 +187,7 @@ func TestStoreListsOnlyOwnedEnvironmentsOrderedByCreation(t *testing.T) {
 		t.Fatalf("reserve foreign Environment: %v", err)
 	}
 
-	details, err := store.ListOwnedEnvironments(ctx, "user-1")
+	details, nextCursor, err := store.ListOwnedEnvironments(ctx, "user-1", nil, 0)
 	if err != nil {
 		t.Fatalf("list owned Environments: %v", err)
 	}
@@ -194,6 +196,122 @@ func TestStoreListsOnlyOwnedEnvironmentsOrderedByCreation(t *testing.T) {
 	}
 	if details[0].Environment.Snapshot().ID != "environment-1" || details[1].Environment.Snapshot().ID != "environment-2" {
 		t.Fatalf("owned Environment order = %#v", []string{details[0].Environment.Snapshot().ID, details[1].Environment.Snapshot().ID})
+	}
+	if nextCursor != nil {
+		t.Fatalf("next cursor = %#v, want nil once every owned Environment fits on the page", nextCursor)
+	}
+}
+
+// TestStorePaginatesOwnedEnvironmentsWithStableKeysetWalk confirms the
+// keyset contract Finding 1 requires: paging through with a small page size
+// visits every owned Environment exactly once, in creation order, with no
+// overlap or gaps, and replaying the same request is stable.
+func TestStorePaginatesOwnedEnvironmentsWithStableKeysetWalk(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	insertCreationPrerequisites(t, ctx, pool)
+	createdAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	// project_seeds.environment_id is UNIQUE, so every Environment needs its
+	// own Project Seed; project-seed-1 already exists via
+	// insertCreationPrerequisites for environment-1.
+	for index := 2; index <= 5; index++ {
+		suffix := fmt.Sprintf("%d", index)
+		if _, err := pool.Exec(ctx, `INSERT INTO project_seeds (id, owner_user_id, repository_url, base_revision, digest, manifest_digest) VALUES ($1, 'user-1', 'https://github.com/example/project.git', 'abc123', $2, $3)`,
+			"project-seed-"+suffix, digest(byte('0'+index)), digest('b')); err != nil {
+			t.Fatalf("insert Project Seed %d: %v", index, err)
+		}
+	}
+	for index := 0; index < 5; index++ {
+		suffix := fmt.Sprintf("%d", index+1)
+		creation := newEnvironmentCreationWithSeed(t, "environment-"+suffix, "policy-"+suffix, "operation-"+suffix,
+			"project-seed-"+suffix, "workspace-"+suffix, "request-key-"+suffix, []byte(`{}`), createdAt.Add(time.Duration(index)*time.Minute))
+		if _, err := store.ReserveEnvironmentCreation(ctx, creation); err != nil {
+			t.Fatalf("reserve Environment %d: %v", index, err)
+		}
+	}
+
+	var cursor *dbstore.Cursor
+	var seen []string
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatal("paginated more than 10 times walking 5 Environments with page size 2; likely stuck in a loop")
+		}
+		details, next, err := store.ListOwnedEnvironments(ctx, "user-1", cursor, 2)
+		if err != nil {
+			t.Fatalf("list owned Environments page %d: %v", pages, err)
+		}
+		for _, detail := range details {
+			seen = append(seen, detail.Environment.Snapshot().ID)
+		}
+		if next == nil {
+			break
+		}
+		cursor = next
+	}
+	want := []string{"environment-1", "environment-2", "environment-3", "environment-4", "environment-5"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("paginated owned Environment IDs = %#v, want %#v", seen, want)
+	}
+
+	replay, replayNext, err := store.ListOwnedEnvironments(ctx, "user-1", nil, 2)
+	if err != nil {
+		t.Fatalf("replay first page: %v", err)
+	}
+	if len(replay) != 2 || replay[0].Environment.Snapshot().ID != "environment-1" || replay[1].Environment.Snapshot().ID != "environment-2" {
+		t.Fatalf("replayed first page = %#v", replay)
+	}
+	if replayNext == nil {
+		t.Fatal("replayed first page next cursor = nil, want non-nil (3 Environments remain)")
+	}
+}
+
+// TestStorePaginatesOwnedEnvironmentsDisambiguatingIdenticalCreatedAt
+// confirms the keyset boundary case: Environments sharing the exact same
+// created_at are still split across pages deterministically, ordered and
+// disambiguated by id, with neither a skip nor a duplicate at the boundary.
+func TestStorePaginatesOwnedEnvironmentsDisambiguatingIdenticalCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	insertCreationPrerequisites(t, ctx, pool)
+	createdAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	for _, suffix := range []string{"2", "3"} {
+		if _, err := pool.Exec(ctx, `INSERT INTO project_seeds (id, owner_user_id, repository_url, base_revision, digest, manifest_digest) VALUES ($1, 'user-1', 'https://github.com/example/project.git', 'abc123', $2, $3)`,
+			"project-seed-"+suffix, digest(suffix[0]), digest('b')); err != nil {
+			t.Fatalf("insert Project Seed %s: %v", suffix, err)
+		}
+	}
+	// All three Environments share the same created_at; only id can order them.
+	for _, spec := range []struct{ id, projectSeedID string }{
+		{"environment-a", "project-seed-1"},
+		{"environment-b", "project-seed-2"},
+		{"environment-c", "project-seed-3"},
+	} {
+		creation := newEnvironmentCreationWithSeed(t, spec.id, "policy-"+spec.id, "operation-"+spec.id, spec.projectSeedID, "workspace-"+spec.id, "request-key-"+spec.id, []byte(`{}`), createdAt)
+		if _, err := store.ReserveEnvironmentCreation(ctx, creation); err != nil {
+			t.Fatalf("reserve Environment %q: %v", spec.id, err)
+		}
+	}
+
+	first, cursor, err := store.ListOwnedEnvironments(ctx, "user-1", nil, 2)
+	if err != nil {
+		t.Fatalf("list first page: %v", err)
+	}
+	if len(first) != 2 || first[0].Environment.Snapshot().ID != "environment-a" || first[1].Environment.Snapshot().ID != "environment-b" {
+		t.Fatalf("first page = %#v, want [environment-a environment-b] ordered by id under a shared created_at", first)
+	}
+	if cursor == nil || cursor.ID != "environment-b" {
+		t.Fatalf("cursor after first page = %#v, want it to key off environment-b", cursor)
+	}
+
+	second, secondCursor, err := store.ListOwnedEnvironments(ctx, "user-1", cursor, 2)
+	if err != nil {
+		t.Fatalf("list second page: %v", err)
+	}
+	if len(second) != 1 || second[0].Environment.Snapshot().ID != "environment-c" {
+		t.Fatalf("second page = %#v, want exactly [environment-c] (no duplicate, no skip at the boundary)", second)
+	}
+	if secondCursor != nil {
+		t.Fatalf("cursor after final page = %#v, want nil", secondCursor)
 	}
 }
 

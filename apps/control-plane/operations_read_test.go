@@ -24,7 +24,7 @@ func TestGetOperationHTTPReportsOwnedOperationWithSteps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("queue domain Operation: %v", err)
 	}
-	reads := &operationReaderFake{operations: map[string]db.OperationDetail{
+	reads := &operationReaderFake{expectedOwnerID: "user-1", operations: map[string]db.OperationDetail{
 		"operation-1": {Operation: operation, Steps: []db.OperationStepProjection{{StepKey: "reserve", Status: "running", Summary: "Reserve Environment"}}},
 	}}
 	handler := operationReadHandler(reads, []string{"request-get"})
@@ -49,7 +49,7 @@ func TestGetOperationHTTPReportsOwnedOperationWithSteps(t *testing.T) {
 }
 
 func TestGetOperationHTTPHidesForeignOperation(t *testing.T) {
-	reads := &operationReaderFake{}
+	reads := &operationReaderFake{expectedOwnerID: "user-1"}
 	handler := operationReadHandler(reads, []string{"request-foreign"})
 
 	response := serveOperationReadRequest(handler, "/v1/operations/missing-operation")
@@ -74,11 +74,15 @@ func serveOperationReadRequest(handler http.Handler, path string) *httptest.Resp
 }
 
 type operationReaderFake struct {
-	operations map[string]db.OperationDetail
-	err        error
+	expectedOwnerID string
+	operations      map[string]db.OperationDetail
+	err             error
 }
 
-func (fake *operationReaderFake) GetOwnedOperation(_ context.Context, _, operationID string) (db.OperationDetail, error) {
+func (fake *operationReaderFake) GetOwnedOperation(_ context.Context, ownerID, operationID string) (db.OperationDetail, error) {
+	if err := requireOwner("GetOwnedOperation", ownerID, fake.expectedOwnerID); err != nil {
+		return db.OperationDetail{}, err
+	}
 	if fake.err != nil {
 		return db.OperationDetail{}, fake.err
 	}
