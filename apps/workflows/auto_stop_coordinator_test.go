@@ -96,7 +96,7 @@ func TestAutoStopCoordinatorExpiryRequiresFreshCurrentSnapshotAndDispatchesOnce(
 		RuntimeID: "runtime-1", Generation: freshGeneration,
 		Observation: observation(policy, 7, activity(now.Add(5*time.Second), 14)),
 	})
-	if expired.Stop == nil || expired.Stop.Reason != workflows.RuntimeStopReasonAutoStop || expired.Stop.RuntimeID != "runtime-1" || expired.Stop.IdempotencyKey == "" {
+	if expired.Stop == nil || expired.Stop.Reason != domain.RuntimeStopAutoStop || expired.Stop.RuntimeID != "runtime-1" || expired.Stop.IdempotencyKey == "" {
 		t.Fatalf("fresh expiry = %#v", expired)
 	}
 	replayed := expire(t, coordinator, expired.State, workflows.AutoStopExpiry{
@@ -125,6 +125,32 @@ func TestAutoStopCoordinatorSuppressesConflictAndRejectsStaleRuntimeExpiry(t *te
 	})
 	if wrongRuntime.Stop != nil {
 		t.Fatalf("stale Runtime expiry dispatched: %#v", wrongRuntime)
+	}
+}
+
+func TestAutoStopCoordinatorSuppressesUntilTheRuntimeResumes(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	policy := mustAutoStopPolicy(t, domain.AutoStopWhenDisconnected, 60)
+	coordinator := workflows.AutoStopCoordinator{}
+	started := observe(t, coordinator, workflows.AutoStopCoordinationState{EnvironmentID: "environment-1"}, observation(policy, 1, activity(now, 1)))
+	suppressed, err := coordinator.Suppress(started.State, "runtime-1")
+	if err != nil {
+		t.Fatalf("Suppress(): %v", err)
+	}
+	if !suppressed.Cancelled || suppressed.State.TimerPending || suppressed.State.SuppressedRuntimeID != "runtime-1" {
+		t.Fatalf("suppressed transition = %#v", suppressed)
+	}
+	ignored := observe(t, coordinator, suppressed.State, observation(policy, 1, activity(now.Add(time.Second), 2)))
+	if ignored.Timer != nil || ignored.State.TimerPending {
+		t.Fatalf("suppressed observation scheduled timer: %#v", ignored)
+	}
+	resumed, err := coordinator.Resume(ignored.State, "runtime-1")
+	if err != nil {
+		t.Fatalf("Resume(): %v", err)
+	}
+	restarted := observe(t, coordinator, resumed.State, observation(policy, 1, activity(now.Add(2*time.Second), 3)))
+	if restarted.Timer == nil || !restarted.State.TimerPending || restarted.State.SuppressedRuntimeID != "" {
+		t.Fatalf("resumed transition = %#v", restarted)
 	}
 }
 

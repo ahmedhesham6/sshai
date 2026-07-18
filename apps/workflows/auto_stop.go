@@ -10,10 +10,12 @@ import (
 )
 
 const (
-	AutoStopService        = "EnvironmentAutoStop"
-	AutoStopObserveHandler = "Observe"
-	AutoStopExpireHandler  = "Expire"
-	autoStopStateKey       = "coordination"
+	AutoStopService         = "EnvironmentAutoStop"
+	AutoStopObserveHandler  = "Observe"
+	AutoStopExpireHandler   = "Expire"
+	AutoStopSuppressHandler = "Suppress"
+	AutoStopResumeHandler   = "Resume"
+	autoStopStateKey        = "coordination"
 )
 
 type AutoStopRefreshRequest struct {
@@ -25,6 +27,15 @@ type AutoStopRefreshRequest struct {
 
 type AutoStopSnapshotSource interface {
 	RefreshAutoStop(context.Context, AutoStopRefreshRequest) (AutoStopObservation, error)
+}
+
+type AutoStopRuntimeRequest struct {
+	RuntimeID string `json:"runtimeId"`
+}
+
+type RuntimeAutoStopController interface {
+	SuppressAutoStop(context.Context, string, string) error
+	ResumeAutoStop(context.Context, string, string) error
 }
 
 type RuntimeStopDispatcher interface {
@@ -40,7 +51,46 @@ func AutoStopDefinition(source AutoStopSnapshotSource, dispatcher RuntimeStopDis
 	object := &autoStopObject{source: source, dispatcher: dispatcher}
 	return restate.NewObject(AutoStopService).
 		Handler(AutoStopObserveHandler, restate.NewObjectHandler(object.Observe)).
-		Handler(AutoStopExpireHandler, restate.NewObjectHandler(object.Expire))
+		Handler(AutoStopExpireHandler, restate.NewObjectHandler(object.Expire)).
+		Handler(AutoStopSuppressHandler, restate.NewObjectHandler(object.Suppress)).
+		Handler(AutoStopResumeHandler, restate.NewObjectHandler(object.Resume))
+}
+
+func (object *autoStopObject) Suppress(ctx restate.ObjectContext, input AutoStopRuntimeRequest) (AutoStopTransition, error) {
+	state, err := object.coordinationState(ctx)
+	if err != nil {
+		return AutoStopTransition{}, err
+	}
+	transition, err := (AutoStopCoordinator{}).Suppress(state, input.RuntimeID)
+	if err != nil {
+		return AutoStopTransition{}, restate.TerminalErrorf("invalid Auto-stop suppression: %v", err)
+	}
+	restate.Set(ctx, autoStopStateKey, transition.State)
+	return transition, nil
+}
+
+func (object *autoStopObject) Resume(ctx restate.ObjectContext, input AutoStopRuntimeRequest) (AutoStopTransition, error) {
+	state, err := object.coordinationState(ctx)
+	if err != nil {
+		return AutoStopTransition{}, err
+	}
+	transition, err := (AutoStopCoordinator{}).Resume(state, input.RuntimeID)
+	if err != nil {
+		return AutoStopTransition{}, restate.TerminalErrorf("invalid Auto-stop resume: %v", err)
+	}
+	restate.Set(ctx, autoStopStateKey, transition.State)
+	return transition, nil
+}
+
+func (*autoStopObject) coordinationState(ctx restate.ObjectContext) (AutoStopCoordinationState, error) {
+	state, err := restate.Get[AutoStopCoordinationState](ctx, autoStopStateKey)
+	if err != nil {
+		return AutoStopCoordinationState{}, err
+	}
+	if state.EnvironmentID == "" {
+		state.EnvironmentID = restate.Key(ctx)
+	}
+	return state, nil
 }
 
 func (object *autoStopObject) Observe(ctx restate.ObjectContext, input AutoStopObservation) (AutoStopTransition, error) {
@@ -117,5 +167,19 @@ func (client *Client) SendAutoStopObservation(ctx context.Context, environmentID
 	_, err := ingress.ObjectSend[AutoStopObservation](
 		client.ingress, AutoStopService, environmentID, AutoStopObserveHandler,
 	).Send(ctx, input, restate.WithIdempotencyKey(idempotencyKey))
+	return err
+}
+
+func (client *Client) SuppressAutoStop(ctx context.Context, environmentID, runtimeID string) error {
+	_, err := ingress.Object[AutoStopRuntimeRequest, AutoStopTransition](
+		client.ingress, AutoStopService, environmentID, AutoStopSuppressHandler,
+	).Request(ctx, AutoStopRuntimeRequest{RuntimeID: runtimeID})
+	return err
+}
+
+func (client *Client) ResumeAutoStop(ctx context.Context, environmentID, runtimeID string) error {
+	_, err := ingress.Object[AutoStopRuntimeRequest, AutoStopTransition](
+		client.ingress, AutoStopService, environmentID, AutoStopResumeHandler,
+	).Request(ctx, AutoStopRuntimeRequest{RuntimeID: runtimeID})
 	return err
 }

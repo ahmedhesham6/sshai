@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -41,7 +42,13 @@ func (service *RuntimeCommandService) StartRuntime(ctx context.Context, input Ru
 }
 
 func (service *RuntimeCommandService) StopRuntime(ctx context.Context, input RuntimeCommandInput) (domain.EnvironmentRuntimeOperation, error) {
-	return service.commandRuntime(ctx, input, domain.OperationRuntimeStop, []byte(`{"reason":"manual"}`))
+	canonicalInput, err := json.Marshal(struct {
+		Reason domain.RuntimeStopReason `json:"reason"`
+	}{Reason: domain.RuntimeStopManual})
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, err
+	}
+	return service.commandRuntime(ctx, input, domain.OperationRuntimeStop, canonicalInput)
 }
 
 func (service *RuntimeCommandService) ReplaceRuntime(ctx context.Context, input RuntimeCommandInput) (domain.EnvironmentRuntimeOperation, error) {

@@ -25,7 +25,7 @@ func TestStoreReadsOnlyPendingRuntimeOperationWithPersistedTarget(t *testing.T) 
 		t.Fatalf("read pending Runtime Operation: %v", err)
 	}
 	if !pending || dispatch.OperationID != "operation-1" || dispatch.OperationType != domain.OperationRuntimeStart ||
-		dispatch.EnvironmentID != "environment-1" || dispatch.RuntimeID != "runtime-1" {
+		dispatch.EnvironmentID != "environment-1" || dispatch.RuntimeID != "runtime-1" || dispatch.OwnerUserID != "user-1" || dispatch.StopReason != "" {
 		t.Fatalf("pending Runtime Operation = %#v pending:%t", dispatch, pending)
 	}
 
@@ -107,7 +107,8 @@ func TestStoreListsPendingRuntimeOperationsInDeterministicBatches(t *testing.T) 
 		t.Fatalf("read remaining pending Runtime Operations: %v", err)
 	}
 	if len(dispatches) != 1 || dispatches[0].OperationID != "operation-2" ||
-		dispatches[0].OperationType != domain.OperationRuntimeStop || dispatches[0].RuntimeID != "runtime-1" {
+		dispatches[0].OperationType != domain.OperationRuntimeStop || dispatches[0].RuntimeID != "runtime-1" ||
+		dispatches[0].OwnerUserID != "user-1" || dispatches[0].StopReason != domain.RuntimeStopManual {
 		t.Fatalf("remaining pending Runtime Operations = %#v", dispatches)
 	}
 	if _, err := store.PendingRuntimeOperations(ctx, 0); err == nil {

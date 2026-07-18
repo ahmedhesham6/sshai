@@ -32,7 +32,7 @@ func TestAutoStopObjectRefreshesAtExpiryAndDispatchesOneIdempotentStop(t *testin
 	}
 	select {
 	case request := <-dispatcher.requests:
-		if request.EnvironmentID != "environment-1" || request.RuntimeID != "runtime-1" || request.Reason != workflows.RuntimeStopReasonAutoStop || request.IdempotencyKey == "" {
+		if request.EnvironmentID != "environment-1" || request.RuntimeID != "runtime-1" || request.Reason != domain.RuntimeStopAutoStop || request.IdempotencyKey == "" {
 			t.Fatalf("Runtime stop request = %#v", request)
 		}
 	case <-time.After(20 * time.Second):

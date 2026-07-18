@@ -19,6 +19,7 @@ type AutoStopCoordinationState struct {
 	TimerPending         bool
 	LastSnapshotSequence uint64
 	DispatchedGeneration uint64
+	SuppressedRuntimeID  string
 }
 
 type AutoStopObservation struct {
@@ -39,11 +40,9 @@ type AutoStopTimer struct {
 type RuntimeStopRequest struct {
 	EnvironmentID  string
 	RuntimeID      string
-	Reason         string
+	Reason         domain.RuntimeStopReason
 	IdempotencyKey string
 }
-
-const RuntimeStopReasonAutoStop = "auto_stop"
 
 type AutoStopTransition struct {
 	State     AutoStopCoordinationState
@@ -61,6 +60,30 @@ type AutoStopExpiry struct {
 
 type AutoStopCoordinator struct{}
 
+func (AutoStopCoordinator) Suppress(state AutoStopCoordinationState, runtimeID string) (AutoStopTransition, error) {
+	if state.EnvironmentID == "" || runtimeID == "" {
+		return AutoStopTransition{}, errors.New("suppress Auto-stop: Environment and Runtime are required")
+	}
+	transition := AutoStopTransition{State: state, Cancelled: state.TimerPending}
+	if state.TimerPending {
+		transition.State.TimerGeneration++
+	}
+	transition.State.TimerPending = false
+	transition.State.SuppressedRuntimeID = runtimeID
+	return transition, nil
+}
+
+func (AutoStopCoordinator) Resume(state AutoStopCoordinationState, runtimeID string) (AutoStopTransition, error) {
+	if state.EnvironmentID == "" || runtimeID == "" {
+		return AutoStopTransition{}, errors.New("resume Auto-stop: Environment and Runtime are required")
+	}
+	transition := AutoStopTransition{State: state}
+	if state.SuppressedRuntimeID == runtimeID {
+		transition.State.SuppressedRuntimeID = ""
+	}
+	return transition, nil
+}
+
 func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation AutoStopObservation) (AutoStopTransition, error) {
 	transition := AutoStopTransition{State: state}
 	if coordinationChanged(state, observation) {
@@ -76,6 +99,17 @@ func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation 
 		transition.State.TimerPending = false
 		transition.State.LastSnapshotSequence = 0
 		transition.State.DispatchedGeneration = 0
+		if state.RuntimeID != observation.RuntimeID {
+			transition.State.SuppressedRuntimeID = ""
+		}
+	}
+	if transition.State.SuppressedRuntimeID == observation.RuntimeID {
+		if transition.State.TimerPending {
+			transition.Cancelled = true
+			transition.State.TimerGeneration++
+			transition.State.TimerPending = false
+		}
+		return transition, nil
 	}
 	decision, err := evaluateAutoStop(transition.State, observation)
 	if err != nil {
@@ -133,8 +167,8 @@ func (coordinator AutoStopCoordinator) Expire(state AutoStopCoordinationState, e
 	next.DispatchedGeneration = expiry.Generation
 	transition.State = next
 	transition.Stop = &RuntimeStopRequest{
-		EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID, Reason: RuntimeStopReasonAutoStop,
-		IdempotencyKey: fmt.Sprintf("runtime.stop:%s:%s:%s:%d", RuntimeStopReasonAutoStop, state.EnvironmentID, state.RuntimeID, expiry.Generation),
+		EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID, Reason: domain.RuntimeStopAutoStop,
+		IdempotencyKey: fmt.Sprintf("runtime.stop:%s:%s:%s:%d", domain.RuntimeStopAutoStop, state.EnvironmentID, state.RuntimeID, expiry.Generation),
 	}
 	return transition, nil
 }
