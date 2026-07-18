@@ -76,7 +76,7 @@ No step after data-volume creation may automatically delete the data volume as c
 1. Lock Environment command handling.
 2. Return success if current Runtime is already ready.
 3. Verify the stopped instance, data volume, image compatibility, and credit policy.
-4. Start EC2 with an idempotent provider request.
+4. If a newer promoted AMI exists for the region, fulfill the start as a `runtime.replace` onto the new image instead of restarting the old instance (ADR 0013); otherwise start EC2 with an idempotent provider request.
 5. Open the compute usage interval.
 6. Wait for current-boot guest readiness and mounted state.
 7. Reconcile public SSH keys and safe managed configuration.

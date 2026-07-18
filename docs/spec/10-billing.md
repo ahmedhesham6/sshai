@@ -97,4 +97,4 @@ Show:
 - projected remaining time for the selected Runtime Preset;
 - a link to the Polar customer portal.
 
-The zero-credit enforcement policy remains intentionally open and must be resolved before paid launch.
+Zero-credit enforcement for the private alpha (2026-07-18): new and resumed starts refuse with `CREDITS_POLICY_BLOCKED` when the Credit Balance is at or below zero; running compute is never force-stopped for billing reasons and may drive the balance slightly negative. The `billing policy` stop reason stays reserved for a future enforcement tier. This policy must be revisited before paid launch.

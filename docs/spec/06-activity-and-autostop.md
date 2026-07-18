@@ -17,6 +17,8 @@ Initial `AutoStopPolicy.mode` values:
 
 Every non-manual policy has a configurable grace period. The web and CLI display the exact predicate in plain language.
 
+Defaults (2026-07-18): new Environments get `when_fully_idle` with a 300-second grace period. The rationale is layered: running agents keep the machine up even when disconnected; once no agents remain, the Environment behaves like a plain SSH devbox and stops shortly after the last connection drops, with the grace period absorbing transient disconnects.
+
 ## Guest observation
 
 The guest supervisor periodically reports an `ActivitySnapshot` containing counts and bounded metadata, not arbitrary command lines or environment variables.
@@ -78,4 +80,4 @@ No selected agent processes detected.
 Runtime will stop in 10 minutes unless activity resumes.
 ```
 
-Exact default grace periods and polling cadence remain open implementation parameters.
+Operating parameters (2026-07-18): 60-second Activity Snapshot cadence; a snapshot older than 300 seconds is stale and blocks automatic stop. The grace period must never be configured below the snapshot cadence — idleness cannot be observed faster than it is reported.

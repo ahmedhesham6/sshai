@@ -37,8 +37,8 @@ Host api-dev
 ## SSH-key onboarding
 
 1. Discover existing `.pub` Ed25519 keys.
-2. Offer the user a selection.
-3. Recommend generating a dedicated `devm` Ed25519 key when no suitable key exists.
+2. Default selection (2026-07-18): exactly one key found → use it silently; multiple → pick the most-recently-used, print which, and offer an override flag. No interactive stall in the common path.
+3. Generate a dedicated `devm` Ed25519 key when no suitable key exists.
 4. Upload only the selected public key and fingerprint.
 5. Store the private-key path in local CLI configuration only.
 6. Materialize active public keys into the Environment during create/start reconciliation.

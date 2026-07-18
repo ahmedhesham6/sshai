@@ -47,16 +47,43 @@ protocol: worktree implementation → verification → quality-gate loop (Codex
 adversarial + /code-review high + /simplify) until zero verified findings →
 fetch-sync-merge-push.
 
+## Ratified rulings (2026-07-18 grilling session)
+
+All previously-parked product decisions on the E2E critical path are now
+ruled — see `docs/spec/18-decision-register.md` ("Amendments"), the updated
+`docs/spec/17-open-decisions.md`, and ADRs 0012/0013. Headlines binding the
+slices below:
+
+- **Order**: E2E first (S2 → S4 → S5 → S6), then breadth (S7–S13).
+- **Deploy as we go**: every slice verifies against live AWS in
+  `eu-central-1`/`eu-central-1a` before merging. Credentials (AWS, Restate
+  Cloud, WorkOS, Polar) arrive via user-provisioned `~/.sshai-deploy.env`
+  (0600); verify with smoke calls, never echo.
+- **Credits**: starts refuse at balance ≤ 0 (`CREDITS_POLICY_BLOCKED`);
+  never force-stop running compute in alpha.
+- **Auto-stop defaults**: `when_fully_idle`, 300s grace, 60s cadence, 300s
+  stale threshold. Guest unknown-process + cgroup signals pulled forward
+  into the S2 arc (IDE detection stays in S8).
+- **Sizing**: preset ladder `cpu2-mem8`…`cpu16-mem64` → m7i-flex;
+  user-configurable data volume (default 100 GiB, 20–500); system volume
+  30 GiB platform-owned.
+- **Images/agents**: weekly pinned AMI; upgrade-on-start (start→replace on
+  outdated AMI); home-first user tooling; system-path installs ephemeral
+  (ADR 0013).
+- **Tags**: Postgres tag index written by `capsule publish` (ADR 0012).
+- **Contract**: `capsuleLockId` nullable (regenerate Go + TS clients when
+  touching it); `@sshai/contracts` kept, wired in S11.
+
 | Slice | Title | Depends on | Status |
 |-------|-------|------------|--------|
 | S0 | Quick wins: DX docs (CLI env vars, dev loop, README quickstart); go.mod toolchain task dropped (redundant per Go tooling — pin lives in CI gate) | — | DONE (merged @ `f3ad56f`) |
 | S1 | Workflow-serving binary (`apps/workflows/cmd/workflows`) — re-scoped to BillingDelivery-only after discovering 3 of 4 services have test-fake-only dependencies (see matrix item 1) | — | DONE (merged @ `c26a20b`; recovered from executor session-limit death mid-run — work verified, committed, and landed by advisor) |
 | S1b | Production workflow dependencies — `CapsuleResolver` DONE (`b27e026`, digest-only; tag resolution = named product decision), `db.Store.LoadProfileResolveState` DONE (`70c7087`, merged @ `0eee07d`) | S1 | DONE (partial scope; remainder → S1c) |
 | S1c | Composition + prerequisites: production S3 GrantProvider (`libs/capsule/oci/s3grants.go`), read-only pin query (`libs/db/environment_create_pin.go`), `PinnedProfileVersionResolver` with full `ResolveCapsuleComposition` pipeline, EnvironmentCreate + ProfileResolve bound in cmd/workflows | S1b | DONE (merged @ `fc5bbb1`; full quality loop: review→REVISE (composition rules)→adversarial gate (0 live vulns, 2 MED hardening fixed, 2 LOW accepted with refutation)→12/12 tests) |
-| S2 | Runtime start/stop workflows + SendRuntimeOperation + control-plane wiring + API endpoints | S1, S1b (RuntimeStopDispatcher overlaps) | TODO |
+| S2 | Runtime start/stop workflows + SendRuntimeOperation + control-plane wiring + API endpoints. Amended scope (2026-07-18): + AutoStop production binding with ratified defaults, + guest unknown-process/cgroup signals, + compute-usage-interval open/close wiring, + credit-policy start check, + upgrade-on-start hook point (start→replace decision), toolchain reinstall first (machine currently has no Go) | S1, S1b; ReserveInitialRuntime landed — UNBLOCKED | TODO |
 | S3 | Read models: 9 GET endpoints (environments, profiles, operations, events, /me, /billing) | — | DONE (merged @ `3c713ab`; recovered from second executor session-limit death; gate: 0 authz findings, 3 LOW) |
 | S3b | Cursor pagination on the 3 collection endpoints (spec 09) + owner-assertion hardening in handler fakes. Pending maintainer decision: `capsuleLockId` empty-string sentinel vs nullable contract field | S3 | DONE (merged @ `c323143`, pushed; keyset pagination, contract-first, boundary-tested) |
-| S4 | environment.create steps 4–11 (EC2 provision/attach/network, guest boot, seed, materialize-from-workflow) | S1, S2 | TODO |
+| S4 | environment.create steps 4–11 (EC2 provision/attach/network, guest boot, seed, materialize-from-workflow). Amended scope (2026-07-18): + image-pipeline terraform module + eu-central-1 Packer build with pinned agents + ECS cluster/services terraform (deployment backbone; may start alongside S2) + user-space package managers preconfigured home-first in the AMI | S1, S2 | TODO |
 | S5 | Connection path: POST /connection-intents server side, proxy start-on-connect, CLI ssh config/include wiring | S2, S3 | TODO |
 | S6 | CLI lifecycle: bare `devm`, status, stop, delete, doctor, logout, profile noun, capsule publish/inspect/diff | S2, S3 | TODO |
 | S7 | Deletion safety flow (specs 05+11): disclosures, exact-name confirm, recent-auth, delete workflow | S1 | TODO |
@@ -67,9 +94,10 @@ fetch-sync-merge-push.
 | S12 | Hardening: sshd directives + image build gates + budget controls | — | TODO |
 | S13 | Observability: OTel wiring, spec-14 metrics, reconciliation drivers | S1 | TODO |
 
-Caution: S4 overlaps the user's parallel ReserveInitialRuntime WIP
-(environment_create*, libs/domain/environment.go, libs/db) — coordinate before
-dispatch; never start over uncommitted parallel changes.
+The ReserveInitialRuntime WIP landed before 2026-07-18 (tree verified clean;
+maintainer confirmed the whole critical-path surface is claimable) — the old
+S4-overlap caution is retired. Still never start a slice over uncommitted
+changes in its scope.
 
 ## Findings considered and rejected
 

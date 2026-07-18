@@ -29,14 +29,15 @@ Environment health is evaluated independently as `healthy`, `degraded`, `blocked
 
 ### System volume
 
-- Small encrypted EBS root volume.
-- Versioned Ubuntu AMI, guest supervisor, Docker engine, baseline tools, and materializer runtime.
-- Replaceable during repair or upgrade.
-- Not authoritative for user work.
+- Small encrypted EBS root volume (platform-owned, 30 GiB in alpha).
+- Versioned Ubuntu AMI, guest supervisor, Docker engine, baseline tools, pinned agent binaries, and materializer runtime.
+- Replaceable during repair or upgrade; exclusively platform-owned — user system-path installs (`sudo apt …`) are ephemeral by contract and do not survive replacement (ADR 0013).
+- Not authoritative for user work. The image preconfigures user-space package managers to install into the durable home component so the ordinary tool-install path never touches the system volume.
 
 ### Persistent data volume
 
 - One encrypted gp3 EBS volume per Environment in the MVP.
+- Size is user-configurable per Environment at create (default 100 GiB, bounded 20–500 GiB in alpha).
 - Survives stop, Runtime replacement, and system-volume replacement.
 - `DeleteOnTermination=false`.
 - Explicit deletion only through the Environment delete workflow after ownership validation and private-alpha backup policy.

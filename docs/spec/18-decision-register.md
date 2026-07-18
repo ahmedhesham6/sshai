@@ -30,7 +30,7 @@ This register concludes the design-grilling session. `Accepted` entries are impl
 | `devm` does not execute skills, hooks, or plugins during sync | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
 | Managed targets are drift-protected and never silently overwritten | Accepted | [Profiles and projects](./04-profiles-and-projects.md) |
 | Credentials are Environment-specific bindings; Capsules and Project Specs contain requirements/references only | Accepted | [Security](./11-security.md) |
-| Agent version pinning and updater policy | Open | [Open decisions](./17-open-decisions.md) |
+| Agents pinned at AMI build, auto-update disabled, weekly image rebuilds adopted at start boundaries (2026-07-18) | Accepted | [ADR 0013](../adr/0013-platform-owned-system-image-user-owned-home.md) |
 
 ## Capsules and packaging
 
@@ -77,7 +77,7 @@ This register concludes the design-grilling session. `Accepted` entries are impl
 | Conditions may use connections, Codex/Claude processes, protected processes, and containers | Accepted | [Activity](./06-activity-and-autostop.md) |
 | Process observation feeds policy evaluation; CPU alone is insufficient | Accepted | [Activity](./06-activity-and-autostop.md) |
 | Live Codex/Claude process counts as active even while waiting for input | Accepted | [Activity](./06-activity-and-autostop.md) |
-| Exact defaults, cadence, and grace periods | Open | [Open decisions](./17-open-decisions.md) |
+| Default policy `when_fully_idle`, 300s grace, 60s snapshot cadence, 300s stale threshold (2026-07-18) | Accepted | [Activity](./06-activity-and-autostop.md) |
 
 ## Access and networking
 
@@ -90,7 +90,7 @@ This register concludes the design-grilling session. `Accepted` entries are impl
 | One managed NAT gateway supplies MVP regional egress | Accepted | [Infrastructure](./13-infrastructure.md) |
 | Architecture supports regional cells; private alpha operates one region | Accepted | [Infrastructure](./13-infrastructure.md) |
 | Environment region is immutable in MVP | Accepted | [Domain model](./02-domain-model.md) |
-| Initial region, AZ, and Runtime Preset mappings | Open | [Open decisions](./17-open-decisions.md) |
+| Private alpha runs `eu-central-1`/`eu-central-1a`; Runtime Presets are a ladder (`cpu2-mem8` … `cpu16-mem64`) mapped to m7i-flex regionally (2026-07-18) | Accepted | [Infrastructure](./13-infrastructure.md) |
 
 ## Control plane and technology
 
@@ -117,4 +117,18 @@ This register concludes the design-grilling session. `Accepted` entries are impl
 | Subscription grants one shared Credit Balance | Accepted | [Billing](./10-billing.md) |
 | Compute and storage convert through type-specific rates then debit the same pool | Accepted | [Billing](./10-billing.md) |
 | Do not model separate compute/storage balances | Accepted | [Billing](./10-billing.md) |
-| Zero-balance behavior | Open | [Open decisions](./17-open-decisions.md) |
+| Zero balance blocks new starts (`CREDITS_POLICY_BLOCKED`); running compute is never force-stopped in alpha (2026-07-18; revisit before paid launch) | Accepted | [Billing](./10-billing.md) |
+
+## Amendments (2026-07-18 grilling session)
+
+| Decision | Status | Specification |
+|---|---|---|
+| Capsule tags resolve through an owner-scoped Postgres tag index written at `capsule publish`; no registry service in MVP | Accepted | [ADR 0012](../adr/0012-postgres-tag-index-for-capsule-tags.md) |
+| Platform owns the system image; user work and tools live home-first on the durable data volume; system-path installs are ephemeral across replacement | Accepted | [ADR 0013](../adr/0013-platform-owned-system-image-user-owned-home.md) |
+| Stopped Environments silently adopt a newer promoted AMI at the next start (start fulfilled as replace); upgrades never interrupt a running session | Accepted | [ADR 0013](../adr/0013-platform-owned-system-image-user-owned-home.md) |
+| Data-volume size is user-configurable per Environment (default 100 GiB, bounded 20–500); system volume is platform-owned at 30 GiB | Accepted | [Runtime and storage](./05-runtime-and-storage.md) |
+| `capsuleLockId` is nullable in the API contract until a lock is pinned (replaces the empty-string sentinel) | Accepted | [API](./09-api.md) |
+| SSH key default: single Ed25519 used silently, none generates a dedicated key, multiple picks most-recently-used with override | Accepted | [SSH and networking](./07-ssh-and-networking.md) |
+| Guest unknown-process and cgroup activity signals are pulled forward into the E2E push so `when_fully_idle` is safe as the default | Accepted | [Activity](./06-activity-and-autostop.md) |
+| The generated `@sshai/contracts` TypeScript client is kept and wired to the web app in the web-surfaces slice | Accepted | [Product surfaces](./12-product-surfaces.md) |
+| Deterministic per-user toolset (Nix-style) recorded as a new open decision | Open | [Open decisions](./17-open-decisions.md) |

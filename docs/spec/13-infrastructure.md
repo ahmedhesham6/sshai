@@ -84,17 +84,18 @@ No Runtime public IPv4, Elastic IP, public DNS record, user data containing dura
 
 Product contracts expose stable logical names and resource quantities. Provider instance-family mappings are regional configuration, not domain constants.
 
-Initial shape recommendation, pending benchmarking:
+Ratified alpha ladder (2026-07-18) — preset names state the resources so the user effectively picks vCPU/memory per Environment:
 
-- `small`: 2 vCPU / 4 GiB;
-- `standard`: 4 vCPU / 8 GiB;
-- `large`: 8 vCPU / 16 GiB.
+- `cpu2-mem8`: 2 vCPU / 8 GiB → `m7i-flex.large`;
+- `cpu4-mem16`: 4 vCPU / 16 GiB → `m7i-flex.xlarge`;
+- `cpu8-mem32`: 8 vCPU / 32 GiB → `m7i-flex.2xlarge`;
+- `cpu16-mem64`: 16 vCPU / 64 GiB → `m7i-flex.4xlarge`.
 
-Mappings must use EBS-backed x86-64 types available in the Environment's fixed AZ and compatible with stop/start resize if resizing is added.
+Instance mappings are `eu-central-1` regional configuration and re-benchmarkable without contract changes. The private alpha regional cell is `eu-central-1`, availability zone `eu-central-1a` (2026-07-18). Mappings must use EBS-backed x86-64 types available in the Environment's fixed AZ and compatible with stop/start resize if resizing is added.
 
 ## Image pipeline
 
-Packer builds a versioned Ubuntu 24.04 x86-64 AMI per enabled region.
+Packer builds a versioned Ubuntu 24.04 x86-64 AMI per enabled region, rebuilt on a weekly cadence. Agent binaries (Claude Code, Codex, OpenCode) and common developer tooling are installed at exact pinned versions with auto-update disabled; the platform exclusively owns this system image and stopped Environments adopt a newer promoted AMI at their next start (ADR 0013).
 
 Build gates:
 

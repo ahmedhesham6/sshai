@@ -12,6 +12,7 @@ The public HTTP API is contract-first and resource-oriented. The CLI and TanStac
 - RFC 3339 UTC timestamps.
 - Opaque string identifiers with stable prefixes.
 - Cursor pagination for collections.
+- Not-yet-populated references are `null`, never empty-string sentinels (`capsuleLockId` is nullable until a lock is pinned; 2026-07-18).
 - Every response includes `X-Request-ID`.
 - Product-level errors never use raw AWS errors as the primary message.
 
