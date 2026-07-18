@@ -55,10 +55,13 @@ ruled — see `docs/spec/18-decision-register.md` ("Amendments"), the updated
 slices below:
 
 - **Order**: E2E first (S2 → S4 → S5 → S6), then breadth (S7–S13).
-- **Deploy as we go**: every slice verifies against live AWS in
-  `eu-central-1`/`eu-central-1a` before merging. Credentials (AWS, Restate
-  Cloud, WorkOS, Polar) arrive via user-provisioned `~/.sshai-deploy.env`
-  (0600); verify with smoke calls, never echo.
+- **Verification mode (amended 2026-07-18)**: fakes-first — no credentials
+  exist yet, so every slice verifies with the established test-fake/local
+  pattern (fakes in-package, local Restate in Docker where useful). Target
+  region for all provider config stays `eu-central-1`/`eu-central-1a`. When
+  the maintainer provisions `~/.sshai-deploy.env` (AWS, Restate Cloud,
+  WorkOS, Polar; 0600; smoke-verify, never echo), a dedicated deployment
+  phase runs terraform/packer and a live create→ssh→stop smoke E2E.
 - **Credits**: starts refuse at balance ≤ 0 (`CREDITS_POLICY_BLOCKED`);
   never force-stop running compute in alpha.
 - **Auto-stop defaults**: `when_fully_idle`, 300s grace, 60s cadence, 300s
@@ -83,7 +86,7 @@ slices below:
 | S2 | Runtime start/stop workflows + SendRuntimeOperation + control-plane wiring + API endpoints. Amended scope (2026-07-18): + AutoStop production binding with ratified defaults, + guest unknown-process/cgroup signals, + compute-usage-interval open/close wiring, + credit-policy start check, + upgrade-on-start hook point (start→replace decision), toolchain reinstall first (machine currently has no Go) | S1, S1b; ReserveInitialRuntime landed — UNBLOCKED | TODO |
 | S3 | Read models: 9 GET endpoints (environments, profiles, operations, events, /me, /billing) | — | DONE (merged @ `3c713ab`; recovered from second executor session-limit death; gate: 0 authz findings, 3 LOW) |
 | S3b | Cursor pagination on the 3 collection endpoints (spec 09) + owner-assertion hardening in handler fakes. Pending maintainer decision: `capsuleLockId` empty-string sentinel vs nullable contract field | S3 | DONE (merged @ `c323143`, pushed; keyset pagination, contract-first, boundary-tested) |
-| S4 | environment.create steps 4–11 (EC2 provision/attach/network, guest boot, seed, materialize-from-workflow). Amended scope (2026-07-18): + image-pipeline terraform module + eu-central-1 Packer build with pinned agents + ECS cluster/services terraform (deployment backbone; may start alongside S2) + user-space package managers preconfigured home-first in the AMI | S1, S2 | TODO |
+| S4 | environment.create steps 4–11 (EC2 provision/attach/network, guest boot, seed, materialize-from-workflow). Amended scope (2026-07-18): + image-pipeline terraform module + eu-central-1 Packer template with pinned agents + ECS cluster/services terraform (authored + validated offline; actual apply/build waits for the credentialed deployment phase) + user-space package managers preconfigured home-first in the AMI | S1, S2 | TODO |
 | S5 | Connection path: POST /connection-intents server side, proxy start-on-connect, CLI ssh config/include wiring | S2, S3 | TODO |
 | S6 | CLI lifecycle: bare `devm`, status, stop, delete, doctor, logout, profile noun, capsule publish/inspect/diff | S2, S3 | TODO |
 | S7 | Deletion safety flow (specs 05+11): disclosures, exact-name confirm, recent-auth, delete workflow | S1 | TODO |
