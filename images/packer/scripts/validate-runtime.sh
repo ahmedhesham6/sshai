@@ -4,6 +4,12 @@ set -euo pipefail
 : "${CLAUDE_CODE_VERSION:?CLAUDE_CODE_VERSION is required}"
 : "${CODEX_VERSION:?CODEX_VERSION is required}"
 : "${OPENCODE_VERSION:?OPENCODE_VERSION is required}"
+: "${VALIDATE_ONLY:=false}"
+
+if [[ ! -x /usr/local/bin/sshai-guest && "$VALIDATE_ONLY" != "true" ]]; then
+  printf 'guest supervisor is not installed and executable\n' >&2
+  exit 1
+fi
 
 os_version=$(sed -n 's/^VERSION_ID="\{0,1\}\([^"[:space:]]*\)"\{0,1\}$/\1/p' /etc/os-release)
 test "$os_version" = "24.04"
@@ -23,6 +29,7 @@ grep -qx 'permitrootlogin no' <<<"$sshd_config"
 grep -qx 'passwordauthentication no' <<<"$sshd_config"
 grep -qx 'kbdinteractiveauthentication no' <<<"$sshd_config"
 grep -qx 'x11forwarding no' <<<"$sshd_config"
+grep -qx 'allowtcpforwarding yes' <<<"$sshd_config"
 
 sudo systemctl enable --now docker.service
 sudo docker info >/dev/null

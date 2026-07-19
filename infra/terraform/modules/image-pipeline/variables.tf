@@ -40,6 +40,28 @@ variable "build_subnet_id" {
   type        = string
 }
 
+variable "guest_binary_source" {
+  description = "Repository-relative path to the prebuilt guest supervisor binary consumed by Packer."
+  type        = string
+
+  validation {
+    condition     = length(trimspace(var.guest_binary_source)) > 0
+    error_message = "guest_binary_source must not be empty."
+  }
+}
+
+variable "ami_kms_key_arn" {
+  description = "Optional customer-managed KMS key ARN used for the encrypted final AMI copy."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.ami_kms_key_arn == null || can(regex("^arn:[^:]+:kms:[^:]+:[0-9]{12}:key/.+$", var.ami_kms_key_arn))
+    error_message = "ami_kms_key_arn must be a KMS key ARN when supplied."
+  }
+}
+
 variable "schedule_expression" {
   description = "EventBridge schedule for the required weekly image rebuild."
   type        = string
@@ -60,6 +82,28 @@ variable "packer_linux_amd64_sha256" {
   validation {
     condition     = can(regex("^[0-9a-f]{64}$", var.packer_linux_amd64_sha256))
     error_message = "packer_linux_amd64_sha256 must be a lowercase SHA-256 digest."
+  }
+}
+
+variable "manifest_noncurrent_version_expiration_days" {
+  description = "Days to retain superseded image manifest object versions."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.manifest_noncurrent_version_expiration_days >= 1
+    error_message = "manifest_noncurrent_version_expiration_days must be at least one."
+  }
+}
+
+variable "multipart_abort_days" {
+  description = "Days before incomplete image artifact multipart uploads are aborted."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.multipart_abort_days >= 1
+    error_message = "multipart_abort_days must be at least one."
   }
 }
 

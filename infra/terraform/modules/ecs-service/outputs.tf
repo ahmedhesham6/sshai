@@ -27,3 +27,12 @@ output "load_balancer_decision_inputs" {
   description = "Required unresolved item-11 values for the separate load-balancer/proxy configuration."
   value       = var.load_balancer
 }
+
+output "autoscaling_target" {
+  description = "Optional capacity target to which a caller may attach a ratified scaling policy."
+  value = var.scaling == null ? null : {
+    resource_id        = one(aws_appautoscaling_target.service).resource_id
+    scalable_dimension = one(aws_appautoscaling_target.service).scalable_dimension
+    service_namespace  = one(aws_appautoscaling_target.service).service_namespace
+  }
+}

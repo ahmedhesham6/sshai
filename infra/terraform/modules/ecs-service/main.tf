@@ -1,5 +1,13 @@
 locals {
-  resource_name = "${var.name_prefix}-${var.service_name}"
+  resource_name                  = "${var.name_prefix}-${var.service_name}"
+  container_repository_arn_parts = split(":", var.container_repository_arn)
+  container_repository_name      = trimprefix(local.container_repository_arn_parts[5], "repository/")
+  container_repository_image_prefix = format(
+    "%s.dkr.ecr.%s.amazonaws.com/%s@sha256:",
+    local.container_repository_arn_parts[4],
+    local.container_repository_arn_parts[3],
+    local.container_repository_name,
+  )
   container_environment = [
     for name in sort(keys(var.environment)) : {
       name  = name
@@ -37,9 +45,39 @@ resource "aws_iam_role" "execution" {
   tags = var.tags
 }
 
-resource "aws_iam_role_policy_attachment" "execution" {
-  role       = aws_iam_role.execution.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+resource "aws_iam_role_policy" "execution" {
+  name = "${var.service_name}-execution"
+  role = aws_iam_role.execution.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AuthenticateToEcr"
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      },
+      {
+        Sid    = "PullServiceImage"
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+        ]
+        Resource = var.container_repository_arn
+      },
+      {
+        Sid    = "WriteServiceLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = "${aws_cloudwatch_log_group.service.arn}:*"
+      },
+    ]
+  })
 }
 
 resource "aws_iam_role_policy" "execution_secrets" {
@@ -118,6 +156,13 @@ resource "aws_ecs_task_definition" "service" {
     }
   }])
 
+  lifecycle {
+    precondition {
+      condition     = startswith(var.container_image, local.container_repository_image_prefix)
+      error_message = "container_image must reference the repository granted to the execution role."
+    }
+  }
+
   tags = var.tags
 }
 
@@ -153,12 +198,15 @@ resource "aws_ecs_service" "service" {
     subnets          = var.subnet_ids
   }
 
+  # A caller-supplied policy owns this value after service creation. Keeping
+  # Terraform out of that feedback loop also avoids erasing a scaled value on
+  # unrelated applies; without a policy, the initial count remains stable.
   lifecycle {
     ignore_changes = [desired_count]
   }
 
   depends_on = [
-    aws_iam_role_policy_attachment.execution,
+    aws_iam_role_policy.execution,
     aws_iam_role_policy.execution_secrets,
   ]
 
@@ -166,27 +214,11 @@ resource "aws_ecs_service" "service" {
 }
 
 resource "aws_appautoscaling_target" "service" {
-  max_capacity       = var.scaling.maximum_tasks
-  min_capacity       = var.scaling.minimum_tasks
+  count = var.scaling == null ? 0 : 1
+
+  max_capacity       = var.scaling == null ? 0 : var.scaling.maximum_tasks
+  min_capacity       = var.scaling == null ? 0 : var.scaling.minimum_tasks
   resource_id        = "service/${element(split("/", var.cluster_arn), length(split("/", var.cluster_arn)) - 1)}/${aws_ecs_service.service.name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
-}
-
-resource "aws_appautoscaling_policy" "cpu" {
-  name               = "${local.resource_name}-cpu"
-  policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.service.resource_id
-  scalable_dimension = aws_appautoscaling_target.service.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.service.service_namespace
-
-  target_tracking_scaling_policy_configuration {
-    target_value       = var.scaling.target_cpu_percent
-    scale_in_cooldown  = var.scaling.scale_in_cooldown
-    scale_out_cooldown = var.scaling.scale_out_cooldown
-
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
-    }
-  }
 }

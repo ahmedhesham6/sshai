@@ -19,29 +19,23 @@ mock_provider "aws" {
 }
 
 variables {
-  name_prefix       = "sshai-development-eu-central-1"
-  service_name      = "control-plane"
-  cluster_arn       = "arn:aws:ecs:eu-central-1:123456789012:cluster/sshai-development-eu-central-1"
-  container_image   = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/control-plane@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  container_port    = 8080
-  task_cpu          = 512
-  task_memory       = 1024
-  desired_count     = 1
-  subnet_ids        = ["subnet-00000000000000001", "subnet-00000000000000002"]
-  security_group_id = "sg-00000000000000001"
+  name_prefix              = "sshai-development-eu-central-1"
+  service_name             = "control-plane"
+  cluster_arn              = "arn:aws:ecs:eu-central-1:123456789012:cluster/sshai-development-eu-central-1"
+  container_image          = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/control-plane@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  container_repository_arn = "arn:aws:ecr:eu-central-1:123456789012:repository/control-plane"
+  container_port           = 8080
+  task_cpu                 = 512
+  task_memory              = 1024
+  desired_count            = 1
+  subnet_ids               = ["subnet-00000000000000001", "subnet-00000000000000002"]
+  security_group_id        = "sg-00000000000000001"
   load_balancer = {
     target_group_arn                  = "arn:aws:elasticloadbalancing:eu-central-1:123456789012:targetgroup/control-plane/0123456789abcdef"
     health_check_grace_period_seconds = 30
     websocket_idle_timeout_seconds    = 3600
     client_keep_alive_seconds         = 3600
     maximum_connection_age_seconds    = 86400
-  }
-  scaling = {
-    minimum_tasks      = 1
-    maximum_tasks      = 3
-    target_cpu_percent = 60
-    scale_in_cooldown  = 300
-    scale_out_cooldown = 60
   }
   task_role_policy_json = jsonencode({
     Version   = "2012-10-17"
@@ -75,13 +69,17 @@ run "creates_an_isolated_private_fargate_service" {
   }
 
   assert {
-    condition     = output.load_balancer_decision_inputs.maximum_connection_age_seconds == var.load_balancer.maximum_connection_age_seconds
-    error_message = "Unresolved load-balancer and proxy policy must remain explicit for the caller."
+    condition     = aws_iam_role.task.name != aws_iam_role.execution.name && aws_ecs_task_definition.service.task_role_arn == aws_iam_role.task.arn
+    error_message = "Each service needs a distinct application role and deployment execution role."
   }
 
   assert {
-    condition     = aws_iam_role.task.name != aws_iam_role.execution.name && aws_ecs_task_definition.service.task_role_arn == aws_iam_role.task.arn
-    error_message = "Each service needs a distinct application role and deployment execution role."
+    condition = (
+      one([for statement in jsondecode(aws_iam_role_policy.execution.policy).Statement : statement if statement.Sid == "AuthenticateToEcr"]).Resource == "*" &&
+      one([for statement in jsondecode(aws_iam_role_policy.execution.policy).Statement : statement if statement.Sid == "PullServiceImage"]).Resource == var.container_repository_arn &&
+      one([for statement in jsondecode(aws_iam_role_policy.execution.policy).Statement : statement if statement.Sid == "WriteServiceLogs"]).Resource == "${aws_cloudwatch_log_group.service.arn}:*"
+    )
+    error_message = "The execution role must scope image pulls and log writes while leaving only ECR authentication wildcarded."
   }
 
   assert {
@@ -90,8 +88,8 @@ run "creates_an_isolated_private_fargate_service" {
   }
 
   assert {
-    condition     = aws_appautoscaling_target.service.min_capacity == 1 && aws_appautoscaling_target.service.max_capacity == 3
-    error_message = "Service capacity must preserve the required caller-supplied scaling decision."
+    condition     = length(aws_appautoscaling_target.service) == 0 && output.autoscaling_target == null
+    error_message = "The module must create no scaling resources or choose a scaling signal when scaling is omitted."
   }
 
   assert {
@@ -108,4 +106,14 @@ run "rejects_a_mutable_container_tag" {
   }
 
   expect_failures = [var.container_image]
+}
+
+run "rejects_an_image_outside_the_scoped_repository" {
+  command = plan
+
+  variables {
+    container_image = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/workflows@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+
+  expect_failures = [aws_ecs_task_definition.service]
 }

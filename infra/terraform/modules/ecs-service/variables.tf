@@ -23,8 +23,18 @@ variable "container_image" {
   type        = string
 
   validation {
-    condition     = strcontains(var.container_image, "@sha256:")
-    error_message = "container_image must be pinned by sha256 digest."
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.container_image))
+    error_message = "container_image must end in a lowercase 64-hex sha256 digest."
+  }
+}
+
+variable "container_repository_arn" {
+  description = "ARN of the one ECR repository the execution role may pull from."
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:[^:]+:ecr:[^:]+:[0-9]{12}:repository/.+$", var.container_repository_arn))
+    error_message = "container_repository_arn must be an ECR repository ARN."
   }
 }
 
@@ -89,20 +99,21 @@ variable "load_balancer" {
 }
 
 variable "scaling" {
-  # TODO(decision-register): item 11 includes regional proxy scaling. Keep all
-  # service capacity policy explicit at each call site until it is ratified.
-  description = "Required per-service scaling policy values."
+  # TODO(decision-register-11): the module may create an optional capacity
+  # target, but it deliberately creates no scaling policy or signal. Callers
+  # may attach a policy to the exported target only after the relevant policy
+  # is explicitly ratified.
+  description = "Optional autoscaling capacity bounds; no scaling signal or policy is selected by this module."
   type = object({
-    minimum_tasks      = number
-    maximum_tasks      = number
-    target_cpu_percent = number
-    scale_in_cooldown  = number
-    scale_out_cooldown = number
+    minimum_tasks = number
+    maximum_tasks = number
   })
+  default  = null
+  nullable = true
 
   validation {
-    condition     = var.scaling.minimum_tasks >= 1 && var.scaling.maximum_tasks >= var.scaling.minimum_tasks && var.scaling.target_cpu_percent >= 1 && var.scaling.target_cpu_percent <= 100
-    error_message = "scaling must have a positive ordered task range and a CPU target from 1 to 100."
+    condition     = var.scaling == null || var.scaling.minimum_tasks >= 1 && var.scaling.maximum_tasks >= var.scaling.minimum_tasks
+    error_message = "scaling must be null or have a positive ordered task range."
   }
 }
 

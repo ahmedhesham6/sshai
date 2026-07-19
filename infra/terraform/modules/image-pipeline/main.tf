@@ -1,4 +1,38 @@
 locals {
+  ownership_request_tags = {
+    "aws:RequestTag/image-pipeline" = var.name_prefix
+    "aws:RequestTag/managed-by"     = "packer"
+    "aws:RequestTag/project"        = "sshai"
+  }
+  ownership_resource_tags = {
+    "ec2:ResourceTag/image-pipeline" = var.name_prefix
+    "ec2:ResourceTag/managed-by"     = "packer"
+    "ec2:ResourceTag/project"        = "sshai"
+  }
+  kms_policy_statements = jsondecode(var.ami_kms_key_arn == null ? "[]" : jsonencode([
+    {
+      Sid    = "UseAmiEncryptionKey"
+      Effect = "Allow"
+      Action = [
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:ReEncryptFrom",
+        "kms:ReEncryptTo",
+      ]
+      Resource = var.ami_kms_key_arn
+    },
+    {
+      Sid      = "GrantAmiEncryptionKeyToAws"
+      Effect   = "Allow"
+      Action   = "kms:CreateGrant"
+      Resource = var.ami_kms_key_arn
+      Condition = {
+        Bool = { "kms:GrantIsForAWSResource" = "true" }
+      }
+    },
+  ]))
+
   # Implementation choice: spec 13 does not prescribe an image runner. A
   # scheduled CodeBuild job is the smallest AWS-native runner for the existing
   # Packer template and avoids a permanently running build host.
@@ -16,8 +50,8 @@ locals {
       build = {
         commands = [
           "packer init images/packer/runtime.pkr.hcl",
-          "packer validate -var source_revision=$CODEBUILD_RESOLVED_SOURCE_VERSION -var build_vpc_id=$BUILD_VPC_ID -var build_subnet_id=$BUILD_SUBNET_ID -var aws_region=$PACKER_REGION images/packer/runtime.pkr.hcl",
-          "packer build -var source_revision=$CODEBUILD_RESOLVED_SOURCE_VERSION -var build_vpc_id=$BUILD_VPC_ID -var build_subnet_id=$BUILD_SUBNET_ID -var aws_region=$PACKER_REGION images/packer/runtime.pkr.hcl",
+          "packer validate -var \"source_revision=$CODEBUILD_RESOLVED_SOURCE_VERSION\" -var \"build_vpc_id=$BUILD_VPC_ID\" -var \"build_subnet_id=$BUILD_SUBNET_ID\" -var \"aws_region=$PACKER_REGION\" -var \"pipeline_id=$PACKER_PIPELINE_ID\" -var \"guest_binary_source=$GUEST_BINARY_SOURCE\" -var \"ami_kms_key_id=$AMI_KMS_KEY_ARN\" images/packer/runtime.pkr.hcl",
+          "packer build -var \"source_revision=$CODEBUILD_RESOLVED_SOURCE_VERSION\" -var \"build_vpc_id=$BUILD_VPC_ID\" -var \"build_subnet_id=$BUILD_SUBNET_ID\" -var \"aws_region=$PACKER_REGION\" -var \"pipeline_id=$PACKER_PIPELINE_ID\" -var \"guest_binary_source=$GUEST_BINARY_SOURCE\" -var \"ami_kms_key_id=$AMI_KMS_KEY_ARN\" images/packer/runtime.pkr.hcl",
         ]
       }
       post_build = {
@@ -61,6 +95,36 @@ resource "aws_s3_bucket_public_access_block" "artifacts" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+
+  rule {
+    id     = "manifest-version-retention"
+    status = "Enabled"
+
+    filter {
+      prefix = "manifests/"
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = var.manifest_noncurrent_version_expiration_days
+    }
+  }
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = var.multipart_abort_days
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.artifacts]
 }
 
 resource "aws_s3_bucket_policy" "secure_transport" {
@@ -113,7 +177,7 @@ resource "aws_iam_role_policy" "build" {
   role = aws_iam_role.build.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid    = "BuildLogs"
         Effect = "Allow"
@@ -136,28 +200,13 @@ resource "aws_iam_role_policy" "build" {
         Resource = "${aws_s3_bucket.artifacts.arn}/manifests/*"
       },
       {
-        # Packer creates resources with IDs that do not exist when this policy
-        # is planned. Conditions and resource narrowing are deferred to the
-        # credentialed hardening phase after the first CloudTrail capture.
-        Sid    = "BuildAmi"
+        Sid    = "DescribeBuildResources"
         Effect = "Allow"
         Action = [
-          "ec2:AttachVolume",
-          "ec2:AuthorizeSecurityGroupIngress",
-          "ec2:CreateImage",
-          "ec2:CreateKeyPair",
-          "ec2:CreateSecurityGroup",
-          "ec2:CreateSnapshot",
-          "ec2:CreateTags",
-          "ec2:CreateVolume",
-          "ec2:DeleteKeyPair",
-          "ec2:DeleteSecurityGroup",
-          "ec2:DeleteSnapshot",
-          "ec2:DeleteVolume",
-          "ec2:DeregisterImage",
-          "ec2:DescribeImages",
           "ec2:DescribeAccountAttributes",
           "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeImageAttribute",
+          "ec2:DescribeImages",
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceAttribute",
           "ec2:DescribeInstanceStatus",
@@ -170,20 +219,87 @@ resource "aws_iam_role_policy" "build" {
           "ec2:DescribeVolumes",
           "ec2:DescribeVolumeStatus",
           "ec2:DescribeVpcs",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CreateTaggedBuildResources"
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateImage",
+          "ec2:CreateKeyPair",
+          "ec2:CreateSecurityGroup",
+          "ec2:CreateSnapshot",
+          "ec2:CreateVolume",
+          "ec2:RunInstances",
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = local.ownership_request_tags
+        }
+      },
+      {
+        Sid      = "CopyTaggedEncryptedAmi"
+        Effect   = "Allow"
+        Action   = "ec2:CopyImage"
+        Resource = "*"
+        Condition = {
+          StringEquals = local.ownership_request_tags
+        }
+      },
+      {
+        Sid      = "TagResourcesDuringOwnedCreation"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "*"
+        Condition = {
+          StringEquals = merge(local.ownership_request_tags, {
+            "ec2:CreateAction" = [
+              "CreateImage",
+              "CreateKeyPair",
+              "CopyImage",
+              "CreateSecurityGroup",
+              "CreateSnapshot",
+              "CreateVolume",
+              "RunInstances",
+            ]
+          })
+        }
+      },
+      {
+        Sid      = "RetagOwnedBuildResources"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "*"
+        Condition = {
+          StringEquals = local.ownership_resource_tags
+        }
+      },
+      {
+        Sid    = "MutateOnlyOwnedBuildResources"
+        Effect = "Allow"
+        Action = [
+          "ec2:AttachVolume",
+          "ec2:AuthorizeSecurityGroupIngress",
+          "ec2:DeleteKeyPair",
+          "ec2:DeleteSecurityGroup",
+          "ec2:DeleteSnapshot",
+          "ec2:DeleteVolume",
+          "ec2:DeregisterImage",
           "ec2:DetachVolume",
-          "ec2:GetPasswordData",
           "ec2:ModifyImageAttribute",
           "ec2:ModifyInstanceAttribute",
           "ec2:ModifySnapshotAttribute",
-          "ec2:RegisterImage",
           "ec2:RevokeSecurityGroupIngress",
-          "ec2:RunInstances",
           "ec2:StopInstances",
           "ec2:TerminateInstances",
         ]
         Resource = "*"
+        Condition = {
+          StringEquals = local.ownership_resource_tags
+        }
       },
-    ]
+    ], local.kms_policy_statements)
   })
 }
 
@@ -215,6 +331,21 @@ resource "aws_codebuild_project" "runtime_image" {
     environment_variable {
       name  = "BUILD_VPC_ID"
       value = var.build_vpc_id
+    }
+
+    environment_variable {
+      name  = "PACKER_PIPELINE_ID"
+      value = var.name_prefix
+    }
+
+    environment_variable {
+      name  = "GUEST_BINARY_SOURCE"
+      value = var.guest_binary_source
+    }
+
+    environment_variable {
+      name  = "AMI_KMS_KEY_ARN"
+      value = var.ami_kms_key_arn == null ? "" : var.ami_kms_key_arn
     }
 
     environment_variable {

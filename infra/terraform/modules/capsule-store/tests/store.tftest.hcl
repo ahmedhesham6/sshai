@@ -41,4 +41,12 @@ run "protects_the_owner_scoped_capsule_store" {
     condition     = strcontains(aws_s3_bucket_policy.secure_transport.policy, "Deny") && strcontains(aws_s3_bucket_policy.secure_transport.policy, "aws:SecureTransport") && strcontains(aws_s3_bucket_policy.secure_transport.policy, "false")
     error_message = "The Capsule store must deny requests made without secure transport."
   }
+
+  assert {
+    condition = (
+      one(data.aws_iam_policy_document.control_plane_presigning.statement).actions == toset(["s3:GetObject", "s3:PutObject"]) &&
+      one(data.aws_iam_policy_document.control_plane_presigning.statement).resources == toset(["${aws_s3_bucket.capsules.arn}/owner/*"])
+    )
+    error_message = "The control-plane presigning document must permit only Capsule object access under owner/*."
+  }
 }
