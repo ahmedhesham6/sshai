@@ -11,10 +11,11 @@ import (
 )
 
 type guestControlConfig struct {
-	endpoint        string
-	certificateFile string
-	privateKeyFile  string
-	caFile          string
+	port                 int
+	serverName           string
+	certificateDirectory string
+	privateKeyDirectory  string
+	caFile               string
 }
 
 type runtimeGuestTransport interface {
@@ -29,8 +30,11 @@ type configuredGuestTransport struct {
 }
 
 func newRuntimeGuestTransport(config guestControlConfig) (runtimeGuestTransport, error) {
+	if config.serverName != "" && config.certificateDirectory == "" && config.privateKeyDirectory == "" && config.caFile == "" {
+		return nil, errors.New("GUEST_CONTROL_TLS_SERVER_NAME requires guest control TLS configuration")
+	}
 	configured := 0
-	for _, value := range []string{config.endpoint, config.certificateFile, config.privateKeyFile, config.caFile} {
+	for _, value := range []string{config.certificateDirectory, config.privateKeyDirectory, config.caFile} {
 		if value != "" {
 			configured++
 		}
@@ -38,12 +42,15 @@ func newRuntimeGuestTransport(config guestControlConfig) (runtimeGuestTransport,
 	if configured == 0 {
 		return unavailableGuestTransport{}, nil
 	}
-	if configured != 4 {
-		return nil, errors.New("GUEST_CONTROL_ENDPOINT, GUEST_CONTROL_TLS_CERT_FILE, GUEST_CONTROL_TLS_KEY_FILE, and GUEST_CONTROL_TLS_CA_FILE are all required when guest control is configured")
+	if configured != 3 {
+		return nil, errors.New("GUEST_CONTROL_TLS_CERT_DIR, GUEST_CONTROL_TLS_KEY_DIR, and GUEST_CONTROL_TLS_CA_FILE are all required when guest control is configured")
+	}
+	certificates, err := guestcontrol.NewDirectoryClientCertificateSource(config.certificateDirectory, config.privateKeyDirectory)
+	if err != nil {
+		return nil, err
 	}
 	client, err := guestcontrol.NewClient(guestcontrol.ClientConfig{
-		Endpoint: config.endpoint, CertificateFile: config.certificateFile,
-		PrivateKeyFile: config.privateKeyFile, CAFile: config.caFile,
+		Port: config.port, ServerName: config.serverName, CertificateSource: certificates, CAFile: config.caFile,
 	})
 	if err != nil {
 		return nil, err
@@ -52,7 +59,7 @@ func newRuntimeGuestTransport(config guestControlConfig) (runtimeGuestTransport,
 }
 
 func (transport *configuredGuestTransport) WaitForRuntimeReady(ctx context.Context, request workflows.RuntimeGuestReadinessRequest) (workflows.RuntimeGuestReadiness, error) {
-	status, err := transport.client.WaitForReadiness(ctx, guestTarget(request), guest.ReadinessDataMounted)
+	status, err := transport.client.ReadReadiness(ctx, guestTarget(request))
 	if err != nil {
 		return workflows.RuntimeGuestReadiness{}, err
 	}

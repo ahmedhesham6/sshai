@@ -207,6 +207,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	guestControlPort, err := int32OrDefault("GUEST_CONTROL_PORT", 9443)
+	if err != nil || guestControlPort < 1 || guestControlPort > 65535 {
+		return config{}, errors.New("GUEST_CONTROL_PORT must be between 1 and 65535")
+	}
 	config := config{
 		databaseURL:         os.Getenv("DATABASE_URL"),
 		polarEventsEndpoint: os.Getenv("POLAR_EVENTS_ENDPOINT"),
@@ -228,8 +232,8 @@ func loadConfig() (config, error) {
 		runtimePresets:         presets,
 		imageVersion:           os.Getenv("IMAGE_VERSION"),
 		guestControl: guestControlConfig{
-			endpoint: os.Getenv("GUEST_CONTROL_ENDPOINT"), certificateFile: os.Getenv("GUEST_CONTROL_TLS_CERT_FILE"),
-			privateKeyFile: os.Getenv("GUEST_CONTROL_TLS_KEY_FILE"), caFile: os.Getenv("GUEST_CONTROL_TLS_CA_FILE"),
+			port: int(guestControlPort), serverName: os.Getenv("GUEST_CONTROL_TLS_SERVER_NAME"), certificateDirectory: os.Getenv("GUEST_CONTROL_TLS_CERT_DIR"),
+			privateKeyDirectory: os.Getenv("GUEST_CONTROL_TLS_KEY_DIR"), caFile: os.Getenv("GUEST_CONTROL_TLS_CA_FILE"),
 		},
 	}
 	if config.databaseURL == "" || config.polarEventsEndpoint == "" || config.polarAccessToken == "" ||

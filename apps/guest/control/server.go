@@ -10,26 +10,41 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
 type ServerConfig struct {
-	EnvironmentID   string
+	Target          Target
 	ClientIdentity  string
 	MaxRequestBytes int64
+	QuiesceTimeout  time.Duration
 }
 
 type server struct {
 	config     ServerConfig
 	operations Operations
+	stateMu    sync.Mutex
+	quiescing  bool
+	inFlight   int
+	idle       chan struct{}
 }
 
 func NewServer(config ServerConfig, operations Operations) (http.Handler, error) {
-	config.EnvironmentID = strings.TrimSpace(config.EnvironmentID)
-	if config.EnvironmentID == "" {
-		return nil, errors.New("construct guest control server: Environment ID is required")
+	for name, value := range map[string]string{
+		"owner": config.Target.OwnerUserID, "Environment": config.Target.EnvironmentID,
+		"Runtime": config.Target.RuntimeID, "provider": config.Target.ProviderID, "private address": config.Target.PrivateIPv4,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return nil, fmt.Errorf("construct guest control server: %s identity is required", name)
+		}
 	}
-	if _, err := url.ParseRequestURI(config.ClientIdentity); err != nil || !strings.Contains(config.ClientIdentity, "://") {
+	claimedEnvironment, err := clientIdentityEnvironment(config.ClientIdentity)
+	if err != nil {
 		return nil, errors.New("construct guest control server: client URI identity is required")
+	}
+	if subtle.ConstantTimeCompare([]byte(claimedEnvironment), []byte(config.Target.EnvironmentID)) != 1 {
+		return nil, errors.New("construct guest control server: client URI identity must claim this Environment")
 	}
 	if operations == nil {
 		return nil, errors.New("construct guest control server: operations are required")
@@ -37,7 +52,26 @@ func NewServer(config ServerConfig, operations Operations) (http.Handler, error)
 	if config.MaxRequestBytes <= 0 {
 		config.MaxRequestBytes = defaultMaximumRequestBytes
 	}
+	if config.QuiesceTimeout <= 0 {
+		config.QuiesceTimeout = 10 * time.Minute
+	}
 	return &server{config: config, operations: operations}, nil
+}
+
+func clientIdentityEnvironment(identity string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(identity))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("client URI identity is invalid")
+	}
+	segments := strings.Split(strings.Trim(parsed.EscapedPath(), "/"), "/")
+	if len(segments) < 2 || segments[len(segments)-2] != "environment" {
+		return "", errors.New("client URI identity has no Environment claim")
+	}
+	value, err := url.PathUnescape(segments[len(segments)-1])
+	if err != nil || strings.TrimSpace(value) == "" || strings.Contains(value, "/") {
+		return "", errors.New("client URI identity Environment claim is invalid")
+	}
+	return value, nil
 }
 
 func (server *server) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -53,6 +87,10 @@ func (server *server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	if !server.authorizePeer(response, request) {
 		return
 	}
+	if isMutatingPath(request.URL.Path) && server.isQuiescing() {
+		writeError(response, http.StatusConflict, errors.New("guest is quiescing for Runtime shutdown"))
+		return
+	}
 	switch request.URL.Path {
 	case readinessPath:
 		var input ReadinessRequest
@@ -66,6 +104,10 @@ func (server *server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		if !server.decode(response, request, &input) || !server.authorize(response, input.Target) {
 			return
 		}
+		if !server.beginMutation(response) {
+			return
+		}
+		defer server.endMutation()
 		err := server.operations.ApplyProjectSeed(request.Context(), input)
 		server.writeResult(response, emptyResponse{}, err)
 	case sshHostIdentityPath:
@@ -73,19 +115,27 @@ func (server *server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		if !server.decode(response, request, &input) || !server.authorize(response, input.Target) {
 			return
 		}
+		if !server.beginMutation(response) {
+			return
+		}
+		defer server.endMutation()
 		status, err := server.operations.RestoreSSHHostIdentity(request.Context(), input.Target)
 		server.writeResult(response, sshHostIdentityResponse{Status: status}, err)
 	case sshKeysPath:
-		server.runTargetOperation(response, request, server.operations.ReconcileSSHKeys)
+		server.runTargetOperation(response, request, true, server.operations.ReconcileSSHKeys)
 	case managedConfigurationPath:
-		server.runTargetOperation(response, request, server.operations.ReconcileManagedConfiguration)
+		server.runTargetOperation(response, request, true, server.operations.ReconcileManagedConfiguration)
 	case shutdownPath:
-		server.runTargetOperation(response, request, server.operations.PrepareShutdown)
+		server.runShutdown(response, request)
 	case materializationPath:
 		var input MaterializationRequest
 		if !server.decode(response, request, &input) || !server.authorize(response, input.Target) {
 			return
 		}
+		if !server.beginMutation(response) {
+			return
+		}
+		defer server.endMutation()
 		results, err := server.operations.ApplyMaterialization(request.Context(), input)
 		server.writeResult(response, materializationResponse{Results: results}, err)
 	case activitySnapshotPath:
@@ -100,6 +150,21 @@ func (server *server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	}
 }
 
+func isMutatingPath(path string) bool {
+	switch path {
+	case projectSeedPath, sshHostIdentityPath, sshKeysPath, managedConfigurationPath, materializationPath:
+		return true
+	default:
+		return false
+	}
+}
+
+func (server *server) isQuiescing() bool {
+	server.stateMu.Lock()
+	defer server.stateMu.Unlock()
+	return server.quiescing
+}
+
 func (server *server) authorizePeer(response http.ResponseWriter, request *http.Request) bool {
 	for _, identity := range request.TLS.PeerCertificates[0].URIs {
 		if subtle.ConstantTimeCompare([]byte(identity.String()), []byte(server.config.ClientIdentity)) == 1 {
@@ -110,12 +175,72 @@ func (server *server) authorizePeer(response http.ResponseWriter, request *http.
 	return false
 }
 
-func (server *server) runTargetOperation(response http.ResponseWriter, request *http.Request, operation func(context.Context, Target) error) {
+func (server *server) runTargetOperation(response http.ResponseWriter, request *http.Request, mutating bool, operation func(context.Context, Target) error) {
 	var input targetRequest
 	if !server.decode(response, request, &input) || !server.authorize(response, input.Target) {
 		return
 	}
+	if mutating && !server.beginMutation(response) {
+		return
+	}
+	if mutating {
+		defer server.endMutation()
+	}
 	server.writeResult(response, emptyResponse{}, operation(request.Context(), input.Target))
+}
+
+func (server *server) runShutdown(response http.ResponseWriter, request *http.Request) {
+	var input targetRequest
+	if !server.decode(response, request, &input) || !server.authorize(response, input.Target) {
+		return
+	}
+	if err := server.quiesce(request.Context()); err != nil {
+		server.writeResult(response, emptyResponse{}, transientOperationError(fmt.Errorf("quiesce guest mutations: %w", err)))
+		return
+	}
+	server.writeResult(response, emptyResponse{}, server.operations.PrepareShutdown(request.Context(), input.Target))
+}
+
+func (server *server) beginMutation(response http.ResponseWriter) bool {
+	server.stateMu.Lock()
+	defer server.stateMu.Unlock()
+	if server.quiescing {
+		writeError(response, http.StatusConflict, errors.New("guest is quiescing for Runtime shutdown"))
+		return false
+	}
+	if server.inFlight == 0 {
+		server.idle = make(chan struct{})
+	}
+	server.inFlight++
+	return true
+}
+
+func (server *server) endMutation() {
+	server.stateMu.Lock()
+	defer server.stateMu.Unlock()
+	server.inFlight--
+	if server.inFlight == 0 && server.idle != nil {
+		close(server.idle)
+	}
+}
+
+func (server *server) quiesce(ctx context.Context) error {
+	server.stateMu.Lock()
+	server.quiescing = true
+	if server.inFlight == 0 {
+		server.stateMu.Unlock()
+		return nil
+	}
+	idle := server.idle
+	server.stateMu.Unlock()
+	waitContext, cancel := context.WithTimeout(ctx, server.config.QuiesceTimeout)
+	defer cancel()
+	select {
+	case <-idle:
+		return nil
+	case <-waitContext.Done():
+		return waitContext.Err()
+	}
 }
 
 func (server *server) decode(response http.ResponseWriter, request *http.Request, destination any) bool {
@@ -138,16 +263,37 @@ func (server *server) decode(response http.ResponseWriter, request *http.Request
 }
 
 func (server *server) authorize(response http.ResponseWriter, target Target) bool {
-	if target.EnvironmentID == "" || subtle.ConstantTimeCompare([]byte(target.EnvironmentID), []byte(server.config.EnvironmentID)) != 1 {
-		writeError(response, http.StatusForbidden, errors.New("request does not target this Environment"))
-		return false
+	for _, identity := range []struct{ expected, actual string }{
+		{server.config.Target.OwnerUserID, target.OwnerUserID},
+		{server.config.Target.EnvironmentID, target.EnvironmentID},
+		{server.config.Target.RuntimeID, target.RuntimeID},
+		{server.config.Target.ProviderID, target.ProviderID},
+		{server.config.Target.PrivateIPv4, target.PrivateIPv4},
+	} {
+		if subtle.ConstantTimeCompare([]byte(identity.expected), []byte(identity.actual)) != 1 {
+			writeError(response, http.StatusForbidden, errors.New("request does not target this Environment's current Runtime"))
+			return false
+		}
 	}
 	return true
 }
 
 func (server *server) writeResult(response http.ResponseWriter, result any, err error) {
 	if err != nil {
-		writeError(response, http.StatusUnprocessableEntity, err)
+		status := http.StatusInternalServerError
+		var classified interface{ Transient() bool }
+		if errors.As(err, &classified) {
+			if classified.Transient() {
+				status = http.StatusServiceUnavailable
+			} else {
+				status = http.StatusUnprocessableEntity
+			}
+		}
+		failure := errorResponse{Error: err.Error()}
+		if materialization, ok := result.(materializationResponse); ok {
+			failure.Results = materialization.Results
+		}
+		writeJSONError(response, status, failure)
 		return
 	}
 	response.Header().Set("Content-Type", "application/json")
@@ -156,8 +302,12 @@ func (server *server) writeResult(response http.ResponseWriter, result any, err 
 }
 
 func writeError(response http.ResponseWriter, status int, err error) {
+	writeJSONError(response, status, errorResponse{Error: err.Error()})
+}
+
+func writeJSONError(response http.ResponseWriter, status int, failure errorResponse) {
 	response.Header().Set("Content-Type", "application/json")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	response.WriteHeader(status)
-	_ = json.NewEncoder(response).Encode(errorResponse{Error: err.Error()})
+	_ = json.NewEncoder(response).Encode(failure)
 }

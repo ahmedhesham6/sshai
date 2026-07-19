@@ -109,9 +109,13 @@ func TestGuestControlTransportKeepsPermanentFailureWhenUnconfigured(t *testing.T
 }
 
 func TestGuestControlTransportRejectsPartialConfiguration(t *testing.T) {
-	_, err := newRuntimeGuestTransport(guestControlConfig{endpoint: "https://10.0.0.8:9443"})
+	_, err := newRuntimeGuestTransport(guestControlConfig{certificateDirectory: "/run/devm/client-certs"})
 	if err == nil || !strings.Contains(err.Error(), "all required") {
 		t.Fatalf("partial guest transport error = %v", err)
+	}
+	_, err = newRuntimeGuestTransport(guestControlConfig{serverName: "guest.internal"})
+	if err == nil || !strings.Contains(err.Error(), "requires guest control") {
+		t.Fatalf("server-name-only guest transport error = %v", err)
 	}
 }
 

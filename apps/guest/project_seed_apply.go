@@ -108,7 +108,7 @@ func (application *ProjectSeedApplication) Apply(ctx context.Context, workspace 
 	if application == nil {
 		return errors.New("Project Seed application is not initialized")
 	}
-	if replayed, err := application.replayed(workspace); replayed || err != nil {
+	if replayed, err := application.prepareWorkspace(workspace); replayed || err != nil {
 		return err
 	}
 	parent := filepath.Dir(workspace)
@@ -150,6 +150,32 @@ func (application *ProjectSeedApplication) Apply(ctx context.Context, workspace 
 		return fmt.Errorf("publish Project Seed workspace: %w", err)
 	}
 	return nil
+}
+
+// prepareWorkspace preserves the remote-authority guard while allowing the
+// empty directory created by persistent-state bootstrap to be initialized.
+// Removing an empty directory is race-safe: os.Remove fails if another actor
+// publishes content between ReadDir and Remove, and that failure is surfaced.
+func (application *ProjectSeedApplication) prepareWorkspace(workspace string) (bool, error) {
+	replayed, err := application.replayed(workspace)
+	if replayed || err == nil {
+		return replayed, err
+	}
+	if !errors.Is(err, ErrProjectSeedWorkspaceDiverged) {
+		return false, err
+	}
+	info, statErr := os.Lstat(workspace)
+	if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, err
+	}
+	entries, readErr := os.ReadDir(workspace)
+	if readErr != nil || len(entries) != 0 {
+		return false, err
+	}
+	if removeErr := os.Remove(workspace); removeErr != nil {
+		return false, fmt.Errorf("remove empty bootstrap workspace: %w", removeErr)
+	}
+	return false, nil
 }
 
 func (application *ProjectSeedApplication) applyBundle(ctx context.Context, workspace string) error {
@@ -378,8 +404,12 @@ func (application *ProjectSeedApplication) replayed(workspace string) (bool, err
 	if err == nil && strings.TrimSpace(string(marker)) == application.fingerprint {
 		return true, nil
 	}
-	return false, errors.New("workspace diverges from this Project Seed")
+	return false, ErrProjectSeedWorkspaceDiverged
 }
+
+// ErrProjectSeedWorkspaceDiverged means the durable workspace contains state
+// that was not initialized by this exact Project Seed.
+var ErrProjectSeedWorkspaceDiverged = errors.New("workspace diverges from this Project Seed")
 
 func validateRepositoryURL(raw string) error {
 	repository, err := url.Parse(raw)

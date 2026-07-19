@@ -118,5 +118,29 @@ type activitySnapshotResponse struct {
 }
 
 type errorResponse struct {
-	Error string `json:"error"`
+	Error   string                                 `json:"error"`
+	Results []profile.ProfileMaterializationResult `json:"results,omitempty"`
+}
+
+type operationError struct {
+	err       error
+	transient bool
+}
+
+func (err operationError) Error() string   { return err.err.Error() }
+func (err operationError) Unwrap() error   { return err.err }
+func (err operationError) Transient() bool { return err.transient }
+
+func permanentOperationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return operationError{err: err}
+}
+
+func transientOperationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return operationError{err: err, transient: true}
 }

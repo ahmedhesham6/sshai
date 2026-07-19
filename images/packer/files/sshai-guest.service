@@ -1,7 +1,7 @@
 [Unit]
 Description=sshai Runtime guest supervisor
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target ssh.service
+After=network-online.target ssh.service
 ConditionFileIsExecutable=/usr/local/bin/sshai-guest
 
 [Service]
@@ -9,6 +9,8 @@ Type=simple
 ExecStart=/usr/local/bin/sshai-guest
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=12min
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

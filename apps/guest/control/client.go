@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/url"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,24 +21,35 @@ import (
 )
 
 type ClientConfig struct {
-	Endpoint        string
-	CertificateFile string
-	PrivateKeyFile  string
-	CAFile          string
-	PollInterval    time.Duration
-	RequestTimeout  time.Duration
+	// Port is the guest control port. The destination address always comes
+	// from each request Target; a process-global guest endpoint is forbidden.
+	Port int
+	// ServerName optionally pins the DNS identity used to authenticate each
+	// per-Environment server certificate. When empty, the target private IPv4
+	// address must be present in that certificate's IP SANs.
+	ServerName        string
+	CertificateFile   string
+	PrivateKeyFile    string
+	CertificateSource ClientCertificateSource
+	CAFile            string
+	RequestTimeout    time.Duration
+	DialContext       func(context.Context, string, string) (net.Conn, error)
+}
+
+type ClientCertificateSource interface {
+	ClientCertificate(context.Context, Target) (tls.Certificate, error)
 }
 
 type Client struct {
-	endpoint     *url.URL
-	http         *http.Client
-	pollInterval time.Duration
+	port int
+	http *http.Client
 }
 
 type TransportError struct {
 	operation string
 	message   string
 	transient bool
+	cause     error
 }
 
 func (err *TransportError) Error() string {
@@ -44,108 +58,124 @@ func (err *TransportError) Error() string {
 
 func (err *TransportError) Transient() bool { return err.transient }
 
+func (err *TransportError) Unwrap() error { return err.cause }
+
 func NewClient(config ClientConfig) (*Client, error) {
-	endpoint, err := url.Parse(strings.TrimSpace(config.Endpoint))
-	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.RawQuery != "" || endpoint.Fragment != "" {
-		return nil, errors.New("construct guest control client: Endpoint must be an HTTPS origin")
+	if config.CAFile == "" {
+		return nil, errors.New("construct guest control client: CA file is required")
 	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/")
-	if config.CertificateFile == "" || config.PrivateKeyFile == "" || config.CAFile == "" {
-		return nil, errors.New("construct guest control client: certificate, private key, and CA files are required")
+	if config.Port == 0 {
+		config.Port = 9443
 	}
-	certificate, err := tls.LoadX509KeyPair(config.CertificateFile, config.PrivateKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("construct guest control client: load client certificate: %w", err)
+	if config.Port < 1 || config.Port > 65535 {
+		return nil, errors.New("construct guest control client: control port must be between 1 and 65535")
+	}
+	certificateSource := config.CertificateSource
+	if certificateSource == nil {
+		if config.CertificateFile == "" || config.PrivateKeyFile == "" {
+			return nil, errors.New("construct guest control client: certificate source or certificate and private key files are required")
+		}
+		certificate, err := loadTrustedX509KeyPair(config.CertificateFile, config.PrivateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("construct guest control client: load client certificate: %w", err)
+		}
+		certificateSource = staticClientCertificateSource{certificate: certificate}
 	}
 	roots, err := loadCertificatePool(config.CAFile)
 	if err != nil {
 		return nil, fmt.Errorf("construct guest control client: load server CA: %w", err)
 	}
-	pollInterval := config.PollInterval
-	if pollInterval <= 0 {
-		pollInterval = time.Second
-	}
 	requestTimeout := config.RequestTimeout
 	if requestTimeout <= 0 {
 		requestTimeout = 10 * time.Minute
 	}
-	transport := &http.Transport{TLSClientConfig: &tls.Config{
-		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{certificate},
-		RootCAs:      roots,
+	transport := &http.Transport{DisableKeepAlives: true, TLSClientConfig: &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		RootCAs:    roots,
+		ServerName: strings.TrimSpace(config.ServerName),
+		GetClientCertificate: func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			target, ok := info.Context().Value(clientTargetContextKey{}).(Target)
+			if !ok {
+				return nil, errors.New("guest control TLS handshake has no request Target")
+			}
+			certificate, err := certificateSource.ClientCertificate(info.Context(), target)
+			if err != nil {
+				return nil, err
+			}
+			return &certificate, nil
+		},
 	}}
+	if config.DialContext != nil {
+		transport.DialContext = config.DialContext
+	}
 	return &Client{
-		endpoint:     endpoint,
-		http:         &http.Client{Transport: transport, Timeout: requestTimeout},
-		pollInterval: pollInterval,
+		port: config.Port,
+		http: &http.Client{
+			Transport: transport,
+			Timeout:   requestTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}, nil
 }
 
-func (client *Client) WaitForReadiness(ctx context.Context, target Target, minimum guest.ReadinessLevel) (ReadinessStatus, error) {
-	minimumOrder := readinessOrder(minimum)
-	if minimumOrder == 0 {
-		return ReadinessStatus{}, errors.New("wait for guest readiness: minimum readiness level is invalid")
+// ReadReadiness returns exactly one current observation. Durable workflow
+// polling owns all deadline, retry, and minimum-level decisions.
+func (client *Client) ReadReadiness(ctx context.Context, target Target) (ReadinessStatus, error) {
+	var status ReadinessStatus
+	if err := client.post(ctx, target, readinessPath, ReadinessRequest{Target: target}, &status); err != nil {
+		return ReadinessStatus{}, err
 	}
-	for {
-		var status ReadinessStatus
-		if err := client.post(ctx, readinessPath, ReadinessRequest{Target: target}, &status); err != nil {
-			return ReadinessStatus{}, err
-		}
-		if readinessOrder(status.Snapshot.Level) >= minimumOrder {
-			return status, nil
-		}
-		timer := time.NewTimer(client.pollInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ReadinessStatus{}, ctx.Err()
-		case <-timer.C:
-		}
-	}
+	return status, nil
 }
 
 func (client *Client) ApplyProjectSeed(ctx context.Context, request ProjectSeedRequest) error {
-	return client.post(ctx, projectSeedPath, request, &emptyResponse{})
+	return client.post(ctx, request.Target, projectSeedPath, request, &emptyResponse{})
 }
 
 func (client *Client) RestoreSSHHostIdentity(ctx context.Context, target Target) (guest.SSHHostIdentityStatus, error) {
 	var response sshHostIdentityResponse
-	err := client.post(ctx, sshHostIdentityPath, targetRequest{Target: target}, &response)
+	err := client.post(ctx, target, sshHostIdentityPath, targetRequest{Target: target}, &response)
 	return response.Status, err
 }
 
 func (client *Client) ReconcileSSHKeys(ctx context.Context, target Target) error {
-	return client.post(ctx, sshKeysPath, targetRequest{Target: target}, &emptyResponse{})
+	return client.post(ctx, target, sshKeysPath, targetRequest{Target: target}, &emptyResponse{})
 }
 
 func (client *Client) ReconcileManagedConfiguration(ctx context.Context, target Target) error {
-	return client.post(ctx, managedConfigurationPath, targetRequest{Target: target}, &emptyResponse{})
+	return client.post(ctx, target, managedConfigurationPath, targetRequest{Target: target}, &emptyResponse{})
 }
 
 func (client *Client) PrepareShutdown(ctx context.Context, target Target) error {
-	return client.post(ctx, shutdownPath, targetRequest{Target: target}, &emptyResponse{})
+	return client.post(ctx, target, shutdownPath, targetRequest{Target: target}, &emptyResponse{})
 }
 
 func (client *Client) ApplyMaterialization(ctx context.Context, request MaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
 	var response materializationResponse
-	err := client.post(ctx, materializationPath, request, &response)
+	err := client.post(ctx, request.Target, materializationPath, request, &response)
 	return response.Results, err
 }
 
 func (client *Client) ReadActivitySnapshot(ctx context.Context, target Target) (ActivitySnapshot, error) {
 	var response activitySnapshotResponse
-	err := client.post(ctx, activitySnapshotPath, targetRequest{Target: target}, &response)
+	err := client.post(ctx, target, activitySnapshotPath, targetRequest{Target: target}, &response)
 	return response.Snapshot, err
 }
 
-func (client *Client) post(ctx context.Context, path string, input, output any) error {
+func (client *Client) post(ctx context.Context, target Target, path string, input, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {
 		return fmt.Errorf("encode guest control request: %w", err)
 	}
-	endpoint := *client.endpoint
-	endpoint.Path += path
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	address, err := targetControlAddress(target, client.port)
+	if err != nil {
+		return &TransportError{operation: path, message: err.Error(), transient: false, cause: err}
+	}
+	endpoint := "https://" + address + path
+	requestContext := context.WithValue(ctx, clientTargetContextKey{}, target)
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("construct guest control request: %w", err)
 	}
@@ -153,23 +183,63 @@ func (client *Client) post(ctx context.Context, path string, input, output any) 
 	request.Header.Set("Accept", "application/json")
 	response, err := client.http.Do(request)
 	if err != nil {
-		return &TransportError{operation: path, message: err.Error(), transient: true}
+		transient := !permanentConnectionError(err)
+		var classified interface{ Transient() bool }
+		if errors.As(err, &classified) {
+			transient = classified.Transient()
+		}
+		return &TransportError{operation: path, message: err.Error(), transient: transient, cause: err}
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		message := http.StatusText(response.StatusCode)
 		var failure errorResponse
-		decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
-		if decoder.Decode(&failure) == nil && failure.Error != "" {
+		content, readErr := io.ReadAll(io.LimitReader(response.Body, (32<<20)+1))
+		if readErr == nil && len(content) <= 32<<20 {
+			_ = json.Unmarshal(content, output)
+		}
+		if json.Unmarshal(content, &failure) == nil && failure.Error != "" {
 			message = failure.Error
 		}
-		return &TransportError{operation: path, message: message, transient: response.StatusCode >= 500}
+		transient := response.StatusCode >= 500 || response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooManyRequests
+		return &TransportError{operation: path, message: message, transient: transient}
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, defaultMaximumRequestBytes))
 	if err := decoder.Decode(output); err != nil {
 		return &TransportError{operation: path, message: "decode response: " + err.Error(), transient: true}
 	}
 	return nil
+}
+
+type clientTargetContextKey struct{}
+
+type staticClientCertificateSource struct{ certificate tls.Certificate }
+
+func (source staticClientCertificateSource) ClientCertificate(context.Context, Target) (tls.Certificate, error) {
+	return source.certificate, nil
+}
+
+func targetControlAddress(target Target, port int) (string, error) {
+	address, err := netip.ParseAddr(strings.TrimSpace(target.PrivateIPv4))
+	if err != nil || !address.Is4() || (!address.IsPrivate() && !address.IsLoopback()) {
+		return "", errors.New("target Runtime private IPv4 address is required")
+	}
+	return net.JoinHostPort(address.String(), strconv.Itoa(port)), nil
+}
+
+func permanentConnectionError(err error) bool {
+	var verification *tls.CertificateVerificationError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	var alert tls.AlertError
+	if errors.As(err, &verification) || errors.As(err, &unknownAuthority) || errors.As(err, &hostname) ||
+		errors.As(err, &invalid) || errors.As(err, &alert) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "tls:") && (strings.Contains(message, "certificate") ||
+		strings.Contains(message, "unknown authority") || strings.Contains(message, "hostname"))
 }
 
 func readinessOrder(level guest.ReadinessLevel) int {

@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/guest"
@@ -24,6 +26,10 @@ type ManagedConfigurationSource interface {
 	ManagedConfiguration(context.Context, Target) (guest.ProfileMaterializationBatch, error)
 }
 
+type SSHHostIdentityActivator interface {
+	ActivateAndVerify(context.Context, Target, string) error
+}
+
 type LocalOperationsConfig struct {
 	Target        Target
 	Readiness     *guest.ReadinessReporter
@@ -32,11 +38,13 @@ type LocalOperationsConfig struct {
 	CacheRoot     string
 	PlatformRoot  string
 	SSHDRoot      string
+	DevUID        int
+	DevGID        int
 
 	HostIdentityGenerator guest.SSHHostIdentityGenerator
+	HostIdentityActivator SSHHostIdentityActivator
 	SSHKeys               SSHKeySource
 	ManagedConfiguration  ManagedConfigurationSource
-	CapsuleGrants         capsuleoci.GrantProvider
 	Activity              *guest.Observer
 	Shutdown              func(context.Context) error
 }
@@ -53,6 +61,12 @@ func NewLocalOperations(config LocalOperationsConfig) (*LocalOperations, error) 
 	}
 	if config.Target.OwnerUserID == "" || config.Target.EnvironmentID == "" || config.Target.RuntimeID == "" || config.Target.ProviderID == "" || config.Target.PrivateIPv4 == "" {
 		return nil, errors.New("construct local guest operations: owner, Environment, Runtime, provider, and private address are required")
+	}
+	if config.DevUID <= 0 || config.DevGID <= 0 {
+		return nil, errors.New("construct local guest operations: positive dev UID and GID are required")
+	}
+	if config.HostIdentityActivator == nil {
+		return nil, errors.New("construct local guest operations: SSH host identity activator is required")
 	}
 	for name, value := range map[string]string{
 		"workspace": config.WorkspaceRoot, "home": config.HomeRoot, "cache": config.CacheRoot,
@@ -80,12 +94,21 @@ func (operations *LocalOperations) ApplyProjectSeed(ctx context.Context, request
 	if err := operations.validateTarget(request.Target); err != nil {
 		return err
 	}
+	if err := operations.canAdvance(ctx, guest.ReadinessProjectReady); err != nil {
+		return err
+	}
 	application, err := guest.NewProjectSeedApplication(request.Seed)
 	if err != nil {
-		return fmt.Errorf("prepare Project Seed: %w", err)
+		return permanentOperationError(fmt.Errorf("prepare Project Seed: %w", err))
 	}
 	if err := application.Apply(ctx, operations.config.WorkspaceRoot); err != nil {
+		if errors.Is(err, guest.ErrProjectSeedWorkspaceDiverged) {
+			return permanentOperationError(err)
+		}
 		return err
+	}
+	if err := chownUserTree(operations.config.WorkspaceRoot, operations.config.DevUID, operations.config.DevGID); err != nil {
+		return fmt.Errorf("set Project Seed ownership: %w", err)
 	}
 	return operations.advance(ctx, guest.ReadinessProjectReady)
 }
@@ -100,6 +123,9 @@ func (operations *LocalOperations) RestoreSSHHostIdentity(ctx context.Context, t
 	if err != nil {
 		return guest.SSHHostIdentityStatus{}, err
 	}
+	if err := operations.config.HostIdentityActivator.ActivateAndVerify(ctx, target, status.Fingerprint); err != nil {
+		return guest.SSHHostIdentityStatus{}, fmt.Errorf("activate SSH host identity: %w", err)
+	}
 	if err := operations.advance(ctx, guest.ReadinessSSHReady); err != nil {
 		return guest.SSHHostIdentityStatus{}, err
 	}
@@ -111,14 +137,17 @@ func (operations *LocalOperations) ReconcileSSHKeys(ctx context.Context, target 
 		return err
 	}
 	if operations.config.SSHKeys == nil {
-		return errors.New("reconcile SSH keys: key source is not configured")
+		return permanentOperationError(errors.New("reconcile SSH keys: key source is not configured"))
 	}
 	keys, err := operations.config.SSHKeys.SSHKeys(ctx, target)
 	if err != nil {
 		return fmt.Errorf("load SSH keys: %w", err)
 	}
 	_, err = guest.ReconcileDevAuthorizedKeys(guest.AuthorizedKeysRequest{HomeRoot: operations.config.HomeRoot, Keys: keys})
-	return err
+	if err != nil {
+		return err
+	}
+	return chownUserTree(filepath.Join(operations.config.HomeRoot, ".ssh"), operations.config.DevUID, operations.config.DevGID)
 }
 
 func (operations *LocalOperations) ReconcileManagedConfiguration(ctx context.Context, target Target) error {
@@ -126,7 +155,7 @@ func (operations *LocalOperations) ReconcileManagedConfiguration(ctx context.Con
 		return err
 	}
 	if operations.config.ManagedConfiguration == nil {
-		return errors.New("reconcile managed configuration: source is not configured")
+		return permanentOperationError(errors.New("reconcile managed configuration: source is not configured"))
 	}
 	batch, err := operations.config.ManagedConfiguration.ManagedConfiguration(ctx, target)
 	if err != nil {
@@ -135,7 +164,10 @@ func (operations *LocalOperations) ReconcileManagedConfiguration(ctx context.Con
 	batch.HomeRoot = operations.config.HomeRoot
 	batch.WorkspaceRoot = operations.config.WorkspaceRoot
 	_, err = guest.ApplyProfileMaterializations(batch)
-	return err
+	if err != nil {
+		return err
+	}
+	return operations.chownUserRoots()
 }
 
 func (operations *LocalOperations) PrepareShutdown(ctx context.Context, target Target) error {
@@ -143,7 +175,7 @@ func (operations *LocalOperations) PrepareShutdown(ctx context.Context, target T
 		return err
 	}
 	if operations.config.Shutdown == nil {
-		return errors.New("prepare Runtime shutdown: shutdown preparer is not configured")
+		return permanentOperationError(errors.New("prepare Runtime shutdown: shutdown preparer is not configured"))
 	}
 	return operations.config.Shutdown(ctx)
 }
@@ -153,16 +185,19 @@ func (operations *LocalOperations) ApplyMaterialization(ctx context.Context, req
 		return nil, err
 	}
 	if request.Lock.EnvironmentID != operations.config.Target.EnvironmentID {
-		return nil, errors.New("materialize Capsule Lock: Lock belongs to another Environment")
+		return nil, permanentOperationError(errors.New("materialize Capsule Lock: Lock belongs to another Environment"))
 	}
 	if subtle.ConstantTimeCompare([]byte(request.OwnerID), []byte(operations.config.Target.OwnerUserID)) != 1 {
-		return nil, errors.New("materialize Capsule Lock: owner does not match the Environment")
+		return nil, permanentOperationError(errors.New("materialize Capsule Lock: owner does not match the Environment"))
 	}
 	lock, err := domain.NewCapsuleLock(request.Lock)
 	if err != nil {
+		return nil, permanentOperationError(err)
+	}
+	if err := operations.canAdvance(ctx, guest.ReadinessAgentsValidated); err != nil {
 		return nil, err
 	}
-	grants := operations.config.CapsuleGrants
+	var grants capsuleoci.GrantProvider
 	if len(request.ReadGrants) > 0 {
 		grants, err = newReadGrantProvider(request.ReadGrants)
 		if err != nil {
@@ -178,7 +213,13 @@ func (operations *LocalOperations) ApplyMaterialization(ctx context.Context, req
 		SecretVersionIdentifiers: append([]string(nil), request.SecretVersionIdentifiers...),
 	})
 	if err != nil {
+		if errors.Is(err, guest.ErrProfileMaterializationBlocked) {
+			return results, permanentOperationError(err)
+		}
 		return nil, err
+	}
+	if err := operations.chownUserRoots(); err != nil {
+		return nil, fmt.Errorf("set Materialization ownership: %w", err)
 	}
 	if err := operations.advance(ctx, guest.ReadinessAgentsValidated); err != nil {
 		return nil, err
@@ -196,7 +237,7 @@ func newReadGrantProvider(grants map[string]ReadGrant) (*readGrantProvider, erro
 	for key, grant := range grants {
 		parsed, err := url.Parse(grant.URL)
 		if key == "" || err != nil || parsed.Scheme != "https" || parsed.Host == "" || grant.ExpiresAt.IsZero() {
-			return nil, errors.New("materialize Capsule Lock: read grant is invalid")
+			return nil, permanentOperationError(errors.New("materialize Capsule Lock: read grant is invalid"))
 		}
 		validated[key] = grant
 	}
@@ -210,11 +251,14 @@ func newReadGrantProvider(grants map[string]ReadGrant) (*readGrantProvider, erro
 
 func (provider *readGrantProvider) Grant(ctx context.Context, request capsuleoci.GrantRequest) (capsuleoci.Grant, error) {
 	if request.Operation != capsuleoci.GrantRead {
-		return capsuleoci.Grant{}, errors.New("Capsule grant permits reads only")
+		return capsuleoci.Grant{}, permanentOperationError(errors.New("Capsule grant permits reads only"))
 	}
 	grant, present := provider.grants[request.Key]
-	if !present || !time.Now().Before(grant.ExpiresAt) {
-		return capsuleoci.Grant{}, errors.New("Capsule read grant is absent or expired")
+	if !present {
+		return capsuleoci.Grant{}, permanentOperationError(errors.New("Capsule read grant is absent"))
+	}
+	if !time.Now().Before(grant.ExpiresAt) {
+		return capsuleoci.Grant{}, transientOperationError(errors.New("Capsule read grant is expired"))
 	}
 	return capsuleoci.Grant{
 		ExpiresAt: grant.ExpiresAt,
@@ -229,11 +273,39 @@ func (provider *readGrantProvider) Grant(ctx context.Context, request capsuleoci
 			}
 			if response.StatusCode != http.StatusOK {
 				response.Body.Close()
-				return nil, fmt.Errorf("Capsule read returned HTTP %d", response.StatusCode)
+				return nil, grantHTTPError{status: response.StatusCode}
 			}
 			return response.Body, nil
 		},
 	}, nil
+}
+
+type grantHTTPError struct{ status int }
+
+func (err grantHTTPError) Error() string {
+	return fmt.Sprintf("Capsule read returned HTTP %d", err.status)
+}
+func (err grantHTTPError) StatusCode() int { return err.status }
+func (err grantHTTPError) Transient() bool {
+	return err.status == http.StatusForbidden || err.status == http.StatusRequestTimeout || err.status == http.StatusTooManyRequests || err.status >= 500
+}
+
+func (operations *LocalOperations) chownUserRoots() error {
+	for _, root := range []string{operations.config.HomeRoot, operations.config.WorkspaceRoot} {
+		if err := chownUserTree(root, operations.config.DevUID, operations.config.DevGID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func chownUserTree(root string, uid, gid int) error {
+	return filepath.WalkDir(root, func(name string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Lchown(name, uid, gid)
+	})
 }
 
 func (operations *LocalOperations) ReadActivitySnapshot(ctx context.Context, target Target) (ActivitySnapshot, error) {
@@ -241,7 +313,7 @@ func (operations *LocalOperations) ReadActivitySnapshot(ctx context.Context, tar
 		return ActivitySnapshot{}, err
 	}
 	if operations.config.Activity == nil {
-		return ActivitySnapshot{}, errors.New("read Activity Snapshot: observer is not configured")
+		return ActivitySnapshot{}, permanentOperationError(errors.New("read Activity Snapshot: observer is not configured"))
 	}
 	snapshot, err := operations.config.Activity.Observe(ctx)
 	if err != nil {
@@ -264,11 +336,11 @@ func (operations *LocalOperations) validateTarget(target Target) error {
 		{name: "provider", expected: operations.config.Target.ProviderID, actual: target.ProviderID},
 	} {
 		if subtle.ConstantTimeCompare([]byte(identity.expected), []byte(identity.actual)) != 1 {
-			return fmt.Errorf("guest control request %s identity does not match the current boot", identity.name)
+			return permanentOperationError(fmt.Errorf("guest control request %s identity does not match the current boot", identity.name))
 		}
 	}
 	if target.PrivateIPv4 != "" && subtle.ConstantTimeCompare([]byte(operations.config.Target.PrivateIPv4), []byte(target.PrivateIPv4)) != 1 {
-		return errors.New("guest control request private address does not match the current boot")
+		return permanentOperationError(errors.New("guest control request private address does not match the current boot"))
 	}
 	return nil
 }
@@ -287,6 +359,18 @@ func (operations *LocalOperations) advance(ctx context.Context, desired guest.Re
 	}
 	_, err = operations.config.Readiness.Advance(ctx, desired, time.Now().UTC())
 	return err
+}
+
+func (operations *LocalOperations) canAdvance(ctx context.Context, desired guest.ReadinessLevel) error {
+	current, err := operations.config.Readiness.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	currentOrder, desiredOrder := readinessOrder(current.Level), readinessOrder(desired)
+	if currentOrder >= desiredOrder || currentOrder+1 == desiredOrder {
+		return nil
+	}
+	return permanentOperationError(fmt.Errorf("advance guest readiness: %s requires the preceding readiness level", desired))
 }
 
 var _ Operations = (*LocalOperations)(nil)
