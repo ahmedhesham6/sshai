@@ -112,5 +112,5 @@ func sameRuntimeReservation(runtime domain.RuntimeSnapshot, reservation domain.R
 	return runtime.ID == reservation.ID && runtime.EnvironmentID == reservation.EnvironmentID && runtime.Sequence == reservation.Sequence &&
 		runtime.RuntimePreset == reservation.RuntimePreset && runtime.Region == reservation.Region &&
 		runtime.AvailabilityZone == reservation.AvailabilityZone && runtime.ImageVersion == reservation.ImageVersion &&
-		runtime.CreatedAt.Equal(reservation.CreatedAt)
+		databaseTimeEqual(runtime.CreatedAt, reservation.CreatedAt)
 }

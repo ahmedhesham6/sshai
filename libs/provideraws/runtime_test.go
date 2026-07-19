@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	"github.com/ahmedhesham6/sshai/libs/provider/providertest"
@@ -35,6 +36,18 @@ type acceptedStartEC2 struct {
 type terminatedRuntimeEC2 struct {
 	*recordingEC2
 	describeCalls int
+}
+
+type asynchronousRetirementEC2 struct {
+	*recordingEC2
+	instanceState           types.InstanceStateName
+	detachRequested         bool
+	detachmentObservations  int
+	deleteOnTermination     bool
+	modifyCalls             int
+	detachCalls             int
+	terminateCalls          int
+	terminatedWhileAttached bool
 }
 
 func (client *divergentRuntimeEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
@@ -87,11 +100,23 @@ func (client *recordingEC2) TerminateInstances(context.Context, *ec2.TerminateIn
 	panic("unexpected TerminateInstances")
 }
 
+func (client *recordingEC2) ModifyInstanceAttribute(context.Context, *ec2.ModifyInstanceAttributeInput, ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error) {
+	panic("unexpected ModifyInstanceAttribute")
+}
+
 func (client *recordingEC2) CreateVolume(context.Context, *ec2.CreateVolumeInput, ...func(*ec2.Options)) (*ec2.CreateVolumeOutput, error) {
 	panic("unexpected CreateVolume")
 }
 
-func (client *recordingEC2) DescribeVolumes(_ context.Context, _ *ec2.DescribeVolumesInput, _ ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+func (client *recordingEC2) DescribeVolumes(_ context.Context, input *ec2.DescribeVolumesInput, _ ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+	if len(input.Filters) != 0 {
+		request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+		tags := append(ownershipTagsForTest("environment-1", "operation-2", systemVolumeResource), runtimeTags(request.RuntimeSpec)...)
+		return &ec2.DescribeVolumesOutput{Volumes: []types.Volume{{
+			AvailabilityZone: aws.String("us-east-1a"), Encrypted: aws.Bool(true), Size: aws.Int32(24),
+			VolumeId: aws.String("vol-system"), VolumeType: types.VolumeTypeGp3, Tags: tags,
+		}}}, nil
+	}
 	return &ec2.DescribeVolumesOutput{Volumes: []types.Volume{{
 		AvailabilityZone: aws.String("us-east-1a"), Encrypted: aws.Bool(true),
 		Size: aws.Int32(100), VolumeId: aws.String("vol-data"), VolumeType: types.VolumeTypeGp3,
@@ -145,7 +170,7 @@ func TestEnsureRuntimeInventoriesAllocationBeforeAttachingPersistentData(t *test
 	if err != nil {
 		t.Fatalf("EnsureRuntime(): %v", err)
 	}
-	if runtime.ProviderID != "i-runtime" || runtime.PrivateIPv4 != "" || runtime.State != provider.RuntimeStatePending || runtime.RuntimeID != "runtime-1" {
+	if runtime.Provider != "aws" || runtime.ProviderID != "i-runtime" || runtime.SystemVolumeProviderID != "vol-system" || runtime.PrivateIPv4 != "" || runtime.State != provider.RuntimeStatePending || runtime.RuntimeID != "runtime-1" {
 		t.Fatalf("Runtime = %#v", runtime)
 	}
 	assertRuntimeLaunchInput(t, client.runInput)
@@ -238,6 +263,149 @@ func TestRuntimeLifecycleReturnsPreTerminatedObservation(t *testing.T) {
 	}
 }
 
+func TestRuntimeObservationTreatsEC2ShuttingDownAsRetirementInProgress(t *testing.T) {
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	instance := ownedInstanceForTest("i-runtime", "runtime-1")
+	instance.State.Name = types.InstanceStateNameShuttingDown
+	instance.PrivateIpAddress = nil
+	observed, err := runtimeObservation(request.RuntimeSpec, instance)
+	if err != nil {
+		t.Fatalf("runtimeObservation(shutting-down): %v", err)
+	}
+	if observed.State != provider.RuntimeStateStopping {
+		t.Fatalf("shutting-down observation state = %q, want %q", observed.State, provider.RuntimeStateStopping)
+	}
+}
+
+func TestRetireRuntimeWaitsForPersistentDataDetachmentBeforeTermination(t *testing.T) {
+	client := &asynchronousRetirementEC2{
+		recordingEC2:        &recordingEC2{},
+		instanceState:       types.InstanceStateNameStopped,
+		deleteOnTermination: true,
+	}
+	adapter, err := newProvider(client, Config{
+		Region: "us-east-1", Environment: "development", SizeGiB: 100,
+		Runtime: RuntimeConfig{
+			AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"},
+			SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newProvider(): %v", err)
+	}
+	adapter.runtimePollInterval = time.Millisecond
+	adapter.runtimePollTimeout = time.Second
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	retired, err := adapter.RetireRuntime(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: "i-runtime"})
+	if err != nil {
+		t.Fatalf("RetireRuntime(): %v", err)
+	}
+	if retired.State != provider.RuntimeStateStopping || client.modifyCalls != 1 || client.detachCalls != 1 || client.terminateCalls != 1 || client.terminatedWhileAttached {
+		t.Fatalf("retirement = %#v modify:%d detach:%d terminate:%d attached-at-terminate:%t", retired, client.modifyCalls, client.detachCalls, client.terminateCalls, client.terminatedWhileAttached)
+	}
+	if client.detachmentObservations < 2 {
+		t.Fatalf("detachment observations = %d, want asynchronous detaching then detached", client.detachmentObservations)
+	}
+}
+
+func TestRetireRuntimeReplayObservesDetachAlreadyInProgress(t *testing.T) {
+	client := &asynchronousRetirementEC2{
+		recordingEC2: &recordingEC2{}, instanceState: types.InstanceStateNameStopped,
+		detachRequested: true, deleteOnTermination: false,
+	}
+	adapter, err := newProvider(client, Config{
+		Region: "us-east-1", Environment: "development", SizeGiB: 100,
+		Runtime: RuntimeConfig{
+			AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"},
+			SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newProvider(): %v", err)
+	}
+	adapter.runtimePollInterval = time.Millisecond
+	adapter.runtimePollTimeout = time.Second
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	retired, err := adapter.RetireRuntime(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: "i-runtime"})
+	if err != nil {
+		t.Fatalf("RetireRuntime(detach replay): %v", err)
+	}
+	if retired.State != provider.RuntimeStateStopping || client.detachCalls != 0 || client.terminateCalls != 1 || client.terminatedWhileAttached {
+		t.Fatalf("detachment replay = %#v detach:%d terminate:%d attached-at-terminate:%t", retired, client.detachCalls, client.terminateCalls, client.terminatedWhileAttached)
+	}
+}
+
+func TestRetireRuntimeReplayAcceptsTerminationInProgress(t *testing.T) {
+	client := &asynchronousRetirementEC2{
+		recordingEC2:  &recordingEC2{},
+		instanceState: types.InstanceStateNameShuttingDown,
+	}
+	adapter, err := newProvider(client, Config{
+		Region: "us-east-1", Environment: "development", SizeGiB: 100,
+		Runtime: RuntimeConfig{
+			AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"},
+			SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newProvider(): %v", err)
+	}
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	retiring, err := adapter.RetireRuntime(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: "i-runtime"})
+	if err != nil {
+		t.Fatalf("RetireRuntime(replay): %v", err)
+	}
+	if retiring.State != provider.RuntimeStateStopping || client.terminateCalls != 0 {
+		t.Fatalf("retirement replay = %#v terminate calls:%d", retiring, client.terminateCalls)
+	}
+}
+
+func (client *asynchronousRetirementEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+	instance := ownedInstanceForTest("i-runtime", "runtime-1")
+	instance.State.Name = client.instanceState
+	instance.PrivateIpAddress = nil
+	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{instance}}}}, nil
+}
+
+func (client *asynchronousRetirementEC2) DescribeVolumes(context.Context, *ec2.DescribeVolumesInput, ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+	volume := types.Volume{
+		AvailabilityZone: aws.String("us-east-1a"), Encrypted: aws.Bool(true), Size: aws.Int32(100),
+		VolumeId: aws.String("vol-data"), VolumeType: types.VolumeTypeGp3,
+		Tags: ownershipTagsForTest("environment-1", "operation-1", "data-volume"),
+	}
+	if !client.detachRequested || client.detachmentObservations < 2 {
+		state := types.VolumeAttachmentStateAttached
+		if client.detachRequested {
+			state = types.VolumeAttachmentStateDetaching
+			client.detachmentObservations++
+		}
+		volume.Attachments = []types.VolumeAttachment{{
+			Device: aws.String("/dev/sdf"), InstanceId: aws.String("i-runtime"), VolumeId: aws.String("vol-data"),
+			DeleteOnTermination: aws.Bool(client.deleteOnTermination), State: state,
+		}}
+	}
+	return &ec2.DescribeVolumesOutput{Volumes: []types.Volume{volume}}, nil
+}
+
+func (client *asynchronousRetirementEC2) ModifyInstanceAttribute(context.Context, *ec2.ModifyInstanceAttributeInput, ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error) {
+	client.modifyCalls++
+	client.deleteOnTermination = false
+	return &ec2.ModifyInstanceAttributeOutput{}, nil
+}
+
+func (client *asynchronousRetirementEC2) DetachVolume(context.Context, *ec2.DetachVolumeInput, ...func(*ec2.Options)) (*ec2.DetachVolumeOutput, error) {
+	client.detachCalls++
+	client.detachRequested = true
+	return &ec2.DetachVolumeOutput{State: types.VolumeAttachmentStateDetaching}, nil
+}
+
+func (client *asynchronousRetirementEC2) TerminateInstances(context.Context, *ec2.TerminateInstancesInput, ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error) {
+	client.terminateCalls++
+	client.terminatedWhileAttached = !client.detachRequested || client.detachmentObservations < 2
+	client.instanceState = types.InstanceStateNameShuttingDown
+	return &ec2.TerminateInstancesOutput{}, nil
+}
+
 func TestRuntimeProviderConformance(t *testing.T) {
 	providertest.RunRuntimeLifecycle(t, func(t *testing.T) providertest.RuntimeHarness {
 		adapter, ec2Client := startAdapter(t)
@@ -284,6 +452,10 @@ func TestRuntimeReplacementRetiresOldBeforeReattachingPersistentData(t *testing.
 		t.Fatal("EnsureRuntime() attached replacement before retiring old Runtime")
 	}
 	lifecycle := oldLifecycle
+	attached, err := adapter.ObserveRuntimeDataVolumeAttachment(t.Context(), lifecycle)
+	if err != nil || !attached.Attached || !attached.ReadWrite || attached.RuntimeProviderID != old.ProviderID {
+		t.Fatalf("old Runtime Data Volume attachment = %#v, %v", attached, err)
+	}
 	if _, err := adapter.StartRuntime(t.Context(), lifecycle); err != nil {
 		t.Fatalf("StartRuntime(): %v", err)
 	}
@@ -292,6 +464,10 @@ func TestRuntimeReplacementRetiresOldBeforeReattachingPersistentData(t *testing.
 	}
 	if _, err := adapter.RetireRuntime(t.Context(), lifecycle); err != nil {
 		t.Fatalf("RetireRuntime(): %v", err)
+	}
+	detached, err := adapter.ObserveRuntimeDataVolumeAttachment(t.Context(), lifecycle)
+	if err != nil || detached.Attached || detached.DataVolumeProviderID != volume.ProviderID {
+		t.Fatalf("retired Runtime Data Volume attachment = %#v, %v", detached, err)
 	}
 	replacement, err := adapter.EnsureRuntime(t.Context(), newRequest)
 	if err != nil {
@@ -413,6 +589,9 @@ func ownedInstanceForTest(providerID, runtimeID string) types.Instance {
 		InstanceId: aws.String(providerID), ImageId: aws.String("ami-pinned"), InstanceType: types.InstanceType("m7i.xlarge"),
 		Placement: &types.Placement{AvailabilityZone: aws.String("us-east-1a")}, PrivateIpAddress: aws.String("10.0.0.4"),
 		State: &types.InstanceState{Name: types.InstanceStateNameRunning}, Tags: tags,
+		BlockDeviceMappings: []types.InstanceBlockDeviceMapping{{
+			DeviceName: aws.String("/dev/sda1"), Ebs: &types.EbsInstanceBlockDevice{VolumeId: aws.String("vol-system")},
+		}},
 	}
 }
 

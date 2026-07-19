@@ -112,13 +112,20 @@ func run(ctx context.Context) error {
 	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, idGenerator{}, time.Now)
 	autoStop := workflows.AutoStopDefinition(snapshots, runtimeStopDispatcher{store: store, commands: runtimeCommands})
 	runtimeStart := workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{
-		Provider: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Credits: store,
+		Provider: runtimeProvider, Attachments: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Credits: store,
 		Images: promotedImageSource{image: config.imageVersion}, Usage: store, Guest: guest, SSHKeys: guest,
-		Managed: guest, AutoStop: workflowClient, IDs: idGenerator{}, Now: time.Now,
+		Managed: guest, ReplacementActions: runtimeActions, HostIdentity: guest,
+		AutoStop: workflowClient, IDs: idGenerator{}, Now: time.Now,
 	})
 	runtimeStop := workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{
 		Provider: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Snapshots: snapshots,
 		Guest: guest, Usage: store, AutoStop: workflowClient, Now: time.Now,
+	})
+	runtimeReplace := workflows.RuntimeReplaceDefinition(workflows.RuntimeReplaceDependencies{
+		Provider: runtimeProvider, Attachments: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes,
+		Images: promotedImageSource{image: config.imageVersion}, Usage: store, Guest: guest,
+		HostIdentity: guest, SSHKeys: guest, Managed: guest, AutoStop: workflowClient,
+		IDs: idGenerator{}, Now: time.Now,
 	})
 
 	restateServer := server.NewRestate()
@@ -134,6 +141,7 @@ func run(ctx context.Context) error {
 		autoStop:       autoStop,
 		runtimeStart:   runtimeStart,
 		runtimeStop:    runtimeStop,
+		runtimeReplace: runtimeReplace,
 	}) {
 		restateServer.Bind(service)
 	}
@@ -156,6 +164,7 @@ type serviceDependencies struct {
 	autoStop          restate.ServiceDefinition
 	runtimeStart      restate.ServiceDefinition
 	runtimeStop       restate.ServiceDefinition
+	runtimeReplace    restate.ServiceDefinition
 }
 
 func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition {
@@ -164,7 +173,7 @@ func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition
 	}
 	for _, pending := range []restate.ServiceDefinition{
 		dependencies.environmentCreate, dependencies.profileResolve, dependencies.autoStop,
-		dependencies.runtimeStart, dependencies.runtimeStop,
+		dependencies.runtimeStart, dependencies.runtimeStop, dependencies.runtimeReplace,
 	} {
 		if pending != nil {
 			services = append(services, pending)

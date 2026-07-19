@@ -3,6 +3,7 @@ SELECT id, environment_id, operation_id, provider, region, provider_id,
        metadata, created_at, deleted_at
 FROM provider_resources
 WHERE operation_id = sqlc.arg(operation_id)
+  AND resource_type = 'data_volume'
 ORDER BY created_at, id;
 
 -- name: ListEnvironmentStateComponents :many

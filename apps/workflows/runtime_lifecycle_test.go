@@ -74,7 +74,6 @@ func TestRuntimeStartWorkflow(t *testing.T) {
 		{name: "pending progresses to running", configure: func(h *runtimeWorkflowHarness) { h.provider.startPending = true }, wantRoute: "10.0.0.8", wantStatus: domain.RuntimeReady, wantObserves: 2, wantStarts: 1, wantOpens: 1, wantManaged: 1},
 		{name: "already ready short circuit", configure: func(h *runtimeWorkflowHarness) { h.actions.state.Runtime = readyRuntimeSnapshot() }, wantRoute: "10.0.0.7", wantStatus: domain.RuntimeReady},
 		{name: "credit blocked finalizes Operation", configure: func(h *runtimeWorkflowHarness) { h.credits.credits = 0 }, wantErrorCode: CreditsPolicyBlocked, wantFailure: CreditsPolicyBlocked, wantStatus: domain.RuntimeStopped, wantObserves: 1},
-		{name: "upgrade requires future replace workflow", configure: func(h *runtimeWorkflowHarness) { h.images.image = "image-v2" }, wantErrorCode: ReplaceRequired, wantFailure: ReplaceRequired, wantStatus: domain.RuntimeStopped, wantObserves: 1},
 		{name: "readiness failure marks Runtime error and keeps usage open", configure: func(h *runtimeWorkflowHarness) {
 			h.guest.readiness = RuntimeGuestReadiness{BootID: "boot-new", PrivateIPv4: "10.0.0.8", DataMounted: false}
 		}, wantErrorCode: GuestNotReady, wantFailure: GuestNotReady, wantStatus: domain.RuntimeError, wantObserves: 1, wantStarts: 1, wantOpens: 1},
@@ -151,9 +150,6 @@ func TestRuntimeStartWorkflow(t *testing.T) {
 			}
 			if harness.provider.observeCalls != test.wantObserves || harness.provider.startCalls != test.wantStarts || harness.usage.openCalls != test.wantOpens {
 				t.Fatalf("provider observes / starts / usage opens = %d/%d/%d, want %d/%d/%d", harness.provider.observeCalls, harness.provider.startCalls, harness.usage.openCalls, test.wantObserves, test.wantStarts, test.wantOpens)
-			}
-			if test.wantErrorCode == ReplaceRequired && harness.actions.decision != "replace:image-v2" {
-				t.Fatalf("replace decision = %q", harness.actions.decision)
 			}
 			if harness.actions.failureCode != test.wantFailure && test.wantFailure != "" {
 				t.Fatalf("Operation failure = %q, want %q", harness.actions.failureCode, test.wantFailure)
@@ -963,6 +959,7 @@ type runtimeGuestFake struct {
 	shutdownCalls, readyCalls int
 	sshCalls, snapshotCalls   int
 	managedCalls              int
+	hostIdentityCalls         int
 	readiness                 RuntimeGuestReadiness
 	snapshotErr               error
 	snapshotLag               time.Duration
@@ -989,6 +986,13 @@ func (fake *runtimeGuestFake) ReconcileRuntimeSSHKeys(_ context.Context, request
 		return errors.New("unexpected SSH Key owner")
 	}
 	fake.sshCalls++
+	return nil
+}
+func (fake *runtimeGuestFake) RestoreRuntimeSSHHostIdentity(_ context.Context, request RuntimeGuestReadinessRequest) error {
+	if request.OwnerUserID != fake.expectedOwnerID {
+		return errors.New("unexpected SSH host identity owner")
+	}
+	fake.hostIdentityCalls++
 	return nil
 }
 func (fake *runtimeGuestFake) PrepareRuntimeShutdown(_ context.Context, request RuntimeGuestReadinessRequest) error {

@@ -96,6 +96,7 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if err != nil {
 		t.Fatalf("RetireRuntime(): %v", err)
 	}
+	retired = awaitTerminated(t, ctx, harness.Adapter, request, retired)
 	if retired.State != provider.RuntimeStateTerminated || retired.PrivateIPv4 != "" {
 		t.Fatalf("retired Runtime = %#v", retired)
 	}
@@ -112,6 +113,36 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if harness.AssertDataVolumePreserved != nil {
 		harness.AssertDataVolumePreserved(t)
 	}
+}
+
+func awaitTerminated(
+	t *testing.T,
+	ctx context.Context,
+	adapter provider.RuntimeProvider,
+	request provider.RuntimeLifecycleRequest,
+	observation provider.Runtime,
+) provider.Runtime {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for observation.State != provider.RuntimeStateTerminated {
+		if observation.State != provider.RuntimeStateStopping {
+			t.Fatalf("retiring Runtime = %#v", observation)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("observe retiring Runtime: %v", ctx.Err())
+		case <-deadline.C:
+			t.Fatalf("Runtime remained terminating: %#v", observation)
+		case <-time.After(10 * time.Millisecond):
+		}
+		var err error
+		observation, err = adapter.ObserveRuntime(ctx, request)
+		if err != nil {
+			t.Fatalf("ObserveRuntime() after retirement: %v", err)
+		}
+	}
+	return observation
 }
 
 func awaitRunning(
@@ -154,7 +185,7 @@ func awaitRunning(
 
 func assertRuntimeOwnership(t *testing.T, runtime provider.Runtime, spec provider.RuntimeSpec) {
 	t.Helper()
-	if runtime.ProviderID == "" || runtime.RuntimeID != spec.RuntimeID || runtime.EnvironmentID != spec.EnvironmentID ||
+	if runtime.Provider == "" || runtime.ProviderID == "" || runtime.SystemVolumeProviderID == "" || runtime.RuntimeID != spec.RuntimeID || runtime.EnvironmentID != spec.EnvironmentID ||
 		runtime.Sequence != spec.Sequence || runtime.Region != spec.Region || runtime.AvailabilityZone != spec.AvailabilityZone ||
 		runtime.RuntimePreset != spec.RuntimePreset || runtime.ImageVersion != spec.ImageVersion ||
 		runtime.DataVolumeProviderID != spec.DataVolumeProviderID || (runtime.PrivateIPv4 != "" && !privateIPv4(runtime.PrivateIPv4)) {

@@ -22,6 +22,9 @@ type RuntimeStartDependencies struct {
 	Guest                RuntimeGuestReadinessSource
 	SSHKeys              RuntimeSSHKeyReconciler
 	Managed              RuntimeManagedConfigurationReconciler
+	ReplacementActions   RuntimeReplaceActions
+	Attachments          provider.RuntimeDataVolumeAttachmentObserver
+	HostIdentity         RuntimeSSHHostIdentityReconciler
 	AutoStop             RuntimeAutoStopController
 	IDs                  IDGenerator
 	Now                  func() time.Time
@@ -133,9 +136,17 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 		}, restate.WithName("record-replace-on-start")); err != nil {
 			return RuntimeStartOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStartFailed, err.Error(), dependencies.Now)
 		}
-		// S4 seam: replace this terminal outcome with durable runtime.replace
-		// fulfillment once that workflow exists. Never acknowledge readiness here.
-		return RuntimeStartOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, ReplaceRequired, "a newer promoted image requires Runtime replacement", dependencies.Now)
+		output, replaceErr := fulfillRuntimeReplacement(ctx, RuntimeReplaceDependencies{
+			Provider: dependencies.Provider, Attachments: dependencies.Attachments, Actions: dependencies.ReplacementActions,
+			DataVolumes: dependencies.DataVolumes, Usage: dependencies.Usage, Guest: dependencies.Guest,
+			HostIdentity: dependencies.HostIdentity, SSHKeys: dependencies.SSHKeys, Managed: dependencies.Managed,
+			AutoStop: dependencies.AutoStop, IDs: dependencies.IDs, Now: dependencies.Now,
+			ProviderPollInterval: dependencies.ProviderPollInterval, ProviderPollTimeout: dependencies.ProviderPollTimeout,
+		}, input, state, promotedImage)
+		if replaceErr != nil {
+			return RuntimeStartOutput{}, replaceErr
+		}
+		return RuntimeStartOutput{RuntimeID: output.ReplacementRuntimeID, PrivateRoute: output.PrivateRoute}, nil
 	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.Actions.RecordRuntimeStartDecision(runCtx, input.OperationID, "start", promotedImage))

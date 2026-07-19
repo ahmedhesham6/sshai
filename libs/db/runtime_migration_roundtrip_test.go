@@ -58,3 +58,28 @@ func TestRuntimeMigrationDownUpRoundTripRemovesRuntimeOwnedState(t *testing.T) {
 		t.Fatalf("round trip retained current Runtime/Operation = %v/%d", currentRuntimeID, operationCount)
 	}
 }
+
+func TestRuntimeProviderResourceMigrationDownUpRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	database, _ := testfixtures.OpenPostgres(t, ctx)
+	migrations, err := fs.Sub(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("migrate through Runtime Provider Resource inventory: %v", err)
+	}
+	if _, err := provider.DownTo(ctx, 19); err != nil {
+		t.Fatalf("migrate Runtime Provider Resource inventory down: %v", err)
+	}
+	assertMigrationColumnCount(t, ctx, database, "provider_resources", "runtime_id", 0)
+	if _, err := provider.UpTo(ctx, 20); err != nil {
+		t.Fatalf("migrate Runtime Provider Resource inventory up again: %v", err)
+	}
+	assertMigrationColumnCount(t, ctx, database, "provider_resources", "runtime_id", 1)
+	assertMigrationColumnCount(t, ctx, database, "runtimes", "provider_resource_id", 1)
+}

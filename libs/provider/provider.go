@@ -94,9 +94,11 @@ type RuntimeLifecycleRequest struct {
 
 type Runtime struct {
 	RuntimeSpec
-	ProviderID  string
-	PrivateIPv4 string
-	State       RuntimeState
+	Provider               string
+	ProviderID             string
+	SystemVolumeProviderID string
+	PrivateIPv4            string
+	State                  RuntimeState
 }
 
 type RuntimeProvider interface {
@@ -106,4 +108,18 @@ type RuntimeProvider interface {
 	StopRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)
 	RetireRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)
 	ObserveRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)
+}
+
+type RuntimeDataVolumeAttachment struct {
+	DataVolumeProviderID string
+	RuntimeProviderID    string
+	Attached             bool
+	ReadWrite            bool
+}
+
+// RuntimeDataVolumeAttachmentObserver is kept separate from RuntimeProvider
+// so lifecycle adapters can expose the replacement safety observation without
+// widening providers that do not manage persistent attachments.
+type RuntimeDataVolumeAttachmentObserver interface {
+	ObserveRuntimeDataVolumeAttachment(context.Context, RuntimeLifecycleRequest) (RuntimeDataVolumeAttachment, error)
 }
