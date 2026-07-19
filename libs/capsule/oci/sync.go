@@ -82,47 +82,75 @@ func CapsuleReadKeys(ctx context.Context, ownerID string, capsuleDigests []strin
 		return nil, err
 	}
 	seenCapsules := make(map[string]struct{}, len(capsuleDigests))
-	seenKeys := make(map[string]struct{})
+	orderedDigests := make([]string, 0, len(capsuleDigests))
 	for _, capsuleDigest := range capsuleDigests {
 		if _, duplicate := seenCapsules[capsuleDigest]; duplicate {
 			continue
 		}
 		seenCapsules[capsuleDigest] = struct{}{}
-		target, err := parseSHA256Digest(capsuleDigest)
-		if err != nil {
-			return nil, invalidContent("discover Capsule read keys: target digest: %v", err)
-		}
-		indexKey := IndexKey(ownerID, target.String())
-		indexBytes, err := client.readObject(ctx, indexKey, maxIndexSize)
-		if err != nil {
-			return nil, fmt.Errorf("discover Capsule read keys: fetch OCI index: %w", err)
-		}
-		manifestDescriptor, err := findManifestDescriptor(indexBytes, target.String())
-		if err != nil {
-			return nil, fmt.Errorf("discover Capsule read keys: resolve target %s: %w", target, err)
-		}
-		manifestKey := ManifestKey(ownerID, manifestDescriptor.Digest.String())
-		manifestBytes, err := client.readObjectAsBlob(ctx, manifestKey, manifestDescriptor)
-		if err != nil {
-			return nil, fmt.Errorf("discover Capsule read keys: fetch image manifest: %w", err)
-		}
-		var imageManifest ocispec.Manifest
-		if err := json.Unmarshal(manifestBytes, &imageManifest); err != nil {
-			return nil, invalidContent("discover Capsule read keys: decode image manifest: %v", err)
-		}
-		if imageManifest.MediaType != ocispec.MediaTypeImageManifest || imageManifest.ArtifactType != capsule.ArtifactMediaType || imageManifest.Config.MediaType != ConfigMediaType {
-			return nil, invalidContent("discover Capsule read keys: remote object is not a Capsule image manifest")
-		}
-		seenKeys[indexKey] = struct{}{}
-		seenKeys[manifestKey] = struct{}{}
-		seenKeys[BlobKey(ownerID, imageManifest.Config.Digest.String())] = struct{}{}
-		for _, layer := range imageManifest.Layers {
-			seenKeys[BlobKey(ownerID, layer.Digest.String())] = struct{}{}
+		orderedDigests = append(orderedDigests, capsuleDigest)
+	}
+	sort.Strings(orderedDigests)
+	discovered := make([][]string, len(orderedDigests))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(client.parallelism)
+	for index, capsuleDigest := range orderedDigests {
+		index, capsuleDigest := index, capsuleDigest
+		group.Go(func() error {
+			keys, err := client.capsuleReadKeys(groupCtx, capsuleDigest)
+			if err != nil {
+				return err
+			}
+			discovered[index] = keys
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	seenKeys := make(map[string]struct{})
+	for _, keys := range discovered {
+		for _, key := range keys {
+			seenKeys[key] = struct{}{}
 		}
 	}
 	keys := make([]string, 0, len(seenKeys))
 	for key := range seenKeys {
 		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+func (client *Client) capsuleReadKeys(ctx context.Context, capsuleDigest string) ([]string, error) {
+	target, err := parseSHA256Digest(capsuleDigest)
+	if err != nil {
+		return nil, invalidContent("discover Capsule read keys: target digest: %v", err)
+	}
+	indexKey := IndexKey(client.ownerID, target.String())
+	indexBytes, err := client.readObject(ctx, indexKey, maxIndexSize)
+	if err != nil {
+		return nil, fmt.Errorf("discover Capsule read keys: fetch OCI index: %w", err)
+	}
+	manifestDescriptor, err := findManifestDescriptor(indexBytes, target.String())
+	if err != nil {
+		return nil, fmt.Errorf("discover Capsule read keys: resolve target %s: %w", target, err)
+	}
+	manifestKey := ManifestKey(client.ownerID, manifestDescriptor.Digest.String())
+	manifestBytes, err := client.readObjectAsBlob(ctx, manifestKey, manifestDescriptor)
+	if err != nil {
+		return nil, fmt.Errorf("discover Capsule read keys: fetch image manifest: %w", err)
+	}
+	var imageManifest ocispec.Manifest
+	if err := json.Unmarshal(manifestBytes, &imageManifest); err != nil {
+		return nil, invalidContent("discover Capsule read keys: decode image manifest: %v", err)
+	}
+	if imageManifest.MediaType != ocispec.MediaTypeImageManifest || imageManifest.ArtifactType != capsule.ArtifactMediaType || imageManifest.Config.MediaType != ConfigMediaType {
+		return nil, invalidContent("discover Capsule read keys: remote object is not a Capsule image manifest")
+	}
+	keys := []string{indexKey, manifestKey, BlobKey(client.ownerID, imageManifest.Config.Digest.String())}
+	for _, layer := range imageManifest.Layers {
+		keys = append(keys, BlobKey(client.ownerID, layer.Digest.String()))
 	}
 	sort.Strings(keys)
 	return keys, nil

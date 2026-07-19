@@ -63,6 +63,24 @@ func TestReadinessReporterAdvancesExactLevelsForCurrentBoot(t *testing.T) {
 	}
 }
 
+func TestCompareReadinessDefinesCanonicalOrdering(t *testing.T) {
+	levels := []guest.ReadinessLevel{
+		guest.ReadinessAllocated, guest.ReadinessDataMounted, guest.ReadinessSSHReady,
+		guest.ReadinessProjectReady, guest.ReadinessAgentsValidated,
+	}
+	for index, level := range levels {
+		if guest.CompareReadiness(level, level) != 0 {
+			t.Fatalf("CompareReadiness(%q, itself) != 0", level)
+		}
+		if index > 0 && guest.CompareReadiness(level, levels[index-1]) <= 0 {
+			t.Fatalf("CompareReadiness(%q, %q) did not advance", level, levels[index-1])
+		}
+	}
+	if guest.CompareReadiness("unknown", guest.ReadinessAllocated) >= 0 {
+		t.Fatal("unknown readiness did not sort before allocated")
+	}
+}
+
 func TestReadinessReporterRejectsSkippedRegressedAndStaleTransitions(t *testing.T) {
 	allocatedAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	identity := guest.BootIdentity{RuntimeID: "runtime-1", BootID: "boot-1", RuntimeSequence: 1}

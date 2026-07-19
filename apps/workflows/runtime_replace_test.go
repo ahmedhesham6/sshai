@@ -160,7 +160,7 @@ func TestRuntimeStartOutdatedImageIsFulfilledByOneReplacementOperation(t *testin
 	}
 }
 
-func TestRuntimeStartNeverInterruptsReadySessionForImageUpgrade(t *testing.T) {
+func TestRuntimeStartNeverInterruptsReadyRuntimeForImageUpgrade(t *testing.T) {
 	harness := newRuntimeReplaceHarness(true)
 	dependencies := RuntimeStartDependencies{Actions: harness.actions, Images: harness.images, Now: harness.now}
 	environment := testfixtures.StartRestate(t, RuntimeStartDefinition(dependencies))
@@ -175,7 +175,7 @@ func TestRuntimeStartNeverInterruptsReadySessionForImageUpgrade(t *testing.T) {
 		t.Fatalf("ready Runtime start = %#v, %v", output, err)
 	}
 	if harness.provider.stopCalls != 0 || harness.provider.retireCalls != 0 || harness.provider.ensureCalls != 0 {
-		t.Fatalf("running session stop/retire/ensure calls = %d/%d/%d", harness.provider.stopCalls, harness.provider.retireCalls, harness.provider.ensureCalls)
+		t.Fatalf("ready Runtime stop/retire/ensure calls = %d/%d/%d", harness.provider.stopCalls, harness.provider.retireCalls, harness.provider.ensureCalls)
 	}
 	if harness.images.calls != 0 {
 		t.Fatalf("promoted image reads = %d, want 0 for ready short circuit", harness.images.calls)

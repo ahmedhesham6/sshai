@@ -22,6 +22,7 @@ type recordingEC2 struct {
 	attachErr                 error
 	omitSystemVolumeMapping   bool
 	systemVolumeDescribeCalls int
+	systemVolumeTagOverrides  map[string]string
 }
 
 type divergentRuntimeEC2 struct {
@@ -115,6 +116,13 @@ func (client *recordingEC2) DescribeVolumes(_ context.Context, input *ec2.Descri
 		client.systemVolumeDescribeCalls++
 		request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
 		tags := append(ownershipTagsForTest("environment-1", "operation-2", systemVolumeResource), runtimeTags(request.RuntimeSpec)...)
+		for key, value := range client.systemVolumeTagOverrides {
+			for index := range tags {
+				if aws.ToString(tags[index].Key) == key {
+					tags[index].Value = aws.String(value)
+				}
+			}
+		}
 		return &ec2.DescribeVolumesOutput{Volumes: []types.Volume{{
 			AvailabilityZone: aws.String("us-east-1a"), Encrypted: aws.Bool(true), Size: aws.Int32(24),
 			VolumeId: aws.String("vol-system"), VolumeType: types.VolumeTypeGp3, Tags: tags,
@@ -216,8 +224,31 @@ func TestEnsureRuntimeInventoriesAllocationBeforeAttachingPersistentData(t *test
 	if attached.SystemVolumeProviderID != "vol-system" {
 		t.Fatalf("attached Runtime system volume = %q, want %q", attached.SystemVolumeProviderID, "vol-system")
 	}
+	if client.systemVolumeDescribeCalls != 1 {
+		t.Fatalf("attachment described filtered system volume %d times, want 1", client.systemVolumeDescribeCalls)
+	}
 	if client.attachInput == nil || aws.ToString(client.attachInput.InstanceId) != "i-runtime" || aws.ToString(client.attachInput.VolumeId) != "vol-data" || aws.ToString(client.attachInput.Device) != "/dev/sdf" {
 		t.Fatalf("AttachVolume input = %#v", client.attachInput)
+	}
+}
+
+func TestEnsureRuntimeDataVolumeAttachmentRejectsDivergentSystemVolumeTags(t *testing.T) {
+	client := &recordingEC2{runInput: &ec2.RunInstancesInput{}, systemVolumeTagOverrides: map[string]string{tagEnvironmentID: "environment-other"}}
+	adapter, err := newProvider(client, Config{
+		Region: "us-east-1", Environment: "development", SizeGiB: 100,
+		Runtime: RuntimeConfig{AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"}, SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	_, err = adapter.EnsureRuntimeDataVolumeAttachment(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: "i-runtime"})
+	assertProviderError(t, err, provider.ErrorCodeResourceDiverged)
+	if client.attachInput != nil {
+		t.Fatalf("divergent system volume allowed Data Volume attachment: %#v", client.attachInput)
+	}
+	if client.systemVolumeDescribeCalls != 1 {
+		t.Fatalf("divergent attachment described filtered system volume %d times, want 1", client.systemVolumeDescribeCalls)
 	}
 }
 
@@ -309,6 +340,30 @@ func TestRuntimeObservationTreatsEC2ShuttingDownAsRetirementInProgress(t *testin
 	}
 	if observed.State != provider.RuntimeStateStopping {
 		t.Fatalf("shutting-down observation state = %q, want %q", observed.State, provider.RuntimeStateStopping)
+	}
+}
+
+func TestRuntimeStartAndStopRejectRetirementInProgress(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		invoke func(*Provider, context.Context, provider.RuntimeLifecycleRequest) (provider.Runtime, error)
+	}{
+		{name: "start", invoke: (*Provider).StartRuntime},
+		{name: "stop", invoke: (*Provider).StopRuntime},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &asynchronousRetirementEC2{recordingEC2: &recordingEC2{}, instanceState: types.InstanceStateNameShuttingDown}
+			adapter, err := newProvider(client, Config{
+				Region: "us-east-1", Environment: "development", SizeGiB: 100,
+				Runtime: RuntimeConfig{AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"}, SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+			_, err = test.invoke(adapter, t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: "i-runtime"})
+			assertProviderError(t, err, provider.ErrorCodeResourceDiverged)
+		})
 	}
 }
 

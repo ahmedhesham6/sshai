@@ -296,12 +296,8 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 	if attached.Failure != "" {
 		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, attached.FailureCode, attached.Failure)
 	}
-	if err := validateProviderRuntimeIdentity(attached.Runtime, lifecycleRequest); err != nil {
+	if err := validateAttachedProviderRuntime(attached.Runtime, lifecycleRequest); err != nil {
 		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, string(provider.ErrorCodeResourceDiverged), err.Error())
-	}
-	if attached.Runtime.Provider == "" || attached.Runtime.SystemVolumeProviderID == "" ||
-		(attached.Runtime.State != provider.RuntimeStatePending && attached.Runtime.State != provider.RuntimeStateRunning) {
-		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, string(provider.ErrorCodeResourceDiverged), "replacement Runtime attachment identity diverged")
 	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.Actions.InventoryReplacementRuntimeResources(runCtx, input.OperationID, dbstore.RuntimeProviderResourceInventory{
@@ -452,8 +448,7 @@ func waitForOldDataVolumeDetachment(ctx restate.WorkflowContext, dependencies Ru
 		attachment, err := dependencies.Attachments.ObserveRuntimeDataVolumeAttachment(runCtx, request)
 		outcome := runtimeAttachmentOutcome{Attachment: attachment}
 		if err != nil {
-			var classified interface{ Transient() bool }
-			if errors.As(err, &classified) && classified.Transient() {
+			if isTransientError(err) {
 				outcome.RetryableFailure = true
 			} else {
 				outcome.Failure = err.Error()

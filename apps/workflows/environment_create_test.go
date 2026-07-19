@@ -437,6 +437,25 @@ func TestEnvironmentCreateWorkflowAttachmentFailureKeepsInventoriedRuntime(t *te
 	}
 }
 
+func TestEnvironmentCreateWorkflowRuntimeTransitionFailureMarksLastKnownRuntimeError(t *testing.T) {
+	for _, failureCall := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("transition-%d", failureCall), func(t *testing.T) {
+			harness := newEnvironmentCreateStepsHarness()
+			harness.actions.persistRuntimeFailAt = failureCall
+			result := harness.run(t, fmt.Sprintf("transition-failure-%d", failureCall))
+			if result.err == nil {
+				t.Fatal("terminal Runtime transition persistence failure completed successfully")
+			}
+			if harness.actions.lastRuntime.Status != domain.RuntimeError {
+				t.Fatalf("Runtime after transition persistence failure = %#v, want error", harness.actions.lastRuntime)
+			}
+			if harness.actions.persistRuntimeCalls != failureCall+1 {
+				t.Fatalf("Runtime persistence calls = %d, want failed transition plus error transition (%d)", harness.actions.persistRuntimeCalls, failureCall+1)
+			}
+		})
+	}
+}
+
 func TestEnvironmentCreateWorkflowProvisionFailureFinalizesWithoutDeletingDataVolume(t *testing.T) {
 	harness := newEnvironmentCreateStepsHarness()
 	harness.provider.ensureRuntimeErr = provider.NewError(provider.ErrorCodePlacementConflict, "placement conflict", nil)
@@ -608,7 +627,7 @@ func newEnvironmentCreateStepsHarness() *environmentCreateStepsHarness {
 	harness := &environmentCreateStepsHarness{provider: providerFake, actions: actions, guest: guest}
 	harness.dependencies = workflows.EnvironmentCreateDependencies{
 		Provider: providerFake, Actions: actions, Capsules: actions,
-		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
+		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, CapsuleApplication: guest,
 		Credentials: guest, Toolchain: guest,
 		IDs: &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
 		Now: time.Now, ImageVersion: "image-v1", ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
@@ -677,6 +696,8 @@ func (fake *environmentCreateStepsProvider) EnsureRuntimeDataVolumeAttachment(_ 
 	if fake.runtime.RuntimeID != request.RuntimeID || fake.runtime.ProviderID != request.ProviderID {
 		return provider.Runtime{}, errors.New("attach Runtime identity does not match allocation")
 	}
+	fake.runtime.Provider = "fake"
+	fake.runtime.SystemVolumeProviderID = "system-volume-1"
 	return fake.runtime, nil
 }
 
@@ -703,14 +724,16 @@ func (fake *environmentCreateStepsProvider) RetireRuntime(ctx context.Context, r
 }
 
 type environmentCreateStepsActions struct {
-	mu                  sync.Mutex
-	runtimeReservation  domain.RuntimeReservation
-	lastRuntime         domain.RuntimeSnapshot
-	outcomes            []workflows.EnvironmentCreateOperationOutcome
-	completeCalls       int
-	capsuleState        workflows.EnvironmentCapsuleState
-	persistedCapsule    workflows.EnvironmentCapsuleState
-	persistCapsuleCalls int
+	mu                   sync.Mutex
+	runtimeReservation   domain.RuntimeReservation
+	lastRuntime          domain.RuntimeSnapshot
+	outcomes             []workflows.EnvironmentCreateOperationOutcome
+	completeCalls        int
+	capsuleState         workflows.EnvironmentCapsuleState
+	persistedCapsule     workflows.EnvironmentCapsuleState
+	persistCapsuleCalls  int
+	persistRuntimeCalls  int
+	persistRuntimeFailAt int
 }
 
 func (*environmentCreateStepsActions) RecordEnvironmentCreateInvocation(_ context.Context, _ string, _ string, _ time.Time) (workflows.EnvironmentCreateInvocation, error) {
@@ -731,6 +754,10 @@ func (actions *environmentCreateStepsActions) ReserveInitialRuntime(_ context.Co
 func (actions *environmentCreateStepsActions) PersistEnvironmentCreateRuntimeTransition(_ context.Context, _ string, _ int64, next domain.RuntimeSnapshot) error {
 	actions.mu.Lock()
 	defer actions.mu.Unlock()
+	actions.persistRuntimeCalls++
+	if actions.persistRuntimeCalls == actions.persistRuntimeFailAt {
+		return permanentActionError{errors.New("simulated terminal Runtime transition persistence failure")}
+	}
 	actions.lastRuntime = next
 	return nil
 }
@@ -1113,7 +1140,7 @@ func environmentCreateDefinition(dataVolumes provider.DataVolumeProvider, action
 	guest := testEnvironmentGuest{}
 	return workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
 		Provider: providerAdapter, Actions: wrapped, Capsules: capsules,
-		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
+		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, CapsuleApplication: guest,
 		Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
 		IDs: ids, Now: now, ImageVersion: imageVersion,
 		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
@@ -1163,7 +1190,16 @@ func (fake *environmentCreateProviderAdapter) EnsureRuntime(_ context.Context, r
 }
 
 func (fake *environmentCreateProviderAdapter) EnsureRuntimeDataVolumeAttachment(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
-	return fake.ObserveRuntime(ctx, request)
+	runtime, err := fake.ObserveRuntime(ctx, request)
+	if err != nil {
+		return provider.Runtime{}, err
+	}
+	fake.mu.Lock()
+	runtime.Provider = "fixture"
+	runtime.SystemVolumeProviderID = "system-volume-" + request.RuntimeID
+	fake.runtimes[request.RuntimeID] = runtime
+	fake.mu.Unlock()
+	return runtime, nil
 }
 
 func (fake *environmentCreateProviderAdapter) ObserveRuntime(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {

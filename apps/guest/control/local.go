@@ -456,11 +456,11 @@ func (operations *LocalOperations) advance(ctx context.Context, desired guest.Re
 	if err != nil {
 		return err
 	}
-	currentOrder, desiredOrder := readinessOrder(current.Level), readinessOrder(desired)
-	if currentOrder >= desiredOrder {
+	advanceBy := guest.CompareReadiness(desired, current.Level)
+	if advanceBy <= 0 {
 		return nil
 	}
-	if currentOrder+1 != desiredOrder {
+	if advanceBy != 1 {
 		return fmt.Errorf("advance guest readiness: %s requires the preceding readiness level", desired)
 	}
 	_, err = operations.config.Readiness.Advance(ctx, desired, time.Now().UTC())
@@ -472,8 +472,7 @@ func (operations *LocalOperations) canAdvance(ctx context.Context, desired guest
 	if err != nil {
 		return err
 	}
-	currentOrder, desiredOrder := readinessOrder(current.Level), readinessOrder(desired)
-	if currentOrder >= desiredOrder || currentOrder+1 == desiredOrder {
+	if advanceBy := guest.CompareReadiness(desired, current.Level); advanceBy <= 1 {
 		return nil
 	}
 	return permanentOperationError(fmt.Errorf("advance guest readiness: %s requires the preceding readiness level", desired))

@@ -204,7 +204,7 @@ type EnvironmentCapsuleMaterializationRequest struct {
 	State EnvironmentCapsuleState       `json:"state"`
 }
 
-type EnvironmentCapsuleMaterializer interface {
+type EnvironmentCapsuleApplier interface {
 	// EnsureEnvironmentCapsuleMaterialized must replay the same converged result
 	// for a stable Operation ID and Capsule Lock digest after an ambiguous
 	// transport failure.
@@ -249,7 +249,7 @@ type EnvironmentCreateDependencies struct {
 	GuestReadiness       RuntimeGuestReadinessSource
 	SSHKeys              RuntimeSSHKeyReconciler
 	ProjectSeed          EnvironmentProjectSeedApplicator
-	Materializer         EnvironmentCapsuleMaterializer
+	CapsuleApplication   EnvironmentCapsuleApplier
 	Credentials          EnvironmentCredentialBinder
 	Toolchain            EnvironmentToolchainValidator
 	IDs                  IDGenerator
@@ -284,7 +284,7 @@ func legacyEnvironmentCreateDependencies(providerAdapter EnvironmentCreateProvid
 	guest := legacyEnvironmentCreateGuest{}
 	return EnvironmentCreateDependencies{
 		Provider: providerAdapter, Actions: actions, Capsules: actions,
-		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
+		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, CapsuleApplication: guest,
 		Credentials: NoProjectCredentialBinder{}, Toolchain: guest,
 		IDs: ids, Now: now, ImageVersion: imageVersion,
 	}
@@ -452,9 +452,10 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	if err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
 	}
-	runtimeState, err = persistEnvironmentCreateRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "persist-runtime-provisioning", runtimeState, provisioning)
+	lastKnownRuntime := runtimeState
+	runtimeState, err = persistEnvironmentCreateRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "persist-runtime-provisioning", lastKnownRuntime, provisioning)
 	if err != nil {
-		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &lastKnownRuntime, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
 	}
 	if ensured.Runtime.State != provider.RuntimeStatePending && ensured.Runtime.State != provider.RuntimeStateRunning {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{
@@ -472,16 +473,17 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	if attached.Failure != "" {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: attached.FailureCode, Message: attached.Failure}, dependencies.Now)
 	}
-	if err := validateProviderRuntimeIdentity(attached.Runtime, lifecycleRequest); err != nil {
+	if err := validateAttachedProviderRuntime(attached.Runtime, lifecycleRequest); err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: string(provider.ErrorCodeResourceDiverged), Message: err.Error()}, dependencies.Now)
 	}
 	starting, err := provisioning.BeginStart(dependencies.Now())
 	if err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
 	}
-	runtimeState, err = persistEnvironmentCreateRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "persist-runtime-starting", runtimeState, starting)
+	lastKnownRuntime = runtimeState
+	runtimeState, err = persistEnvironmentCreateRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "persist-runtime-starting", lastKnownRuntime, starting)
 	if err != nil {
-		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &lastKnownRuntime, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
 	}
 	running, err := waitForProviderState(ctx, dependencies.Provider, lifecycleRequest, ensured, provider.RuntimeStateRunning, provider.RuntimeStatePending, "wait-created-runtime-running", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout, dependencies.Now)
 	if err != nil {
@@ -534,7 +536,7 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: "PROFILE_INCOMPATIBLE", Message: err.Error()}, dependencies.Now)
 	}
 	applyResults, durableErr := restate.Run(ctx, func(runCtx restate.RunContext) ([]profile.ProfileMaterializationResult, error) {
-		results, materializeErr := dependencies.Materializer.EnsureEnvironmentCapsuleMaterialized(runCtx, EnvironmentCapsuleMaterializationRequest{Guest: guestRequest, State: state})
+		results, materializeErr := dependencies.CapsuleApplication.EnsureEnvironmentCapsuleMaterialized(runCtx, EnvironmentCapsuleMaterializationRequest{Guest: guestRequest, State: state})
 		return results, classifyDurableError(materializeErr)
 	}, restate.WithName("materialize-capsule-lock"))
 	if durableErr != nil {
@@ -579,9 +581,10 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	if err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
 	}
-	runtimeState, err = persistEnvironmentCreateRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "persist-runtime-ready", runtimeState, markedReady)
+	lastKnownRuntime = runtimeState
+	runtimeState, err = persistEnvironmentCreateRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "persist-runtime-ready", lastKnownRuntime, markedReady)
 	if err != nil {
-		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &lastKnownRuntime, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
 	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.Actions.CompleteEnvironmentCreation(runCtx, input.OperationID, dependencies.Now()))
@@ -594,7 +597,7 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 func validateEnvironmentCreateDependencies(dependencies EnvironmentCreateDependencies) error {
 	if dependencies.Provider == nil || dependencies.Actions == nil || dependencies.Capsules == nil ||
 		dependencies.SSHIdentity == nil || dependencies.GuestReadiness == nil || dependencies.SSHKeys == nil || dependencies.ProjectSeed == nil ||
-		dependencies.Materializer == nil || dependencies.Credentials == nil || dependencies.Toolchain == nil ||
+		dependencies.CapsuleApplication == nil || dependencies.Credentials == nil || dependencies.Toolchain == nil ||
 		dependencies.IDs == nil || dependencies.Now == nil || strings.TrimSpace(dependencies.ImageVersion) == "" {
 		return errors.New("Environment create workflow dependencies are incomplete")
 	}
@@ -699,8 +702,7 @@ func waitForRuntimeGuestReadiness(ctx restate.WorkflowContext, source RuntimeGue
 		if readErr == nil {
 			return durableDeadlinePollRead[runtimeGuestReadinessOutcome]{Value: runtimeGuestReadinessOutcome{Readiness: readiness}, UseValue: true}, nil
 		}
-		var classified interface{ Transient() bool }
-		if errors.As(readErr, &classified) && classified.Transient() {
+		if isTransientError(readErr) {
 			return durableDeadlinePollRead[runtimeGuestReadinessOutcome]{Value: runtimeGuestReadinessOutcome{RetryableFailure: true}, UseValue: true, RetryableFailure: true}, nil
 		}
 		return durableDeadlinePollRead[runtimeGuestReadinessOutcome]{Value: runtimeGuestReadinessOutcome{Failure: readErr.Error()}, UseValue: true}, nil
@@ -817,7 +819,7 @@ func classifyDurableError(err error) error {
 		return restate.ToTerminalError(err)
 	}
 	var classified interface{ Transient() bool }
-	if errors.As(err, &classified) && !classified.Transient() {
+	if errors.As(err, &classified) && !isTransientError(err) {
 		return restate.ToTerminalError(err)
 	}
 	return err

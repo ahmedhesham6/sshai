@@ -164,6 +164,22 @@ func validateProviderRuntimeIdentity(observed provider.Runtime, request provider
 	return nil
 }
 
+func validateAttachedProviderRuntime(observed provider.Runtime, request provider.RuntimeLifecycleRequest) error {
+	if err := validateProviderRuntimeIdentity(observed, request); err != nil {
+		return err
+	}
+	if strings.TrimSpace(observed.Provider) == "" || strings.TrimSpace(observed.SystemVolumeProviderID) == "" ||
+		(observed.State != provider.RuntimeStatePending && observed.State != provider.RuntimeStateRunning) {
+		return errors.New("Runtime attachment identity diverged")
+	}
+	return nil
+}
+
+func isTransientError(err error) bool {
+	var classified interface{ Transient() bool }
+	return errors.As(err, &classified) && classified.Transient()
+}
+
 func providerDivergenceOutcome(err error) runtimeProviderOutcome {
 	return runtimeProviderOutcome{FailureCode: string(provider.ErrorCodeResourceDiverged), Failure: err.Error()}
 }
@@ -179,8 +195,7 @@ func providerOutcome(runtime provider.Runtime, err error) (runtimeProviderOutcom
 	if err == nil {
 		return runtimeProviderOutcome{Runtime: runtime}, nil
 	}
-	var classified interface{ Transient() bool }
-	if errors.As(err, &classified) && classified.Transient() {
+	if isTransientError(err) {
 		return runtimeProviderOutcome{}, err
 	}
 	code := "PROVIDER_FAILED"
@@ -200,8 +215,7 @@ func timestampProviderOutcome(outcome runtimeProviderOutcome, err error, observe
 }
 
 func providerPollOutcome(runtime provider.Runtime, err error, observedAt time.Time) runtimeProviderOutcome {
-	var classified interface{ Transient() bool }
-	if err != nil && errors.As(err, &classified) && classified.Transient() {
+	if err != nil && isTransientError(err) {
 		return runtimeProviderOutcome{ObservedAt: observedAt, RetryableFailure: true}
 	}
 	outcome, actionErr := providerOutcome(runtime, err)
