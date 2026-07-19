@@ -30,6 +30,9 @@ func TestPostgresRouteStoreRequiresCurrentBootReadyRow(t *testing.T) {
 			if !errors.Is(err, test.wantErr) || route.PrivateAddress != test.wantRoute {
 				t.Fatalf("route = %#v, error:%v", route, err)
 			}
+			if test.wantRoute != "" && (route.RuntimeID != "runtime-1" || route.BootID != "boot-1") {
+				t.Fatalf("route identity = %#v", route)
+			}
 		})
 	}
 }

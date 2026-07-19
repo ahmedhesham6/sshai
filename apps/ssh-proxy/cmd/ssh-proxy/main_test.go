@@ -53,12 +53,12 @@ func (verifierStub) Verify(context.Context, string) (auth.Subject, error) {
 type routeStub struct{}
 
 func (routeStub) ResolveSSH(context.Context, auth.Subject, string) (sshproxy.EnvironmentSSHRoute, error) {
-	return sshproxy.EnvironmentSSHRoute{PrivateAddress: "10.0.0.4:22"}, nil
+	return sshproxy.EnvironmentSSHRoute{RuntimeID: "runtime-1", BootID: "boot-1", PrivateAddress: "10.0.0.4:22"}, nil
 }
 
 type starterStub struct{}
 
-func (starterStub) EnsureStarted(context.Context, string, string) (string, error) {
+func (starterStub) EnsureStarted(context.Context, string, string, string) (string, error) {
 	return "", errors.New("not used")
 }
 

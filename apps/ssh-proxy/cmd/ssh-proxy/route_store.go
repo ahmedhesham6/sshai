@@ -64,7 +64,10 @@ func (store postgresRouteStore) ResolveSSH(ctx context.Context, subject auth.Sub
 	if runtimeID == nil || status == nil || *status != "ready" || privateAddress == nil || bootID == nil || version == nil || *version < 1 || *bootID == "" {
 		return sshproxy.EnvironmentSSHRoute{}, sshproxy.ErrRuntimeNotReady
 	}
-	return sshproxy.EnvironmentSSHRoute{PrivateAddress: net.JoinHostPort(*privateAddress, "22")}, nil
+	return sshproxy.EnvironmentSSHRoute{
+		RuntimeID: *runtimeID, BootID: *bootID,
+		PrivateAddress: net.JoinHostPort(*privateAddress, "22"),
+	}, nil
 }
 
 func (store postgresRouteStore) CurrentBootAttempt(ctx context.Context, environmentID string) (sshproxy.RuntimeBootAttempt, error) {

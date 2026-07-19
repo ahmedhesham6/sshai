@@ -38,12 +38,14 @@ type RuntimeBootAttemptSource interface {
 }
 
 // ControlPlaneRuntimeStarter forwards the verified user bearer to the public
-// start endpoint. Its idempotency key is SHA-256(Environment ID, Runtime ID,
-// boot-attempt version), truncated to 96 bits and prefixed with "ssh-start-".
+// start endpoint. Its idempotency key is SHA-256(connection attempt,
+// Environment ID, Runtime ID, boot-attempt version), truncated to 96 bits and
+// prefixed with "ssh-start-".
 // The boot-attempt version is the stopped Runtime version, or version-1 after
-// that Runtime enters starting. This normalizes both persisted states of one
-// attempt to the same key; later stop/start cycles advance the version and
-// receive a distinct key.
+// that Runtime enters starting. This normalizes both persisted states within
+// one connection attempt to the same key, while the per-connection nonce gives
+// every later user attempt a fresh key even when a failed Operation left the
+// Runtime version unchanged.
 type ControlPlaneRuntimeStarter struct {
 	baseURL  *url.URL
 	client   *http.Client
@@ -64,15 +66,15 @@ func NewControlPlaneRuntimeStarter(baseURL string, client *http.Client, attempts
 	return &ControlPlaneRuntimeStarter{baseURL: parsed, client: &clone, attempts: attempts}, nil
 }
 
-func (starter *ControlPlaneRuntimeStarter) EnsureStarted(ctx context.Context, bearer, environmentID string) (string, error) {
-	if strings.TrimSpace(bearer) == "" || strings.TrimSpace(environmentID) == "" {
-		return "", errors.New("request Runtime start: bearer and Environment ID are required")
+func (starter *ControlPlaneRuntimeStarter) EnsureStarted(ctx context.Context, bearer, environmentID, connectionAttempt string) (string, error) {
+	if strings.TrimSpace(bearer) == "" || strings.TrimSpace(environmentID) == "" || strings.TrimSpace(connectionAttempt) == "" {
+		return "", errors.New("request Runtime start: bearer, Environment ID, and connection attempt are required")
 	}
 	attempt, err := starter.attempts.CurrentBootAttempt(ctx, environmentID)
 	if err != nil {
 		return "", errors.New("request Runtime start: boot attempt is unavailable")
 	}
-	key, err := runtimeStartKey(environmentID, attempt)
+	key, err := runtimeStartKey(environmentID, connectionAttempt, attempt)
 	if err != nil {
 		return "", err
 	}
@@ -98,7 +100,8 @@ func (starter *ControlPlaneRuntimeStarter) EnsureStarted(ctx context.Context, be
 
 	var body struct {
 		Operation struct {
-			ID string `json:"id"`
+			ID     string `json:"id"`
+			Status string `json:"status"`
 		} `json:"operation"`
 		Error struct {
 			Code        string  `json:"code"`
@@ -113,9 +116,11 @@ func (starter *ControlPlaneRuntimeStarter) EnsureStarted(ctx context.Context, be
 		operationID = *body.Error.OperationID
 	}
 	switch {
+	case response.StatusCode == http.StatusAccepted && operationID != "" && body.Operation.Status == "failed":
+		return operationID, ErrRuntimeStartFailed
 	case response.StatusCode == http.StatusAccepted && operationID != "":
 		return operationID, nil
-	case response.StatusCode == http.StatusConflict && body.Error.Code == "OPERATION_CONFLICT" && attempt.RuntimeStatus == "starting":
+	case response.StatusCode == http.StatusConflict && body.Error.Code == "OPERATION_CONFLICT":
 		return operationID, nil
 	case response.StatusCode == http.StatusUnauthorized || body.Error.Code == "AUTHORIZATION_FAILED":
 		return "", ErrStartAuthorization
@@ -126,8 +131,8 @@ func (starter *ControlPlaneRuntimeStarter) EnsureStarted(ctx context.Context, be
 	}
 }
 
-func runtimeStartKey(environmentID string, attempt RuntimeBootAttempt) (string, error) {
-	if strings.TrimSpace(environmentID) == "" || strings.TrimSpace(attempt.RuntimeID) == "" || attempt.RuntimeVersion < 1 {
+func runtimeStartKey(environmentID, connectionAttempt string, attempt RuntimeBootAttempt) (string, error) {
+	if strings.TrimSpace(environmentID) == "" || strings.TrimSpace(connectionAttempt) == "" || strings.TrimSpace(attempt.RuntimeID) == "" || attempt.RuntimeVersion < 1 {
 		return "", errors.New("request Runtime start: current boot attempt is invalid")
 	}
 	bootAttemptVersion := attempt.RuntimeVersion
@@ -137,6 +142,6 @@ func runtimeStartKey(environmentID string, attempt RuntimeBootAttempt) (string, 
 	if bootAttemptVersion < 1 {
 		return "", errors.New("request Runtime start: current boot attempt is invalid")
 	}
-	digest := sha256.Sum256([]byte(environmentID + "\x00" + attempt.RuntimeID + "\x00" + strconv.FormatInt(bootAttemptVersion, 10)))
+	digest := sha256.Sum256([]byte(connectionAttempt + "\x00" + environmentID + "\x00" + attempt.RuntimeID + "\x00" + strconv.FormatInt(bootAttemptVersion, 10)))
 	return startKeyPrefix + hex.EncodeToString(digest[:])[:startKeyDigestSize], nil
 }

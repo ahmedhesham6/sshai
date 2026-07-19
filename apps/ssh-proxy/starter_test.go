@@ -26,18 +26,18 @@ func TestControlPlaneRuntimeStarterTreatsActiveOperationConflictAsSuccess(t *tes
 		response.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(response).Encode(map[string]any{
 			"requestId": "request-1",
-			"error":     map[string]any{"code": "OPERATION_CONFLICT", "message": "active", "operationId": "operation-active"},
+			"error":     map[string]any{"code": "OPERATION_CONFLICT", "message": "active"},
 		})
 	}))
 	defer server.Close()
 	starter, err := sshproxy.NewControlPlaneRuntimeStarter(server.URL, server.Client(), &attemptSource{
-		attempt: sshproxy.RuntimeBootAttempt{RuntimeID: "runtime-1", RuntimeVersion: 7, RuntimeStatus: "starting"},
+		attempt: sshproxy.RuntimeBootAttempt{RuntimeID: "runtime-1", RuntimeVersion: 7, RuntimeStatus: "stopped"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	operationID, err := starter.EnsureStarted(context.Background(), bearer, "env-1")
-	if err != nil || operationID != "operation-active" {
+	operationID, err := starter.EnsureStarted(context.Background(), bearer, "env-1", "connection-1")
+	if err != nil || operationID != "" {
 		t.Fatalf("active start = Operation:%q error:%v", operationID, err)
 	}
 	if len(idempotencyKey) < 16 || len(idempotencyKey) > 40 {
@@ -45,7 +45,7 @@ func TestControlPlaneRuntimeStarterTreatsActiveOperationConflictAsSuccess(t *tes
 	}
 }
 
-func TestControlPlaneRuntimeStarterKeyIsStablePerBootAttemptAndDistinctAcrossAttempts(t *testing.T) {
+func TestControlPlaneRuntimeStarterKeyIsStableWithinConnectionAndFreshAcrossConnections(t *testing.T) {
 	var mu sync.Mutex
 	var keys []string
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -63,18 +63,18 @@ func TestControlPlaneRuntimeStarterKeyIsStablePerBootAttemptAndDistinctAcrossAtt
 		t.Fatal(err)
 	}
 	for range 2 {
-		if _, err := starter.EnsureStarted(context.Background(), "bearer", "env-1"); err != nil {
+		if _, err := starter.EnsureStarted(context.Background(), "bearer", "env-1", "connection-1"); err != nil {
 			t.Fatal(err)
 		}
 	}
 	source.attempt.RuntimeVersion++
 	source.attempt.RuntimeStatus = "starting"
-	if _, err := starter.EnsureStarted(context.Background(), "bearer", "env-1"); err != nil {
+	if _, err := starter.EnsureStarted(context.Background(), "bearer", "env-1", "connection-1"); err != nil {
 		t.Fatal(err)
 	}
-	source.attempt.RuntimeVersion += 2
+	source.attempt.RuntimeVersion--
 	source.attempt.RuntimeStatus = "stopped"
-	if _, err := starter.EnsureStarted(context.Background(), "bearer", "env-1"); err != nil {
+	if _, err := starter.EnsureStarted(context.Background(), "bearer", "env-1", "connection-2"); err != nil {
 		t.Fatal(err)
 	}
 	if len(keys) != 4 || keys[0] != keys[1] || keys[1] != keys[2] || keys[2] == keys[3] {

@@ -4,6 +4,8 @@ package sshproxy
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -46,6 +48,8 @@ type EnvironmentRouter interface {
 }
 
 type EnvironmentSSHRoute struct {
+	RuntimeID      string
+	BootID         string
 	PrivateAddress string
 }
 
@@ -53,7 +57,7 @@ type EnvironmentSSHRoute struct {
 // current Runtime is starting. bearer is the already-verified user access
 // token and must be forwarded without logging or including it in errors.
 type RuntimeStarter interface {
-	EnsureStarted(context.Context, string, string) (operationID string, err error)
+	EnsureStarted(context.Context, string, string, string) (operationID string, err error)
 }
 
 type ContextDialer interface {
@@ -146,7 +150,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 		return
 	}
 	notReady := errors.Is(err, ErrRuntimeNotReady)
-	if (!notReady && err != nil) || (!notReady && !privateSSHAddress(route.PrivateAddress)) {
+	if (!notReady && err != nil) || (!notReady && !validSSHRoute(route)) {
 		http.Error(response, "Environment SSH route unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -159,6 +163,11 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 	}
 	defer connection.CloseNow()
 	connection.SetReadLimit(preBridgeReadLimit)
+	connectionAttempt, err := newConnectionAttempt()
+	if err != nil {
+		proxy.failControl(connection, "", "starting-runtime", "The Runtime connection attempt could not be created safely. Persistent Environment state is intact.")
+		return
+	}
 
 	socketContext, cancelSocket := context.WithCancel(proxy.stream)
 	stopRequestCancellation := context.AfterFunc(request.Context(), cancelSocket)
@@ -177,7 +186,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 		}) {
 			return
 		}
-		operationID, err = proxy.ensureStarted(waitContext, guard, token, environmentID)
+		operationID, err = proxy.ensureStarted(waitContext, guard, token, environmentID, connectionAttempt)
 		if err != nil {
 			if errors.Is(err, errClientFrameBeforeReady) {
 				return
@@ -200,7 +209,23 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 			return
 		}
 	}
+	route, err = proxy.confirmRouteBeforeDial(waitContext, guard, connection, subject, environmentID, operationID, route)
+	if err != nil {
+		if errors.Is(err, errClientFrameBeforeReady) {
+			return
+		}
+		step, message := routeFailure(err)
+		proxy.failControl(connection, operationID, step, message)
+		return
+	}
 
+	// This final owner-scoped read prevents a route that changed during the
+	// readiness wait from being dialed. A Runtime transition can still begin in
+	// the millisecond-scale window between this read and the TCP dial: a TCP
+	// connection cannot participate in the PostgreSQL transaction that owns the
+	// current Runtime pointer. Eliminating that residual window would require a
+	// transactional route lease; the Environment-stable SSH host key does not
+	// prove boot freshness.
 	runtime, err := proxy.dialRuntime(waitContext, guard, route.PrivateAddress)
 	if err != nil {
 		if !errors.Is(err, errClientFrameBeforeReady) {
@@ -297,14 +322,14 @@ func (connection *promotedWebSocketConn) Read(buffer []byte) (int, error) {
 	return connection.Conn.Read(buffer)
 }
 
-func (proxy *proxy) ensureStarted(ctx context.Context, guard *preBridgeGuard, bearer, environmentID string) (string, error) {
+func (proxy *proxy) ensureStarted(ctx context.Context, guard *preBridgeGuard, bearer, environmentID, connectionAttempt string) (string, error) {
 	type result struct {
 		operationID string
 		err         error
 	}
 	completed := make(chan result, 1)
 	go func() {
-		operationID, err := proxy.starter.EnsureStarted(ctx, bearer, environmentID)
+		operationID, err := proxy.starter.EnsureStarted(ctx, bearer, environmentID, connectionAttempt)
 		completed <- result{operationID: operationID, err: err}
 	}()
 	select {
@@ -317,6 +342,14 @@ func (proxy *proxy) ensureStarted(ctx context.Context, guard *preBridgeGuard, be
 	}
 }
 
+func newConnectionAttempt() (string, error) {
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", errors.New("generate connection attempt")
+	}
+	return hex.EncodeToString(entropy[:]), nil
+}
+
 func (proxy *proxy) waitForRoute(ctx context.Context, guard *preBridgeGuard, socket *websocket.Conn, subject auth.Subject, environmentID, operationID string) (EnvironmentSSHRoute, error) {
 	for {
 		if !proxy.writeControl(ctx, socket, connectionprotocol.ControlFrame{
@@ -326,7 +359,7 @@ func (proxy *proxy) waitForRoute(ctx context.Context, guard *preBridgeGuard, soc
 		}
 		route, err := proxy.resolveRoute(ctx, guard, subject, environmentID)
 		if err == nil {
-			if !privateSSHAddress(route.PrivateAddress) {
+			if !validSSHRoute(route) {
 				return EnvironmentSSHRoute{}, errors.New("unsafe Runtime route")
 			}
 			return route, nil
@@ -350,6 +383,30 @@ func (proxy *proxy) waitForRoute(ctx context.Context, guard *preBridgeGuard, soc
 		case <-timer.C:
 		}
 	}
+}
+
+func (proxy *proxy) confirmRouteBeforeDial(ctx context.Context, guard *preBridgeGuard, socket *websocket.Conn, subject auth.Subject, environmentID, operationID string, candidate EnvironmentSSHRoute) (EnvironmentSSHRoute, error) {
+	for {
+		confirmed, err := proxy.resolveRoute(ctx, guard, subject, environmentID)
+		if err == nil && validSSHRoute(confirmed) && sameSSHRoute(candidate, confirmed) {
+			return confirmed, nil
+		}
+		if err != nil && !errors.Is(err, ErrRuntimeNotReady) {
+			return EnvironmentSSHRoute{}, err
+		}
+		candidate, err = proxy.waitForRoute(ctx, guard, socket, subject, environmentID, operationID)
+		if err != nil {
+			return EnvironmentSSHRoute{}, err
+		}
+	}
+}
+
+func validSSHRoute(route EnvironmentSSHRoute) bool {
+	return route.RuntimeID != "" && route.BootID != "" && privateSSHAddress(route.PrivateAddress)
+}
+
+func sameSSHRoute(left, right EnvironmentSSHRoute) bool {
+	return left.RuntimeID == right.RuntimeID && left.BootID == right.BootID && left.PrivateAddress == right.PrivateAddress
 }
 
 func (proxy *proxy) resolveRoute(ctx context.Context, guard *preBridgeGuard, subject auth.Subject, environmentID string) (EnvironmentSSHRoute, error) {
@@ -406,11 +463,17 @@ func closeDialResult(completed <-chan dialResult) {
 }
 
 func (proxy *proxy) writeControl(ctx context.Context, socket *websocket.Conn, frame connectionprotocol.ControlFrame) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return false
 	}
-	writeContext, cancel := context.WithTimeout(ctx, proxy.controlTimeout)
+	// coder/websocket closes the socket when a Write context is canceled. Keep
+	// each write independently bounded so expiry of the readiness wait does not
+	// destroy the socket before the terminal failed frame can be delivered.
+	writeContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), proxy.controlTimeout)
 	defer cancel()
 	return socket.Write(writeContext, websocket.MessageText, payload) == nil
 }
