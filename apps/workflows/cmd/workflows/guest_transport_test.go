@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,67 @@ func TestCapsuleMaterializationGrantSourceMintsEveryExactPullCapability(t *testi
 			t.Fatalf("materialization grant %q = %#v, present=%v", key, grant, present)
 		}
 	}
+}
+
+func TestCapsuleMaterializationGrantSourceMintsCapabilitiesConcurrently(t *testing.T) {
+	provider := newMemoryGrantProvider()
+	client, err := oci.NewClient("user-1", provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsuleValue := buildSingleComponentCapsule(t, "config:editor", "editor content\n")
+	if _, err := client.Publish(t.Context(), capsuleValue); err != nil {
+		t.Fatal(err)
+	}
+	delayed := &delayedGrantProvider{provider: provider}
+	state := workflows.EnvironmentCapsuleState{CapsuleLock: domain.CapsuleLockSnapshot{ResolvedComponents: map[string]domain.ResolvedComponent{
+		"config:editor": {ID: "config:editor", CapsuleDigest: capsuleValue.Digest},
+	}}}
+	grants, err := (capsuleMaterializationGrantSource{provider: delayed}).MaterializationReadGrants(t.Context(), "user-1", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants) < 4 {
+		t.Fatalf("materialization grants = %d, want index, manifest, config, and layer", len(grants))
+	}
+	if got := delayed.maxActiveCalls(); got < 2 || got > capsuleGrantMintParallelism {
+		t.Fatalf("maximum concurrent grant mints = %d, want 2..%d", got, capsuleGrantMintParallelism)
+	}
+}
+
+type delayedGrantProvider struct {
+	provider *memoryGrantProvider
+	mu       sync.Mutex
+	active   int
+	max      int
+}
+
+func (provider *delayedGrantProvider) Grant(ctx context.Context, request oci.GrantRequest) (oci.Grant, error) {
+	provider.mu.Lock()
+	provider.active++
+	if provider.active > provider.max {
+		provider.max = provider.active
+	}
+	provider.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		provider.mu.Lock()
+		provider.active--
+		provider.mu.Unlock()
+		return oci.Grant{}, ctx.Err()
+	case <-time.After(10 * time.Millisecond):
+	}
+	grant, err := provider.provider.Grant(ctx, request)
+	provider.mu.Lock()
+	provider.active--
+	provider.mu.Unlock()
+	return grant, err
+}
+
+func (provider *delayedGrantProvider) maxActiveCalls() int {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	return provider.max
 }
 
 func TestCapsuleMaterializationGrantSourceClassifiesImmutableMetadataPermanent(t *testing.T) {

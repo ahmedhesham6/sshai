@@ -97,6 +97,12 @@ func (reporter *ReadinessReporter) Advance(ctx context.Context, level ReadinessL
 	return reporter.snapshot, nil
 }
 
+// CompareReadiness orders two readiness levels from allocation through agent
+// validation. Unknown levels sort before every valid readiness level.
+func CompareReadiness(left, right ReadinessLevel) int {
+	return readinessOrder(left) - readinessOrder(right)
+}
+
 func (reporter *ReadinessReporter) Snapshot(ctx context.Context) (ReadinessSnapshot, error) {
 	if err := reporter.validateCurrentBoot(ctx); err != nil {
 		return ReadinessSnapshot{}, err

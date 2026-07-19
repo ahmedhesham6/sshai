@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -375,6 +376,34 @@ func TestClientPullsLayersConcurrentlyWithinConfiguredLimit(t *testing.T) {
 	}
 	if got := provider.maxActiveReads(); got > 3 {
 		t.Fatalf("maximum concurrent reads = %d, want no more than 3", got)
+	}
+}
+
+func TestCapsuleReadKeysFetchesIndependentDigestsConcurrentlyInSortedOrder(t *testing.T) {
+	provider := newFileGrantProvider(t)
+	client, err := oci.NewClient("owner-1", provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digests := make([]string, 0, 3)
+	for index, content := range []string{"alpha\n", "bravo\n", "charlie\n"} {
+		value := buildTestCapsule(t, map[string]string{"config:editor": content})
+		if _, err := client.Publish(t.Context(), value); err != nil {
+			t.Fatalf("Publish(%d): %v", index, err)
+		}
+		digests = append(digests, value.Digest)
+	}
+	provider.resetRequests()
+	provider.readDelay = 20 * time.Millisecond
+	keys, err := oci.CapsuleReadKeys(t.Context(), "owner-1", []string{digests[2], digests[0], digests[1], digests[0]}, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.IsSorted(keys) {
+		t.Fatalf("Capsule read keys are not deterministic: %v", keys)
+	}
+	if got := provider.maxActiveReads(); got < 2 || got > 4 {
+		t.Fatalf("maximum concurrent digest reads = %d, want 2..4", got)
 	}
 }
 

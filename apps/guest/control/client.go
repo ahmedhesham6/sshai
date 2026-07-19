@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/guest"
@@ -43,6 +45,14 @@ type ClientCertificateSource interface {
 type Client struct {
 	port int
 	http *http.Client
+}
+
+type targetTransportPool struct {
+	mu                sync.Mutex
+	transports        map[Target]*http.Transport
+	tlsConfig         *tls.Config
+	certificateSource ClientCertificateSource
+	dialContext       func(context.Context, string, string) (net.Conn, error)
 }
 
 type TransportError struct {
@@ -89,25 +99,11 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if requestTimeout <= 0 {
 		requestTimeout = 10 * time.Minute
 	}
-	transport := &http.Transport{DisableKeepAlives: true, TLSClientConfig: &tls.Config{
+	transport := &targetTransportPool{transports: make(map[Target]*http.Transport), certificateSource: certificateSource, dialContext: config.DialContext, tlsConfig: &tls.Config{
 		MinVersion: tls.VersionTLS13,
 		RootCAs:    roots,
 		ServerName: strings.TrimSpace(config.ServerName),
-		GetClientCertificate: func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			target, ok := info.Context().Value(clientTargetContextKey{}).(Target)
-			if !ok {
-				return nil, errors.New("guest control TLS handshake has no request Target")
-			}
-			certificate, err := certificateSource.ClientCertificate(info.Context(), target)
-			if err != nil {
-				return nil, err
-			}
-			return &certificate, nil
-		},
 	}}
-	if config.DialContext != nil {
-		transport.DialContext = config.DialContext
-	}
 	return &Client{
 		port: config.Port,
 		http: &http.Client{
@@ -127,11 +123,19 @@ func (client *Client) ReadReadiness(ctx context.Context, target Target) (Readine
 	if err := client.post(ctx, target, readinessPath, ReadinessRequest{Target: target}, &status); err != nil {
 		return ReadinessStatus{}, err
 	}
+	if guest.CompareReadiness(status.Snapshot.Level, guest.ReadinessAllocated) < 0 {
+		return ReadinessStatus{}, &TransportError{operation: readinessPath, message: "response contains an unknown readiness level", transient: false}
+	}
 	return status, nil
 }
 
 func (client *Client) ApplyProjectSeed(ctx context.Context, request ProjectSeedRequest) error {
-	return client.post(ctx, request.Target, projectSeedPath, request, &emptyResponse{})
+	reader, writer := io.Pipe()
+	go func() {
+		writer.CloseWithError(encodeProjectSeedRequest(writer, request))
+	}()
+	defer reader.Close()
+	return client.postReader(ctx, request.Target, projectSeedPath, reader, &emptyResponse{})
 }
 
 func (client *Client) RestoreSSHHostIdentity(ctx context.Context, target Target) (guest.SSHHostIdentityStatus, error) {
@@ -173,13 +177,17 @@ func (client *Client) post(ctx context.Context, target Target, path string, inpu
 	if err != nil {
 		return fmt.Errorf("encode guest control request: %w", err)
 	}
+	return client.postReader(ctx, target, path, bytes.NewReader(body), output)
+}
+
+func (client *Client) postReader(ctx context.Context, target Target, path string, body io.Reader, output any) error {
 	address, err := targetControlAddress(target, client.port)
 	if err != nil {
 		return &TransportError{operation: path, message: err.Error(), transient: false, cause: err}
 	}
 	endpoint := "https://" + address + path
 	requestContext := context.WithValue(ctx, clientTargetContextKey{}, target)
-	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, endpoint, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, endpoint, body)
 	if err != nil {
 		return fmt.Errorf("construct guest control request: %w", err)
 	}
@@ -188,9 +196,8 @@ func (client *Client) post(ctx context.Context, target Target, path string, inpu
 	response, err := client.http.Do(request)
 	if err != nil {
 		transient := !permanentConnectionError(err)
-		var classified interface{ Transient() bool }
-		if errors.As(err, &classified) {
-			transient = classified.Transient()
+		if classifiedTransient, classified := ClassifyTransientError(err); classified {
+			transient = classifiedTransient
 		}
 		return &TransportError{operation: path, message: err.Error(), transient: transient, cause: err}
 	}
@@ -215,7 +222,117 @@ func (client *Client) post(ctx context.Context, target Target, path string, inpu
 	return nil
 }
 
+// encodeProjectSeedRequest preserves the JSON contract while streaming each
+// raw artifact through base64 directly to the HTTP request. Peak sender-side
+// payload memory is the retained raw Seed plus bounded encoder buffers, not a
+// second full base64-expanded JSON copy.
+func encodeProjectSeedRequest(writer io.Writer, request ProjectSeedRequest) error {
+	if _, err := io.WriteString(writer, `{"target":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(writer, request.Target); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(writer, `,"seed":{"RepositoryURL":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(writer, request.Seed.RepositoryURL); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(writer, `,"BaseRevision":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(writer, request.Seed.BaseRevision); err != nil {
+		return err
+	}
+	for _, artifact := range []struct {
+		name  string
+		value guest.ProjectSeedArtifact
+	}{
+		{name: "GitBundle", value: request.Seed.GitBundle},
+		{name: "TrackedPatch", value: request.Seed.TrackedPatch},
+		{name: "UntrackedTar", value: request.Seed.UntrackedTar},
+		{name: "Manifest", value: request.Seed.Manifest},
+	} {
+		if _, err := fmt.Fprintf(writer, `,%q:`, artifact.name); err != nil {
+			return err
+		}
+		if err := writeProjectSeedArtifact(writer, artifact.value); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(writer, `}}`)
+	return err
+}
+
+func writeProjectSeedArtifact(writer io.Writer, artifact guest.ProjectSeedArtifact) error {
+	if _, err := io.WriteString(writer, `{"SHA256":`); err != nil {
+		return err
+	}
+	if err := writeJSONValue(writer, artifact.SHA256); err != nil {
+		return err
+	}
+	if artifact.Content == nil {
+		_, err := io.WriteString(writer, `,"Content":null}`)
+		return err
+	}
+	if _, err := io.WriteString(writer, `,"Content":"`); err != nil {
+		return err
+	}
+	encoder := base64.NewEncoder(base64.StdEncoding, writer)
+	if _, err := encoder.Write(artifact.Content); err != nil {
+		_ = encoder.Close()
+		return err
+	}
+	if err := encoder.Close(); err != nil {
+		return err
+	}
+	_, err := io.WriteString(writer, `"}`)
+	return err
+}
+
+func writeJSONValue(writer io.Writer, value any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(encoded)
+	return err
+}
+
 type clientTargetContextKey struct{}
+
+func (pool *targetTransportPool) RoundTrip(request *http.Request) (*http.Response, error) {
+	target, ok := request.Context().Value(clientTargetContextKey{}).(Target)
+	if !ok {
+		return nil, errors.New("guest control request has no Target")
+	}
+	return pool.transport(target).RoundTrip(request)
+}
+
+func (pool *targetTransportPool) transport(target Target) *http.Transport {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if transport := pool.transports[target]; transport != nil {
+		return transport
+	}
+	tlsConfig := pool.tlsConfig.Clone()
+	tlsConfig.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		certificate, err := pool.certificateSource.ClientCertificate(info.Context(), target)
+		if err != nil {
+			return nil, err
+		}
+		return &certificate, nil
+	}
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		MaxIdleConns:    64, MaxIdleConnsPerHost: 4, IdleConnTimeout: 90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext:         pool.dialContext,
+	}
+	pool.transports[target] = transport
+	return transport
+}
 
 type staticClientCertificateSource struct{ certificate tls.Certificate }
 
@@ -244,21 +361,4 @@ func permanentConnectionError(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "tls:") && (strings.Contains(message, "certificate") ||
 		strings.Contains(message, "unknown authority") || strings.Contains(message, "hostname"))
-}
-
-func readinessOrder(level guest.ReadinessLevel) int {
-	switch level {
-	case guest.ReadinessAllocated:
-		return 1
-	case guest.ReadinessDataMounted:
-		return 2
-	case guest.ReadinessSSHReady:
-		return 3
-	case guest.ReadinessProjectReady:
-		return 4
-	case guest.ReadinessAgentsValidated:
-		return 5
-	default:
-		return 0
-	}
 }

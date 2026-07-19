@@ -283,9 +283,8 @@ func (server *server) authorize(response http.ResponseWriter, target Target) boo
 func (server *server) writeResult(response http.ResponseWriter, result any, err error) {
 	if err != nil {
 		status := http.StatusInternalServerError
-		var classified interface{ Transient() bool }
-		if errors.As(err, &classified) {
-			if classified.Transient() {
+		if transient, classified := ClassifyTransientError(err); classified {
+			if transient {
 				status = http.StatusServiceUnavailable
 			} else {
 				status = http.StatusUnprocessableEntity

@@ -87,6 +87,14 @@ func (adapter *Provider) EnsureRuntimeDataVolumeAttachment(ctx context.Context, 
 	if err != nil {
 		return provider.Runtime{}, err
 	}
+	// ObserveRuntime obtains this identity from the instance block-device
+	// mapping, which proves neither ownership nor configuration. Force the
+	// filtered DescribeVolumes validation before the attachment side effect.
+	observation.SystemVolumeProviderID = ""
+	observation, err = adapter.withSystemVolumeIdentity(ctx, observation)
+	if err != nil {
+		return provider.Runtime{}, err
+	}
 	volume, err := adapter.dataVolume(ctx, request.RuntimeSpec)
 	if err != nil {
 		return provider.Runtime{}, err
@@ -94,7 +102,7 @@ func (adapter *Provider) EnsureRuntimeDataVolumeAttachment(ctx context.Context, 
 	if err := adapter.ensureDataVolumeAttachment(ctx, request.DataVolumeProviderID, types.Instance{InstanceId: aws.String(request.ProviderID)}, volume); err != nil {
 		return provider.Runtime{}, err
 	}
-	return adapter.withSystemVolumeIdentity(ctx, observation)
+	return observation, nil
 }
 
 // withSystemVolumeIdentity resolves the replaceable system volume's provider
@@ -150,9 +158,12 @@ func (adapter *Provider) withSystemVolumeIdentity(ctx context.Context, observati
 }
 
 func (adapter *Provider) StartRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
-	observation, err := adapter.ObserveRuntime(ctx, request)
+	observation, instanceState, err := adapter.observeRuntime(ctx, request)
 	if err != nil {
 		return provider.Runtime{}, err
+	}
+	if instanceState == types.InstanceStateNameShuttingDown {
+		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Runtime retirement is in progress", nil)
 	}
 	switch observation.State {
 	case provider.RuntimeStatePending, provider.RuntimeStateRunning:
@@ -174,9 +185,12 @@ func (adapter *Provider) StartRuntime(ctx context.Context, request provider.Runt
 }
 
 func (adapter *Provider) StopRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
-	observation, err := adapter.ObserveRuntime(ctx, request)
+	observation, instanceState, err := adapter.observeRuntime(ctx, request)
 	if err != nil {
 		return provider.Runtime{}, err
+	}
+	if instanceState == types.InstanceStateNameShuttingDown {
+		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Runtime retirement is in progress", nil)
 	}
 	switch observation.State {
 	case provider.RuntimeStateStopped, provider.RuntimeStateStopping:
@@ -326,24 +340,33 @@ func (adapter *Provider) waitForDataVolumeAttachment(
 }
 
 func (adapter *Provider) ObserveRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	observation, _, err := adapter.observeRuntime(ctx, request)
+	return observation, err
+}
+
+func (adapter *Provider) observeRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, types.InstanceStateName, error) {
 	if _, err := adapter.validateRuntimeSpec(request.RuntimeSpec); err != nil {
-		return provider.Runtime{}, err
+		return provider.Runtime{}, "", err
 	}
 	if strings.TrimSpace(request.ProviderID) == "" {
-		return provider.Runtime{}, provider.NewError(provider.ErrorCodeInvalidRequest, "provider Runtime identity is required", nil)
+		return provider.Runtime{}, "", provider.NewError(provider.ErrorCodeInvalidRequest, "provider Runtime identity is required", nil)
 	}
 	output, err := adapter.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{request.ProviderID}})
 	if err != nil {
-		return provider.Runtime{}, containError("observe Runtime", err)
+		return provider.Runtime{}, "", containError("observe Runtime", err)
 	}
 	instances := instancesFromReservations(output.Reservations)
 	if len(instances) != 1 || aws.ToString(instances[0].InstanceId) != request.ProviderID {
-		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "provider Runtime identity is not unique", nil)
+		return provider.Runtime{}, "", provider.NewError(provider.ErrorCodeResourceDiverged, "provider Runtime identity is not unique", nil)
 	}
 	if err := adapter.validateRuntime(request.RuntimeSpec, instances[0]); err != nil {
-		return provider.Runtime{}, err
+		return provider.Runtime{}, "", err
 	}
-	return runtimeObservation(request.RuntimeSpec, instances[0])
+	observation, err := runtimeObservation(request.RuntimeSpec, instances[0])
+	if err != nil {
+		return provider.Runtime{}, "", err
+	}
+	return observation, instances[0].State.Name, nil
 }
 
 func (adapter *Provider) ObserveRuntimeDataVolumeAttachment(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.RuntimeDataVolumeAttachment, error) {

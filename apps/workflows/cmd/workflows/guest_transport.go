@@ -26,7 +26,7 @@ type runtimeGuestTransport interface {
 	workflows.RuntimeGuestShutdownPreparer
 	workflows.EnvironmentSSHIdentityRestorer
 	workflows.EnvironmentProjectSeedApplicator
-	workflows.EnvironmentCapsuleMaterializer
+	workflows.EnvironmentCapsuleApplier
 	workflows.EnvironmentToolchainValidator
 }
 
@@ -99,7 +99,7 @@ func (transport *configuredGuestTransport) WaitForRuntimeReady(ctx context.Conte
 	}
 	return workflows.RuntimeGuestReadiness{
 		BootID: status.Snapshot.BootID, PrivateIPv4: status.PrivateIPv4,
-		DataMounted: readinessAtLeast(status.Snapshot.Level, guest.ReadinessDataMounted),
+		DataMounted: guest.CompareReadiness(status.Snapshot.Level, guest.ReadinessDataMounted) >= 0,
 	}, nil
 }
 
@@ -156,14 +156,6 @@ func guestTarget(request workflows.RuntimeGuestReadinessRequest) guestcontrol.Ta
 		OwnerUserID: request.OwnerUserID, EnvironmentID: request.EnvironmentID, RuntimeID: request.RuntimeID,
 		ProviderID: request.ProviderID, PrivateIPv4: request.PrivateIPv4,
 	}
-}
-
-func readinessAtLeast(actual, expected guest.ReadinessLevel) bool {
-	order := map[guest.ReadinessLevel]int{
-		guest.ReadinessAllocated: 1, guest.ReadinessDataMounted: 2, guest.ReadinessSSHReady: 3,
-		guest.ReadinessProjectReady: 4, guest.ReadinessAgentsValidated: 5,
-	}
-	return order[actual] >= order[expected]
 }
 
 var (

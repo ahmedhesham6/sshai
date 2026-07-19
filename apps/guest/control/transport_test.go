@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -105,6 +106,87 @@ func TestClientAndServerRoundTrip(t *testing.T) {
 	if operations.seed.Seed.RepositoryURL != seed.RepositoryURL || operations.materialization.Lock.ID != "lock-1" {
 		t.Fatalf("requests were not preserved: seed=%+v materialization=%+v", operations.seed, operations.materialization)
 	}
+}
+
+func TestClientReusesConnectionsOnlyWithinTheSameTarget(t *testing.T) {
+	target := control.Target{OwnerUserID: "user-1", EnvironmentID: "environment-1", RuntimeID: "runtime-1", ProviderID: "instance-1", PrivateIPv4: "10.0.0.8"}
+	pki := testPKI(t, "connection-reuse")
+	serverTLS, err := control.LoadServerTLSConfig(pki.certificateFile, pki.keyFile, pki.caFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := control.NewServer(control.ServerConfig{Target: target, ClientIdentity: "spiffe://devm/workflows/environment/environment-1"}, &fakeOperations{readiness: []control.ReadinessStatus{
+		{Snapshot: guest.ReadinessSnapshot{RuntimeID: target.RuntimeID, BootID: "boot-1", RuntimeSequence: 1, Level: guest.ReadinessAllocated, ObservedAt: time.Now()}, PrivateIPv4: target.PrivateIPv4},
+		{Snapshot: guest.ReadinessSnapshot{RuntimeID: target.RuntimeID, BootID: "boot-1", RuntimeSequence: 1, Level: guest.ReadinessAllocated, ObservedAt: time.Now()}, PrivateIPv4: target.PrivateIPv4},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.TLS = serverTLS
+	var connectionMu sync.Mutex
+	connections := 0
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connectionMu.Lock()
+			connections++
+			connectionMu.Unlock()
+		}
+	}
+	server.StartTLS()
+	defer server.Close()
+	certificate, err := tls.LoadX509KeyPair(pki.certificateFile, pki.keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &recordingClientCertificateSource{certificate: certificate}
+	client, err := control.NewClient(control.ClientConfig{
+		Port: 9443, ServerName: "example.com", CertificateSource: source, CAFile: pki.caFile,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := client.ReadReadiness(t.Context(), target); err != nil {
+			t.Fatalf("same-Target readiness: %v", err)
+		}
+	}
+	other := target
+	other.RuntimeID = "runtime-2"
+	if _, err := client.ReadReadiness(t.Context(), other); err == nil {
+		t.Fatal("different Target unexpectedly passed server authorization")
+	}
+	connectionMu.Lock()
+	connectionCount := connections
+	connectionMu.Unlock()
+	if connectionCount != 2 {
+		t.Fatalf("TLS connections = %d, want one reused connection plus one Target-isolated connection", connectionCount)
+	}
+	if got := source.targetsSnapshot(); len(got) != 2 || got[0] != target || got[1] != other {
+		t.Fatalf("client certificate Target resolutions = %#v", got)
+	}
+}
+
+type recordingClientCertificateSource struct {
+	mu          sync.Mutex
+	certificate tls.Certificate
+	targets     []control.Target
+}
+
+func (source *recordingClientCertificateSource) ClientCertificate(_ context.Context, target control.Target) (tls.Certificate, error) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.targets = append(source.targets, target)
+	return source.certificate, nil
+}
+
+func (source *recordingClientCertificateSource) targetsSnapshot() []control.Target {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	return append([]control.Target(nil), source.targets...)
 }
 
 func TestServerRejectsClientSignedByWrongCA(t *testing.T) {

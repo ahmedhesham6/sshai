@@ -117,10 +117,10 @@ func TestStoreRecordsRuntimeWorkflowFailureCodeAndMessage(t *testing.T) {
 	}
 }
 
-func TestStorePersistsRuntimeReplacementWithoutDeletingHistory(t *testing.T) {
+func TestStorePersistsRuntimeReplacementAndPrunesExpiredProviderResources(t *testing.T) {
 	ctx := context.Background()
 	store, pool := openTestStoreAndPool(t, ctx)
-	createdAt := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	createdAt := time.Now().UTC().Truncate(time.Microsecond).Add(-45 * 24 * time.Hour)
 	insertRuntimeOperationState(t, ctx, pool, createdAt)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO operations (id, environment_id, type, status, requested_by_user_id, idempotency_key, restate_invocation_id, input, created_at, completed_at)
@@ -254,5 +254,29 @@ func TestStorePersistsRuntimeReplacementWithoutDeletingHistory(t *testing.T) {
 	}
 	if err := store.VerifyRuntimeDataVolumeOwnership(ctx, "user-1", "environment-1", "volume-1"); err != nil {
 		t.Fatalf("healthy durable State Components in degraded Environment must pass verification: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE provider_resources SET deleted_at = $1 WHERE runtime_id = 'runtime-2'`, createdAt.Add(6*time.Hour)); err != nil {
+		t.Fatalf("age current Runtime Provider Resources: %v", err)
+	}
+	pruned, err := store.PruneProviderResources(ctx, time.Now().UTC().Add(-30*24*time.Hour))
+	if err != nil {
+		t.Fatalf("PruneProviderResources(): %v", err)
+	}
+	var oldResources, currentResources int
+	var oldReference, currentReference *string
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM provider_resources WHERE runtime_id = 'runtime-1'`).Scan(&oldResources); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM provider_resources WHERE runtime_id = 'runtime-2'`).Scan(&currentResources); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT provider_resource_id FROM runtimes WHERE id = 'runtime-1'`).Scan(&oldReference); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT provider_resource_id FROM runtimes WHERE id = 'runtime-2'`).Scan(&currentReference); err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 2 || oldResources != 0 || currentResources != 2 || oldReference != nil || currentReference == nil || *currentReference != "resource-runtime-2" {
+		t.Fatalf("Provider Resource pruning = pruned:%d old:%d current:%d old-ref:%v current-ref:%v", pruned, oldResources, currentResources, oldReference, currentReference)
 	}
 }

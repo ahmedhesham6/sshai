@@ -34,7 +34,7 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 		polarDeliverer: polarEventDelivererFake{}, polarStore: polarDeliveryStoreFake{}, now: time.Now,
 		environmentCreate: workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
 			Provider: testfixtures.NewProvider(), Actions: creationActions, Capsules: creationActions,
-			SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
+			SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, CapsuleApplication: guest,
 			Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
 			IDs: idGenerator{}, Now: time.Now, ImageVersion: "image-v1",
 		}),

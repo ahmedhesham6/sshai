@@ -26,6 +26,35 @@ func TestClassifyDurableErrorTerminatesOnlyClassifiedPermanentFailures(t *testin
 	}
 }
 
+func TestValidateAttachedProviderRuntimeRequiresInventoriableIdentity(t *testing.T) {
+	request := provider.RuntimeLifecycleRequest{RuntimeSpec: provider.RuntimeSpec{
+		RuntimeID: "runtime-1", EnvironmentID: "environment-1", Sequence: 1,
+		Region: "eu-central-1", AvailabilityZone: "eu-central-1a", RuntimePreset: "cpu2-mem8",
+		ImageVersion: "image-v1", DataVolumeProviderID: "volume-data-1",
+	}, ProviderID: "instance-1"}
+	valid := provider.Runtime{RuntimeSpec: request.RuntimeSpec, Provider: "aws", ProviderID: request.ProviderID, SystemVolumeProviderID: "volume-system-1", State: provider.RuntimeStatePending}
+	if err := validateAttachedProviderRuntime(valid, request); err != nil {
+		t.Fatalf("valid attached Runtime: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*provider.Runtime)
+	}{
+		{name: "missing provider", mutate: func(value *provider.Runtime) { value.Provider = "" }},
+		{name: "missing system volume", mutate: func(value *provider.Runtime) { value.SystemVolumeProviderID = "" }},
+		{name: "invalid state", mutate: func(value *provider.Runtime) { value.State = provider.RuntimeStateStopped }},
+		{name: "divergent provider identity", mutate: func(value *provider.Runtime) { value.ProviderID = "instance-other" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observed := valid
+			test.mutate(&observed)
+			if err := validateAttachedProviderRuntime(observed, request); err == nil {
+				t.Fatal("invalid attached Runtime passed shared create/replace guard")
+			}
+		})
+	}
+}
+
 func TestEnvironmentCreationActionsReturnsPersistedProviderIdentity(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
 	repository := &creationRepositoryFake{state: validEnvironmentState(t, createdAt, "persisted-volume-1")}

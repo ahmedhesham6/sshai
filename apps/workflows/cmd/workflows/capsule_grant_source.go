@@ -10,7 +10,10 @@ import (
 	guestcontrol "github.com/ahmedhesham6/sshai/apps/guest/control"
 	"github.com/ahmedhesham6/sshai/apps/workflows"
 	capsuleoci "github.com/ahmedhesham6/sshai/libs/capsule/oci"
+	"golang.org/x/sync/errgroup"
 )
+
+const capsuleGrantMintParallelism = 8
 
 type capsuleMaterializationGrantSource struct {
 	provider capsuleoci.GrantProvider
@@ -28,17 +31,30 @@ func (source capsuleMaterializationGrantSource) MaterializationReadGrants(ctx co
 		}
 		return nil, err
 	}
+	ordered := make([]guestcontrol.ReadGrant, len(keys))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(capsuleGrantMintParallelism)
+	for index, key := range keys {
+		index, key := index, key
+		group.Go(func() error {
+			grant, err := source.provider.Grant(groupCtx, capsuleoci.GrantRequest{OwnerID: ownerUserID, Key: key, Operation: capsuleoci.GrantRead})
+			if err != nil {
+				return fmt.Errorf("mint Capsule materialization read grant: %w", err)
+			}
+			parsed, parseErr := url.Parse(grant.URL)
+			if parseErr != nil || parsed.Scheme != "https" || parsed.Host == "" || grant.ExpiresAt.IsZero() {
+				return permanentGuestTransportError{err: errors.New("mint Capsule materialization read grant: provider returned an invalid serializable capability")}
+			}
+			ordered[index] = guestcontrol.ReadGrant{URL: grant.URL, ExpiresAt: grant.ExpiresAt}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
 	result := make(map[string]guestcontrol.ReadGrant, len(keys))
-	for _, key := range keys {
-		grant, err := source.provider.Grant(ctx, capsuleoci.GrantRequest{OwnerID: ownerUserID, Key: key, Operation: capsuleoci.GrantRead})
-		if err != nil {
-			return nil, fmt.Errorf("mint Capsule materialization read grant: %w", err)
-		}
-		parsed, parseErr := url.Parse(grant.URL)
-		if parseErr != nil || parsed.Scheme != "https" || parsed.Host == "" || grant.ExpiresAt.IsZero() {
-			return nil, permanentGuestTransportError{err: errors.New("mint Capsule materialization read grant: provider returned an invalid serializable capability")}
-		}
-		result[key] = guestcontrol.ReadGrant{URL: grant.URL, ExpiresAt: grant.ExpiresAt}
+	for index, key := range keys {
+		result[key] = ordered[index]
 	}
 	return result, nil
 }

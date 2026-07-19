@@ -400,7 +400,7 @@ var (
 	_ workflows.RuntimeGuestShutdownPreparer          = unavailableGuestTransport{}
 	_ workflows.EnvironmentSSHIdentityRestorer        = unavailableGuestTransport{}
 	_ workflows.EnvironmentProjectSeedApplicator      = unavailableGuestTransport{}
-	_ workflows.EnvironmentCapsuleMaterializer        = unavailableGuestTransport{}
+	_ workflows.EnvironmentCapsuleApplier             = unavailableGuestTransport{}
 	_ workflows.EnvironmentToolchainValidator         = unavailableGuestTransport{}
 	_ workflows.RuntimeStopDispatcher                 = runtimeStopDispatcher{}
 )

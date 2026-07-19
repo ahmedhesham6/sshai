@@ -3,6 +3,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/guest"
@@ -10,6 +11,16 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 )
+
+// ClassifyTransientError reports whether err carries the shared transient
+// classification and, when it does, whether retry is appropriate.
+func ClassifyTransientError(err error) (transient bool, classified bool) {
+	var value interface{ Transient() bool }
+	if !errors.As(err, &value) {
+		return false, false
+	}
+	return value.Transient(), true
+}
 
 const (
 	readinessPath              = "/v1/readiness"

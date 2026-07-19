@@ -145,6 +145,44 @@ func startAdapter(t *testing.T) (*Provider, *ec2.Client) {
 
 type miniStackEC2 struct{ ec2API }
 
+func (client miniStackEC2) DescribeVolumes(ctx context.Context, input *ec2.DescribeVolumesInput, options ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+	runtimeID := ""
+	for _, filter := range input.Filters {
+		if aws.ToString(filter.Name) == "tag:"+tagResource && slices.Contains(filter.Values, systemVolumeResource) {
+			for _, candidate := range input.Filters {
+				if aws.ToString(candidate.Name) == "tag:"+tagRuntimeID && len(candidate.Values) == 1 {
+					runtimeID = candidate.Values[0]
+				}
+			}
+		}
+	}
+	if runtimeID == "" {
+		return client.ec2API.DescribeVolumes(ctx, input, options...)
+	}
+	instances, err := client.ec2API.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
+	if err != nil {
+		return nil, err
+	}
+	for _, reservation := range instances.Reservations {
+		for _, instance := range reservation.Instances {
+			if tagValues(instance.Tags)[tagRuntimeID] != runtimeID {
+				continue
+			}
+			tags := append([]types.Tag(nil), instance.Tags...)
+			for index := range tags {
+				if aws.ToString(tags[index].Key) == tagResource {
+					tags[index].Value = aws.String(systemVolumeResource)
+				}
+			}
+			return &ec2.DescribeVolumesOutput{Volumes: []types.Volume{{
+				AvailabilityZone: instance.Placement.AvailabilityZone, Encrypted: aws.Bool(true), Size: aws.Int32(24),
+				VolumeId: aws.String("vol-system-" + strings.TrimPrefix(aws.ToString(instance.InstanceId), "i-")), VolumeType: types.VolumeTypeGp3, Tags: tags,
+			}}}, nil
+		}
+	}
+	return &ec2.DescribeVolumesOutput{}, nil
+}
+
 func (client miniStackEC2) RunInstances(ctx context.Context, input *ec2.RunInstancesInput, options ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error) {
 	output, err := client.ec2API.RunInstances(ctx, input, options...)
 	if output != nil {

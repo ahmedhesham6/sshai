@@ -60,7 +60,7 @@ func (fake *Provider) EnsureRuntime(_ context.Context, request provider.EnsureRu
 		return existing, nil
 	}
 	runtime := provider.Runtime{
-		RuntimeSpec: request.RuntimeSpec, ProviderID: "fake-runtime-" + request.RuntimeID,
+		RuntimeSpec: request.RuntimeSpec, Provider: "fixture", ProviderID: "fake-runtime-" + request.RuntimeID,
 		PrivateIPv4: "10.0.0.8", State: provider.RuntimeStateRunning,
 	}
 	fake.runtimes[request.RuntimeID] = runtime
@@ -74,6 +74,8 @@ func (fake *Provider) EnsureRuntimeDataVolumeAttachment(_ context.Context, reque
 	if !ok || runtime.ProviderID != request.ProviderID || runtime.RuntimeSpec != request.RuntimeSpec {
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Runtime attachment identity diverged", nil)
 	}
+	runtime.SystemVolumeProviderID = "fixture-system-volume-" + request.RuntimeID
+	fake.runtimes[request.RuntimeID] = runtime
 	return runtime, nil
 }
 
