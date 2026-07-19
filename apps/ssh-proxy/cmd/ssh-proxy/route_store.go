@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	sshproxy "github.com/ahmedhesham6/sshai/apps/ssh-proxy"
 	"github.com/ahmedhesham6/sshai/libs/auth"
+	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -44,6 +46,31 @@ type rowQuerier interface {
 type postgresRouteStore struct {
 	queries rowQuerier
 	region  string
+}
+
+type postgresIntentStore struct {
+	store *dbstore.Store
+	now   func() time.Time
+}
+
+func (store postgresIntentStore) Consume(ctx context.Context, subject auth.Subject, intentID, environmentID string) (sshproxy.ConnectionIntentAttempt, error) {
+	if store.store == nil || store.now == nil {
+		return sshproxy.ConnectionIntentAttempt{}, errors.New("consume Connection Intent: store is unavailable")
+	}
+	record, err := store.store.ConsumeConnectionIntent(ctx, subject.WorkOSUserID, intentID, environmentID, store.now().UTC())
+	if err != nil {
+		switch {
+		case errors.Is(err, dbstore.ErrConnectionIntentNotFound):
+			return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentNotFound
+		case errors.Is(err, dbstore.ErrConnectionIntentExpired):
+			return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentExpired
+		case errors.Is(err, dbstore.ErrConnectionIntentUsed):
+			return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentUsed
+		default:
+			return sshproxy.ConnectionIntentAttempt{}, err
+		}
+	}
+	return sshproxy.ConnectionIntentAttempt{OperationID: record.OperationID}, nil
 }
 
 func (store postgresRouteStore) ResolveSSH(ctx context.Context, subject auth.Subject, environmentID string) (sshproxy.EnvironmentSSHRoute, error) {

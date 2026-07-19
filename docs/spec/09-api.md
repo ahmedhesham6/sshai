@@ -75,7 +75,7 @@ Environment detail includes the pinned `ProfileVersionID`, `LockID`, pending Cap
 
 - `POST /v1/environments/{environmentId}/connection-intents`
 
-A Connection Intent authorizes one short-lived attempt, returns the regional WSS endpoint, stable logical host name, and Runtime/start Operation state. It is not an SSH credential.
+A Connection Intent authorizes exactly one short-lived WSS admission attempt and returns the regional WSS endpoint, stable logical host name, and nullable Runtime/start Operation state. The CLI presents its ID in `X-Connection-Intent-ID`; the regional proxy atomically consumes it before upgrade after matching its owner and Environment to the verified bearer and route path. Missing, expired, or already-used Intents are refused. Expiry is an admission deadline: it does not interrupt an attempt that was already consumed and admitted. The Intent is not an SSH credential, and the bearer remains mandatory.
 
 Updating the Auto-stop Policy is an asynchronous Environment Operation because it must durably cancel or replace pending Restate timers.
 
@@ -97,11 +97,15 @@ Every resource is owned by the authenticated WorkOS user projection. A missing f
 - Same key and different input returns `409 IDEMPOTENCY_CONFLICT`.
 - Connection Intent creation may use a short deterministic key derived from Environment and CLI attempt.
 - An unexpired Connection Intent key replays the stored Intent identity, expiry,
-  and nullable start Operation reference even if Runtime state has since changed.
+  consumed state, and nullable start Operation reference even if Runtime state has since changed.
   At expiry the record is replaced under the same User/key serialization lock;
   expired records are also pruned by the control-plane retention loop.
 - A non-start active Operation conflicts with new Connection Intent creation;
   concurrent attempts may join the same active Runtime start.
+- Connection Intent preparation does not hold a database transaction or pool
+  connection. Replay lookup and final persistence each use the shared
+  User/`Idempotency-Key` advisory lock in separate short transactions; an insert
+  race re-reads the winning stored response.
 
 ## Errors
 

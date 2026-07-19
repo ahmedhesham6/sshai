@@ -3,6 +3,7 @@ package sshproxy_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,7 +12,7 @@ import (
 	sshproxy "github.com/ahmedhesham6/sshai/apps/ssh-proxy"
 )
 
-func TestControlPlaneRuntimeStarterTreatsActiveOperationConflictAsSuccess(t *testing.T) {
+func TestControlPlaneRuntimeStarterReturnsTypedActiveOperationConflict(t *testing.T) {
 	const bearer = "FORWARDED_BEARER"
 	var idempotencyKey string
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -37,11 +38,32 @@ func TestControlPlaneRuntimeStarterTreatsActiveOperationConflictAsSuccess(t *tes
 		t.Fatal(err)
 	}
 	operationID, err := starter.EnsureStarted(context.Background(), bearer, "env-1", "connection-1")
-	if err != nil || operationID != "" {
+	if !errors.Is(err, sshproxy.ErrRuntimeOperationConflict) || operationID != "" {
 		t.Fatalf("active start = Operation:%q error:%v", operationID, err)
 	}
 	if len(idempotencyKey) < 16 || len(idempotencyKey) > 40 {
 		t.Fatalf("idempotency key = %q", idempotencyKey)
+	}
+}
+
+func TestControlPlaneRuntimeStarterReturnsTypedSettlingRuntimeState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"requestId": "request-1",
+			"error":     map[string]any{"code": "RUNTIME_COMMAND_INVALID_STATE", "message": "settling"},
+		})
+	}))
+	defer server.Close()
+	starter, err := sshproxy.NewControlPlaneRuntimeStarter(server.URL, server.Client(), &attemptSource{
+		attempt: sshproxy.RuntimeBootAttempt{RuntimeID: "runtime-1", RuntimeVersion: 8, RuntimeStatus: "starting"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operationID, err := starter.EnsureStarted(context.Background(), "bearer", "env-1", "connection-1"); !errors.Is(err, sshproxy.ErrRuntimeCommandInvalidState) || operationID != "" {
+		t.Fatalf("settling start = Operation:%q error:%v", operationID, err)
 	}
 }
 

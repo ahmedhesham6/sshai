@@ -25,6 +25,7 @@ const (
 	maxIntentBodyBytes   = 64 << 10
 	connectionKeyPrefix  = "ssh-"
 	connectionKeyHexSize = 24
+	creditsBlockedText   = "The Runtime cannot start because the Credit Balance is depleted. Add credits and try again."
 )
 
 type accessTokenSource interface {
@@ -80,6 +81,9 @@ func (command sshProxyCommand) run(ctx context.Context, environmentID string) er
 		return errors.New("request SSH connection: control plane is unavailable")
 	}
 	if response.StatusCode() != http.StatusCreated || response.JSON201 == nil {
+		if response.JSONDefault != nil && response.JSONDefault.Error.Code == "CREDITS_POLICY_BLOCKED" {
+			return errors.New("request SSH connection: " + creditsBlockedText)
+		}
 		return fmt.Errorf("request SSH connection: control plane returned HTTP %d", response.StatusCode())
 	}
 	proxyURL, err := validateConnectionIntent(*response.JSON201, environmentID, command.now())
@@ -89,7 +93,10 @@ func (command sshProxyCommand) run(ctx context.Context, environmentID string) er
 	dialContext, cancelDial := context.WithTimeout(ctx, proxyRequestTimeout)
 	connection, _, err := websocket.Dial(dialContext, proxyURL.String(), &websocket.DialOptions{
 		HTTPClient: client,
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + accessToken}},
+		HTTPHeader: http.Header{
+			"Authorization":         {"Bearer " + accessToken},
+			connection.IntentHeader: {response.JSON201.Id},
+		},
 	})
 	cancelDial()
 	if err != nil {
@@ -169,6 +176,8 @@ type sshControlStep struct {
 
 func sshControlStepText(value string) (sshControlStep, bool) {
 	switch value {
+	case "credits-blocked":
+		return sshControlStep{identifier: "credits-blocked", progress: "Checking Credit Balance", failure: creditsBlockedText}, true
 	case "starting-runtime":
 		return sshControlStep{identifier: "starting-runtime", progress: "Starting Runtime", failure: "the Runtime could not be started"}, true
 	case "waiting-for-guest":

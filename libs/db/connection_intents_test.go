@@ -3,6 +3,7 @@ package db_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -157,6 +158,140 @@ func TestStoreConnectionIntentFinalCheckRejectsActiveStopWithoutMinting(t *testi
 	}
 	if records != 0 {
 		t.Fatalf("persisted Connection Intents = %d, want 0", records)
+	}
+}
+
+func TestStoreConsumesOwnedConnectionIntentExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertReadyConnectionIntentState(t, ctx, pool, now)
+	operationID := "operation-start"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO operations (
+			id, environment_id, type, status, requested_by_user_id, idempotency_key,
+			restate_invocation_id, input, created_at, completed_at
+		) VALUES ($1, 'environment-1', 'runtime.start', 'succeeded', 'user-1',
+			'system:connection-start:consumed', 'invocation-start', '{}', $2, $2)`, operationID, now); err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", now, now.Add(time.Minute),
+		func(context.Context) (*string, error) { return &operationID, nil },
+		func() string { return "intent-1" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumed, err := store.ConsumeConnectionIntent(ctx, "workos-1", created.IntentID, "environment-1", now.Add(time.Second))
+	if err != nil || consumed.OperationID == nil || *consumed.OperationID != operationID || consumed.UsedAt == nil || !consumed.UsedAt.Equal(now.Add(time.Second)) {
+		t.Fatalf("consumed Connection Intent = %#v error:%v", consumed, err)
+	}
+	if _, err := store.ConsumeConnectionIntent(ctx, "workos-1", created.IntentID, "environment-1", now.Add(2*time.Second)); !errors.Is(err, dbstore.ErrConnectionIntentUsed) {
+		t.Fatalf("reused Connection Intent error = %v", err)
+	}
+	if _, err := store.ConsumeConnectionIntent(ctx, "workos-2", created.IntentID, "environment-1", now.Add(2*time.Second)); !errors.Is(err, dbstore.ErrConnectionIntentNotFound) {
+		t.Fatalf("foreign Connection Intent error = %v", err)
+	}
+	if _, err := store.ConsumeConnectionIntent(ctx, "workos-1", created.IntentID, "environment-2", now.Add(2*time.Second)); !errors.Is(err, dbstore.ErrConnectionIntentNotFound) {
+		t.Fatalf("wrong-Environment Connection Intent error = %v", err)
+	}
+}
+
+func TestStoreRejectsExpiredConnectionIntentWithoutConsumingIt(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertReadyConnectionIntentState(t, ctx, pool, now)
+	created, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", now, now.Add(time.Minute),
+		func(context.Context) (*string, error) { return nil, nil }, func() string { return "intent-1" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeConnectionIntent(ctx, "workos-1", created.IntentID, "environment-1", created.ExpiresAt); !errors.Is(err, dbstore.ErrConnectionIntentExpired) {
+		t.Fatalf("expired Connection Intent error = %v", err)
+	}
+	var usedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT used_at FROM connection_intent_idempotency WHERE intent_id = $1`, created.IntentID).Scan(&usedAt); err != nil {
+		t.Fatal(err)
+	}
+	if usedAt != nil {
+		t.Fatalf("expired Connection Intent used_at = %s", usedAt)
+	}
+}
+
+func TestStoreConcurrentColdConnectionIntentsDoNotStarveTwoConnectionPool(t *testing.T) {
+	setupCtx := context.Background()
+	database, connectionString := openTestDatabase(t, setupCtx)
+	if err := dbstore.Migrate(setupCtx, database); err != nil {
+		t.Fatal(err)
+	}
+	config, err := pgxpool.ParseConfig(connectionString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(setupCtx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	store := dbstore.NewStore(pool)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertRuntimeOperationState(t, setupCtx, pool, now)
+	ctx, cancel := context.WithTimeout(setupCtx, 3*time.Second)
+	defer cancel()
+
+	var ready sync.WaitGroup
+	ready.Add(2)
+	release := make(chan struct{})
+	go func() {
+		ready.Wait()
+		close(release)
+	}()
+	results := make(chan error, 2)
+	for index := range 2 {
+		go func() {
+			prepare := func(prepareCtx context.Context) (*string, error) {
+				ready.Done()
+				select {
+				case <-release:
+				case <-prepareCtx.Done():
+					return nil, context.Cause(prepareCtx)
+				}
+				operationID := "operation-start-" + string(rune('1'+index))
+				operation := runtimeOperationCandidate(t, operationID, "environment-1", domain.OperationRuntimeStart, "system:connection-start:"+operationID, []byte(`{}`), now.Add(time.Second))
+				command, reserveErr := store.ReserveRuntimeOperation(prepareCtx, operation)
+				if reserveErr == nil {
+					reservedID := command.Operation().Snapshot().ID
+					return &reservedID, nil
+				}
+				if !errors.Is(reserveErr, dbstore.ErrOperationConflict) {
+					return nil, reserveErr
+				}
+				var activeID string
+				if queryErr := pool.QueryRow(prepareCtx, `
+					SELECT id FROM operations
+					WHERE environment_id = 'environment-1' AND status IN ('queued', 'running')`,
+				).Scan(&activeID); queryErr != nil {
+					return nil, queryErr
+				}
+				return &activeID, nil
+			}
+			_, createErr := store.CreateOrReplayConnectionIntent(
+				ctx, "user-1", "connection-key-000"+string(rune('1'+index)), "environment-1",
+				now, now.Add(time.Minute), prepare, func() string { return "intent-" + string(rune('1'+index)) },
+			)
+			results <- createErr
+		}()
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent cold Connection Intent: %v", err)
+		}
 	}
 }
 

@@ -24,6 +24,7 @@ const (
 	defaultDialTimeout         = 10 * time.Second
 	defaultIdleTimeout         = 2 * time.Minute
 	defaultStartWaitTimeout    = 10 * time.Minute
+	defaultStartSettleTimeout  = 15 * time.Second
 	defaultRoutePollInterval   = 2 * time.Second
 	defaultControlWriteTimeout = 10 * time.Second
 	defaultBufferBytes         = 32 * 1024
@@ -31,9 +32,12 @@ const (
 )
 
 var (
-	ErrEnvironmentNotFound = errors.New("Environment SSH route not found")
-	ErrRuntimeNotReady     = errors.New("Runtime SSH route not ready")
-	ErrRuntimeStartFailed  = errors.New("Runtime start failed")
+	ErrEnvironmentNotFound      = errors.New("Environment SSH route not found")
+	ErrRuntimeNotReady          = errors.New("Runtime SSH route not ready")
+	ErrRuntimeStartFailed       = errors.New("Runtime start failed")
+	ErrConnectionIntentNotFound = errors.New("Connection Intent not found")
+	ErrConnectionIntentExpired  = errors.New("Connection Intent expired")
+	ErrConnectionIntentUsed     = errors.New("Connection Intent already used")
 )
 
 type BearerVerifier interface {
@@ -53,6 +57,16 @@ type EnvironmentSSHRoute struct {
 	PrivateAddress string
 }
 
+type ConnectionIntentAttempt struct {
+	OperationID *string
+}
+
+// ConnectionIntentAuthorizer atomically consumes an owner- and
+// Environment-scoped Connection Intent before the WebSocket is upgraded.
+type ConnectionIntentAuthorizer interface {
+	Consume(context.Context, auth.Subject, string, string) (ConnectionIntentAttempt, error)
+}
+
 // RuntimeStarter asks the control plane to ensure that the Environment's
 // current Runtime is starting. bearer is the already-verified user access
 // token and must be forwarded without logging or including it in errors.
@@ -66,6 +80,7 @@ type ContextDialer interface {
 
 type Config struct {
 	Verifier       BearerVerifier
+	Intents        ConnectionIntentAuthorizer
 	Routes         EnvironmentRouter
 	Starter        RuntimeStarter
 	Dialer         ContextDialer
@@ -73,6 +88,7 @@ type Config struct {
 	DialTimeout    time.Duration
 	IdleTimeout    time.Duration
 	StartTimeout   time.Duration
+	SettleTimeout  time.Duration
 	PollInterval   time.Duration
 	ControlTimeout time.Duration
 	BufferBytes    int
@@ -80,6 +96,7 @@ type Config struct {
 
 type proxy struct {
 	verifier       BearerVerifier
+	intents        ConnectionIntentAuthorizer
 	routes         EnvironmentRouter
 	starter        RuntimeStarter
 	dialer         ContextDialer
@@ -87,14 +104,15 @@ type proxy struct {
 	dialTimeout    time.Duration
 	idleTimeout    time.Duration
 	startTimeout   time.Duration
+	settleTimeout  time.Duration
 	pollInterval   time.Duration
 	controlTimeout time.Duration
 	bufferBytes    int
 }
 
 func NewHandler(config Config) (http.Handler, error) {
-	if config.Verifier == nil || config.Routes == nil || config.Starter == nil || config.Dialer == nil {
-		return nil, errors.New("create SSH proxy: verifier, Environment router, Runtime starter, and dialer are required")
+	if config.Verifier == nil || config.Intents == nil || config.Routes == nil || config.Starter == nil || config.Dialer == nil {
+		return nil, errors.New("create SSH proxy: verifier, Connection Intent authorizer, Environment router, Runtime starter, and dialer are required")
 	}
 	if config.DialTimeout == 0 {
 		config.DialTimeout = defaultDialTimeout
@@ -104,6 +122,9 @@ func NewHandler(config Config) (http.Handler, error) {
 	}
 	if config.StartTimeout == 0 {
 		config.StartTimeout = defaultStartWaitTimeout
+	}
+	if config.SettleTimeout == 0 {
+		config.SettleTimeout = defaultStartSettleTimeout
 	}
 	if config.PollInterval == 0 {
 		config.PollInterval = defaultRoutePollInterval
@@ -117,15 +138,15 @@ func NewHandler(config Config) (http.Handler, error) {
 	if config.StreamContext == nil {
 		config.StreamContext = context.Background()
 	}
-	if config.DialTimeout < 0 || config.IdleTimeout < 0 || config.StartTimeout < 0 ||
+	if config.DialTimeout < 0 || config.IdleTimeout < 0 || config.StartTimeout < 0 || config.SettleTimeout < 0 ||
 		config.PollInterval < 0 || config.ControlTimeout < 0 || config.BufferBytes < 1 {
 		return nil, errors.New("create SSH proxy: timeouts and buffer size must be positive")
 	}
 	handler := &proxy{
-		verifier: config.Verifier, routes: config.Routes, starter: config.Starter, dialer: config.Dialer,
+		verifier: config.Verifier, intents: config.Intents, routes: config.Routes, starter: config.Starter, dialer: config.Dialer,
 		stream:      config.StreamContext,
 		dialTimeout: config.DialTimeout, idleTimeout: config.IdleTimeout, startTimeout: config.StartTimeout,
-		pollInterval: config.PollInterval, controlTimeout: config.ControlTimeout, bufferBytes: config.BufferBytes,
+		settleTimeout: config.SettleTimeout, pollInterval: config.PollInterval, controlTimeout: config.ControlTimeout, bufferBytes: config.BufferBytes,
 	}
 	router := http.NewServeMux()
 	router.HandleFunc("GET /v1/environments/{environment_id}/ssh", handler.serveSSH)
@@ -144,6 +165,25 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 		return
 	}
 	environmentID := request.PathValue("environment_id")
+	intentID := request.Header.Get(connectionprotocol.IntentHeader)
+	if intentID == "" || intentID != strings.TrimSpace(intentID) {
+		http.Error(response, "Connection Intent is required", http.StatusBadRequest)
+		return
+	}
+	attempt, err := proxy.intents.Consume(request.Context(), subject, intentID, environmentID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrConnectionIntentNotFound):
+			http.Error(response, "Connection Intent not found", http.StatusNotFound)
+		case errors.Is(err, ErrConnectionIntentExpired):
+			http.Error(response, "Connection Intent expired", http.StatusGone)
+		case errors.Is(err, ErrConnectionIntentUsed):
+			http.Error(response, "Connection Intent already used", http.StatusConflict)
+		default:
+			http.Error(response, "Connection Intent unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
 	route, err := proxy.routes.ResolveSSH(request.Context(), subject, environmentID)
 	if errors.Is(err, ErrEnvironmentNotFound) {
 		http.Error(response, "Environment not found", http.StatusNotFound)
@@ -180,27 +220,66 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 	guard := watchPreBridgeClient(socketContext, connection)
 
 	operationID := ""
+	if attempt.OperationID != nil {
+		operationID = *attempt.OperationID
+	}
 	if notReady {
-		if !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
-			Type: connectionprotocol.ControlProgress, Step: "starting-runtime", Message: "Requesting Runtime start.",
-		}) {
-			return
-		}
-		operationID, err = proxy.ensureStarted(waitContext, guard, token, environmentID, connectionAttempt)
-		if err != nil {
-			if errors.Is(err, errClientFrameBeforeReady) {
+		if operationID == "" {
+			if !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
+				Type: connectionprotocol.ControlProgress, Step: "starting-runtime", Message: "Requesting Runtime start.",
+			}) {
 				return
 			}
-			proxy.failControl(connection, operationID, "starting-runtime", startFailureMessage(err))
-			return
+			operationID, err = proxy.ensureStarted(waitContext, guard, token, environmentID, connectionAttempt)
+			if err != nil {
+				if errors.Is(err, errClientFrameBeforeReady) {
+					return
+				}
+				if errors.Is(err, ErrRuntimeCommandInvalidState) {
+					settled, resolveErr := proxy.resolveRoute(waitContext, guard, subject, environmentID)
+					switch {
+					case resolveErr == nil && validSSHRoute(settled):
+						route, notReady = settled, false
+					case errors.Is(resolveErr, ErrRuntimeNotReady):
+						if !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
+							Type: connectionprotocol.ControlProgress, Step: "waiting-for-guest", Message: "Waiting for a settling Runtime start.",
+						}) {
+							return
+						}
+						settleContext, cancelSettle := context.WithTimeout(waitContext, proxy.settleTimeout)
+						route, resolveErr = proxy.waitForRoute(settleContext, guard, connection, subject, environmentID, operationID)
+						cancelSettle()
+						if resolveErr == nil {
+							notReady = false
+							break
+						}
+						if errors.Is(resolveErr, errClientFrameBeforeReady) {
+							return
+						}
+						step, message := routeFailure(resolveErr)
+						proxy.failControl(connection, operationID, step, message)
+						return
+					default:
+						step, message := routeFailure(resolveErr)
+						proxy.failControl(connection, operationID, step, message)
+						return
+					}
+				} else {
+					step, message := startFailure(err)
+					proxy.failControl(connection, operationID, step, message)
+					return
+				}
+			}
 		}
-		if !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
+		if notReady && !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
 			Type: connectionprotocol.ControlProgress, OperationID: operationID, Step: "waiting-for-guest", Message: "Waiting for Runtime readiness.",
 		}) {
 			return
 		}
-		route, err = proxy.waitForRoute(waitContext, guard, connection, subject, environmentID, operationID)
-		if err != nil {
+		if notReady {
+			route, err = proxy.waitForRoute(waitContext, guard, connection, subject, environmentID, operationID)
+		}
+		if notReady && err != nil {
 			if errors.Is(err, errClientFrameBeforeReady) {
 				return
 			}
@@ -495,14 +574,16 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-func startFailureMessage(err error) string {
+func startFailure(err error) (string, string) {
 	switch {
 	case errors.Is(err, ErrCreditsPolicyBlocked):
-		return "Runtime start is blocked by the credit policy. Persistent Environment state is intact."
+		return "credits-blocked", "The Runtime cannot start because the Credit Balance is depleted. Add credits and try again."
 	case errors.Is(err, ErrStartAuthorization):
-		return "Runtime start authorization failed. Persistent Environment state is intact."
+		return "starting-runtime", "Runtime start authorization failed. Persistent Environment state is intact."
+	case errors.Is(err, ErrRuntimeOperationConflict):
+		return "operation-conflict", "Another Environment Operation prevents this Runtime start. Persistent Environment state is intact."
 	default:
-		return "The Runtime could not be started. Persistent Environment state is intact."
+		return "starting-runtime", "The Runtime could not be started. Persistent Environment state is intact."
 	}
 }
 

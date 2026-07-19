@@ -21,8 +21,10 @@ const (
 )
 
 var (
-	ErrCreditsPolicyBlocked = errors.New("Runtime start blocked by credit policy")
-	ErrStartAuthorization   = errors.New("Runtime start authorization failed")
+	ErrCreditsPolicyBlocked       = errors.New("Runtime start blocked by credit policy")
+	ErrStartAuthorization         = errors.New("Runtime start authorization failed")
+	ErrRuntimeOperationConflict   = errors.New("Runtime start conflicts with an active Operation")
+	ErrRuntimeCommandInvalidState = errors.New("Runtime start encountered a settling state")
 )
 
 // RuntimeBootAttempt identifies the persisted state from which a start is
@@ -121,7 +123,9 @@ func (starter *ControlPlaneRuntimeStarter) EnsureStarted(ctx context.Context, be
 	case response.StatusCode == http.StatusAccepted && operationID != "":
 		return operationID, nil
 	case response.StatusCode == http.StatusConflict && body.Error.Code == "OPERATION_CONFLICT":
-		return operationID, nil
+		return operationID, ErrRuntimeOperationConflict
+	case response.StatusCode == http.StatusUnprocessableEntity && body.Error.Code == "RUNTIME_COMMAND_INVALID_STATE":
+		return operationID, ErrRuntimeCommandInvalidState
 	case response.StatusCode == http.StatusUnauthorized || body.Error.Code == "AUTHORIZATION_FAILED":
 		return "", ErrStartAuthorization
 	case response.StatusCode == http.StatusForbidden && body.Error.Code == "CREDITS_POLICY_BLOCKED":

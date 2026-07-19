@@ -9,6 +9,14 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+var (
+	ErrConnectionIntentNotFound = errors.New("Connection Intent not found")
+	ErrConnectionIntentExpired  = errors.New("Connection Intent expired")
+	ErrConnectionIntentUsed     = errors.New("Connection Intent already used")
 )
 
 // ConnectionIntentRecord is the persisted response identity for one
@@ -21,6 +29,67 @@ type ConnectionIntentRecord struct {
 	OperationID    *string
 	IntentID       string
 	ExpiresAt      time.Time
+	UsedAt         *time.Time
+}
+
+// ConsumeConnectionIntent atomically spends one unexpired Connection Intent
+// for the WorkOS subject and Environment presented at the regional proxy.
+// Missing and foreign records are deliberately indistinguishable.
+func (store *Store) ConsumeConnectionIntent(ctx context.Context, workOSUserID, intentID, environmentID string, observedAt time.Time) (ConnectionIntentRecord, error) {
+	if !canonicalConnectionIntentIdentity(workOSUserID) || !canonicalConnectionIntentIdentity(intentID) ||
+		!canonicalConnectionIntentIdentity(environmentID) || observedAt.IsZero() {
+		return ConnectionIntentRecord{}, errors.New("consume Connection Intent: canonical identities and observation time are required")
+	}
+	var record ConnectionIntentRecord
+	var expiresAt, usedAt pgtype.Timestamptz
+	err := store.pool.QueryRow(ctx, `
+		UPDATE connection_intent_idempotency intent
+		SET used_at = $4
+		FROM users owner
+		WHERE intent.owner_user_id = owner.id
+		  AND owner.workos_user_id = $1
+		  AND intent.intent_id = $2
+		  AND intent.environment_id = $3
+		  AND intent.expires_at > $4
+		  AND intent.used_at IS NULL
+		RETURNING intent.owner_user_id, intent.idempotency_key, intent.environment_id,
+		          intent.operation_id, intent.intent_id, intent.expires_at, intent.used_at`,
+		workOSUserID, intentID, environmentID, observedAt.UTC(),
+	).Scan(
+		&record.OwnerUserID, &record.IdempotencyKey, &record.EnvironmentID,
+		&record.OperationID, &record.IntentID, &expiresAt, &usedAt,
+	)
+	if err == nil {
+		if !expiresAt.Valid || !usedAt.Valid {
+			return ConnectionIntentRecord{}, errors.New("consume Connection Intent: database returned invalid timestamps")
+		}
+		record.ExpiresAt = expiresAt.Time
+		record.UsedAt = timePointer(usedAt.Time)
+		return record, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return ConnectionIntentRecord{}, fmt.Errorf("consume Connection Intent: %w", err)
+	}
+	if err := store.pool.QueryRow(ctx, `
+		SELECT intent.expires_at, intent.used_at
+		FROM connection_intent_idempotency intent
+		JOIN users owner ON owner.id = intent.owner_user_id
+		WHERE owner.workos_user_id = $1
+		  AND intent.intent_id = $2
+		  AND intent.environment_id = $3`,
+		workOSUserID, intentID, environmentID,
+	).Scan(&expiresAt, &usedAt); errors.Is(err, pgx.ErrNoRows) {
+		return ConnectionIntentRecord{}, ErrConnectionIntentNotFound
+	} else if err != nil {
+		return ConnectionIntentRecord{}, fmt.Errorf("consume Connection Intent: inspect refusal: %w", err)
+	}
+	if usedAt.Valid {
+		return ConnectionIntentRecord{}, ErrConnectionIntentUsed
+	}
+	if !expiresAt.Valid || !expiresAt.Time.After(observedAt) {
+		return ConnectionIntentRecord{}, ErrConnectionIntentExpired
+	}
+	return ConnectionIntentRecord{}, errors.New("consume Connection Intent: atomic update was not applied")
 }
 
 // CreateOrReplayConnectionIntent serializes a Connection Intent against every
@@ -39,15 +108,77 @@ func (store *Store) CreateOrReplayConnectionIntent(
 		!canonicalConnectionIntentIdentity(environmentID) || observedAt.IsZero() || !expiresAt.After(observedAt) || prepare == nil || mint == nil {
 		return ConnectionIntentRecord{}, errors.New("create Connection Intent: canonical identities, expiry, preparation, and minting are required")
 	}
+	existing, present, err := store.replayConnectionIntent(ctx, ownerID, idempotencyKey, environmentID, observedAt)
+	if err != nil || present {
+		return existing, err
+	}
+	operationID, err := prepare(ctx)
+	if err != nil {
+		return ConnectionIntentRecord{}, err
+	}
+	record, err := store.persistPreparedConnectionIntent(
+		ctx, ownerID, idempotencyKey, environmentID, observedAt, expiresAt, operationID, mint,
+	)
+	var insertRace *connectionIntentInsertRaceError
+	if !errors.As(err, &insertRace) {
+		return record, err
+	}
+	existing, present, replayErr := store.replayConnectionIntent(ctx, ownerID, idempotencyKey, environmentID, observedAt)
+	if replayErr != nil {
+		return ConnectionIntentRecord{}, replayErr
+	}
+	if present {
+		return existing, nil
+	}
+	return ConnectionIntentRecord{}, classifyRepositoryError(insertRace.cause)
+}
+
+func (store *Store) replayConnectionIntent(ctx context.Context, ownerID, idempotencyKey, environmentID string, observedAt time.Time) (ConnectionIntentRecord, bool, error) {
 	tx, err := store.pool.Begin(ctx)
 	if err != nil {
-		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: begin transaction: %w", err)
+		return ConnectionIntentRecord{}, false, fmt.Errorf("create Connection Intent: begin replay transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
-		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: lock idempotency key: %w", err)
+		return ConnectionIntentRecord{}, false, fmt.Errorf("create Connection Intent: lock replay idempotency key: %w", err)
 	}
+	existing, present, err := loadConnectionIntentForUpdate(ctx, tx, ownerID, idempotencyKey)
+	if err != nil {
+		return ConnectionIntentRecord{}, false, err
+	}
+	if present && existing.ExpiresAt.After(observedAt) {
+		if existing.EnvironmentID != environmentID {
+			return ConnectionIntentRecord{}, false, ErrIdempotencyConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return ConnectionIntentRecord{}, false, fmt.Errorf("create Connection Intent: commit replay: %w", err)
+		}
+		return existing, true, nil
+	}
+	if err := rejectExistingOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
+		return ConnectionIntentRecord{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ConnectionIntentRecord{}, false, fmt.Errorf("create Connection Intent: commit replay miss: %w", err)
+	}
+	return ConnectionIntentRecord{}, false, nil
+}
 
+func (store *Store) persistPreparedConnectionIntent(
+	ctx context.Context,
+	ownerID, idempotencyKey, environmentID string,
+	observedAt, expiresAt time.Time,
+	preparedOperationID *string,
+	mint func() string,
+) (ConnectionIntentRecord, error) {
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: begin persist transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
+		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: lock persist idempotency key: %w", err)
+	}
 	existing, present, err := loadConnectionIntentForUpdate(ctx, tx, ownerID, idempotencyKey)
 	if err != nil {
 		return ConnectionIntentRecord{}, err
@@ -57,7 +188,7 @@ func (store *Store) CreateOrReplayConnectionIntent(
 			return ConnectionIntentRecord{}, ErrIdempotencyConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: commit replay: %w", err)
+			return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: commit concurrent replay: %w", err)
 		}
 		return existing, nil
 	}
@@ -68,21 +199,10 @@ func (store *Store) CreateOrReplayConnectionIntent(
 			return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: replace expired record: %w", err)
 		}
 	}
-	var operationExists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM operations WHERE requested_by_user_id = $1 AND idempotency_key = $2
-	)`, ownerID, idempotencyKey).Scan(&operationExists); err != nil {
-		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: inspect Operation idempotency key: %w", err)
-	}
-	if operationExists {
-		return ConnectionIntentRecord{}, ErrIdempotencyConflict
-	}
-
-	operationID, err := prepare(ctx)
-	if err != nil {
+	if err := rejectExistingOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
 		return ConnectionIntentRecord{}, err
 	}
-	operationID, err = lockConnectionIntentEnvironment(ctx, tx, ownerID, environmentID, operationID)
+	preparedOperationID, err = lockConnectionIntentEnvironment(ctx, tx, ownerID, environmentID, preparedOperationID)
 	if err != nil {
 		return ConnectionIntentRecord{}, err
 	}
@@ -92,13 +212,17 @@ func (store *Store) CreateOrReplayConnectionIntent(
 	}
 	record := ConnectionIntentRecord{
 		OwnerUserID: ownerID, IdempotencyKey: idempotencyKey, EnvironmentID: environmentID,
-		OperationID: operationID, IntentID: intentID, ExpiresAt: expiresAt.UTC(),
+		OperationID: preparedOperationID, IntentID: intentID, ExpiresAt: expiresAt.UTC(),
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO connection_intent_idempotency (
 			owner_user_id, idempotency_key, environment_id, operation_id, intent_id, expires_at
 		) VALUES ($1, $2, $3, $4, $5, $6)`,
 		record.OwnerUserID, record.IdempotencyKey, record.EnvironmentID, record.OperationID, record.IntentID, record.ExpiresAt); err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+			return ConnectionIntentRecord{}, &connectionIntentInsertRaceError{cause: fmt.Errorf("create Connection Intent: persist response: %w", err)}
+		}
 		return ConnectionIntentRecord{}, classifyRepositoryError(fmt.Errorf("create Connection Intent: persist response: %w", err))
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -107,14 +231,33 @@ func (store *Store) CreateOrReplayConnectionIntent(
 	return record, nil
 }
 
+type connectionIntentInsertRaceError struct{ cause error }
+
+func (err *connectionIntentInsertRaceError) Error() string { return err.cause.Error() }
+func (err *connectionIntentInsertRaceError) Unwrap() error { return err.cause }
+
+func rejectExistingOperationIdempotencyKey(ctx context.Context, tx pgx.Tx, ownerID, idempotencyKey string) error {
+	var operationExists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM operations WHERE requested_by_user_id = $1 AND idempotency_key = $2
+	)`, ownerID, idempotencyKey).Scan(&operationExists); err != nil {
+		return fmt.Errorf("create Connection Intent: inspect Operation idempotency key: %w", err)
+	}
+	if operationExists {
+		return ErrIdempotencyConflict
+	}
+	return nil
+}
+
 func loadConnectionIntentForUpdate(ctx context.Context, tx pgx.Tx, ownerID, idempotencyKey string) (ConnectionIntentRecord, bool, error) {
 	var record ConnectionIntentRecord
+	var usedAt pgtype.Timestamptz
 	err := tx.QueryRow(ctx, `
-		SELECT owner_user_id, idempotency_key, environment_id, operation_id, intent_id, expires_at
+		SELECT owner_user_id, idempotency_key, environment_id, operation_id, intent_id, expires_at, used_at
 		FROM connection_intent_idempotency
 		WHERE owner_user_id = $1 AND idempotency_key = $2
 		FOR UPDATE`, ownerID, idempotencyKey).Scan(
-		&record.OwnerUserID, &record.IdempotencyKey, &record.EnvironmentID, &record.OperationID, &record.IntentID, &record.ExpiresAt,
+		&record.OwnerUserID, &record.IdempotencyKey, &record.EnvironmentID, &record.OperationID, &record.IntentID, &record.ExpiresAt, &usedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ConnectionIntentRecord{}, false, nil
@@ -124,6 +267,9 @@ func loadConnectionIntentForUpdate(ctx context.Context, tx pgx.Tx, ownerID, idem
 	}
 	if record.ExpiresAt.IsZero() {
 		return ConnectionIntentRecord{}, false, errors.New("create Connection Intent: database returned invalid expiry")
+	}
+	if usedAt.Valid {
+		record.UsedAt = timePointer(usedAt.Time)
 	}
 	return record, true, nil
 }
@@ -183,4 +329,9 @@ func (store *Store) PruneConnectionIntents(ctx context.Context, expiredAt time.T
 
 func canonicalConnectionIntentIdentity(value string) bool {
 	return value != "" && value == strings.TrimSpace(value)
+}
+
+func timePointer(value time.Time) *time.Time {
+	result := value
+	return &result
 }

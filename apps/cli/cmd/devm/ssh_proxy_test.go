@@ -254,6 +254,26 @@ func TestSSHProxyCommandFailedControlNamesStepAndLeaksNoBearerOrPayload(t *testi
 	}
 }
 
+func TestSSHProxyCommandExplainsCreditBlockFromProxyControlFrame(t *testing.T) {
+	const peerMessage = "PEER_CREDIT_MESSAGE_MUST_NOT_BE_PRINTED"
+	server := newProxyControlServer(t, "ACCESS_SECRET", "env_01", func(ctx context.Context, socket *websocket.Conn) {
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{
+			Type: connection.ControlFailed, Step: "credits-blocked", Message: peerMessage,
+		})
+	})
+	defer server.Close()
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+		tokens: staticAccessTokenSource{token: "ACCESS_SECRET"}, attempt: "attempt-01",
+		input: bytes.NewReader(nil), output: io.Discard, now: time.Now,
+	}
+	err := command.run(context.Background(), "env_01")
+	message := fmt.Sprint(err)
+	if err == nil || !strings.Contains(message, creditsBlockedText) || strings.Contains(message, peerMessage) {
+		t.Fatalf("credit-blocked proxy error = %v", err)
+	}
+}
+
 func TestSSHProxyCommandRejectsBinaryBeforeReadyWithoutWritingPayload(t *testing.T) {
 	const payload = "SSH_PAYLOAD_SECRET"
 	server := newProxyControlServer(t, "ACCESS_SECRET", "env_01", func(ctx context.Context, socket *websocket.Conn) {
@@ -373,6 +393,27 @@ func TestSSHProxyCommandNotReadyResponseDoesNotExposePayloadOrBearer(t *testing.
 	err := command.run(context.Background(), "env_01")
 	if err == nil || strings.Contains(fmt.Sprint(err), token) || strings.Contains(fmt.Sprint(err), "RUNTIME_PAYLOAD_SECRET") {
 		t.Fatalf("not-ready error = %v", err)
+	}
+}
+
+func TestSSHProxyCommandExplainsCreditBlockFromConnectionIntent(t *testing.T) {
+	const peerMessage = "PEER_CREDIT_MESSAGE_MUST_NOT_BE_PRINTED"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprintf(response, `{"requestId":"request-01","error":{"code":"CREDITS_POLICY_BLOCKED","message":%q}}`, peerMessage)
+	}))
+	defer server.Close()
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+		tokens: staticAccessTokenSource{token: "ACCESS_SECRET"}, attempt: "attempt-01",
+		input: bytes.NewReader(nil), output: io.Discard, now: time.Now,
+	}
+	err := command.run(context.Background(), "env_01")
+	message := fmt.Sprint(err)
+	if err == nil || !strings.Contains(message, "The Runtime cannot start because the Credit Balance is depleted. Add credits and try again.") ||
+		strings.Contains(message, peerMessage) {
+		t.Fatalf("credit-blocked intent error = %v", err)
 	}
 }
 
@@ -516,6 +557,11 @@ func newProxyControlServer(t *testing.T, token, environmentID string, stream fun
 				ExpiresAt: time.Now().Add(time.Minute),
 			})
 		case "/v1/environments/" + environmentID + "/ssh":
+			if got := request.Header.Get(connection.IntentHeader); got != "intent-01" {
+				t.Errorf("connection intent = %q", got)
+				http.Error(response, "connection intent required", http.StatusBadRequest)
+				return
+			}
 			connection, err := websocket.Accept(response, request, nil)
 			if err != nil {
 				t.Errorf("accept websocket: %v", err)

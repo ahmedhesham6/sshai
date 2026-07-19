@@ -49,12 +49,14 @@ Private-key contents are never uploaded or logged.
 
 1. OpenSSH launches `devm ssh-proxy` through `ProxyCommand`.
 2. The CLI refreshes its WorkOS access token when necessary.
-3. The CLI requests the Environment route and opens an authenticated WSS connection to its regional proxy.
-4. The proxy verifies JWT signature, issuer, audience, expiry, and Environment ownership.
-5. If the Runtime is stopped, the proxy requests an idempotent start Operation and streams progress control messages while waiting.
-6. The proxy resolves the Runtime's observed private address only after current-boot readiness.
+3. The CLI creates a Connection Intent, validates the returned regional `proxyUrl`, and opens that WSS endpoint with its bearer and the Intent ID in `X-Connection-Intent-ID`.
+4. Before upgrading the socket, the proxy verifies JWT signature, issuer, audience, and expiry, then atomically consumes the unexpired, unused Connection Intent for that subject and path Environment. A missing, expired, reused, foreign, or wrong-Environment Intent is refused before upgrade.
+5. The consumed Intent's nullable start Operation is authoritative. When present, the proxy waits for that Operation's Runtime readiness without issuing another start. Only an Intent without an Operation may use the proxy's idempotent start fallback.
+6. The proxy resolves the Runtime's observed private address only after current-boot readiness and rechecks Environment ownership through the route lookup.
 7. The proxy opens a TCP connection to private port 22.
 8. Binary WebSocket frames bridge bytes without terminating SSH encryption.
+
+Connection Intent expiry is checked only when the WSS attempt is admitted. Consuming the Intent authorizes that one attempt; expiry during the bounded readiness wait does not cancel or re-authorize the in-flight connection.
 
 The proxy must apply backpressure and bounded buffers. It must not log SSH payload bytes.
 
@@ -77,7 +79,7 @@ The Runtime SSH host key belongs to the Environment, not the system volume. Stor
 ## Failure behavior
 
 - Auth failure closes before Runtime start.
-- Insufficient credits returns a product-level refusal before compute allocation once zero-balance policy is defined.
+- Insufficient credits returns the client-owned, actionable `credits-blocked` refusal before compute allocation, whether the block is returned while creating the Connection Intent or by the proxy's fallback start.
 - Start failure returns an SSH-proxy error naming the failed semantic step and confirming persistent state remains intact.
 - WebSocket disconnect does not automatically stop the Runtime; the Auto-stop Policy evaluates observed activity.
 - A stale private address is never reused without boot/readiness confirmation.

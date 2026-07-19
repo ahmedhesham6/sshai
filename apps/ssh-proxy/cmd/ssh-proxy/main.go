@@ -15,6 +15,7 @@ import (
 
 	sshproxy "github.com/ahmedhesham6/sshai/apps/ssh-proxy"
 	"github.com/ahmedhesham6/sshai/libs/auth"
+	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -54,6 +55,7 @@ func run(ctx context.Context) error {
 	}()
 
 	routes := postgresRouteStore{queries: pool, region: config.region}
+	intents := postgresIntentStore{store: dbstore.NewStore(pool), now: time.Now}
 	starter, err := sshproxy.NewControlPlaneRuntimeStarter(
 		config.controlPlaneURL,
 		&http.Client{Timeout: 15 * time.Second},
@@ -62,7 +64,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	handler, err := buildHandler(ctx, config, verifier, routes, starter, &net.Dialer{})
+	handler, err := buildHandler(ctx, config, verifier, intents, routes, starter, &net.Dialer{})
 	if err != nil {
 		return err
 	}
@@ -79,12 +81,12 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func buildHandler(ctx context.Context, config config, verifier sshproxy.BearerVerifier, routes sshproxy.EnvironmentRouter, starter sshproxy.RuntimeStarter, dialer sshproxy.ContextDialer) (http.Handler, error) {
+func buildHandler(ctx context.Context, config config, verifier sshproxy.BearerVerifier, intents sshproxy.ConnectionIntentAuthorizer, routes sshproxy.EnvironmentRouter, starter sshproxy.RuntimeStarter, dialer sshproxy.ContextDialer) (http.Handler, error) {
 	return sshproxy.NewHandler(sshproxy.Config{
-		Verifier: verifier, Routes: routes, Starter: starter, Dialer: dialer,
+		Verifier: verifier, Intents: intents, Routes: routes, Starter: starter, Dialer: dialer,
 		StreamContext: ctx,
 		DialTimeout:   config.dialTimeout, IdleTimeout: config.idleTimeout,
-		StartTimeout: config.startTimeout, PollInterval: config.pollInterval,
+		StartTimeout: config.startTimeout, SettleTimeout: config.settleTimeout, PollInterval: config.pollInterval,
 		ControlTimeout: config.controlTimeout, BufferBytes: config.bufferBytes,
 	})
 }
@@ -100,6 +102,7 @@ type config struct {
 	dialTimeout     time.Duration
 	idleTimeout     time.Duration
 	startTimeout    time.Duration
+	settleTimeout   time.Duration
 	pollInterval    time.Duration
 	controlTimeout  time.Duration
 	bufferBytes     int
@@ -125,6 +128,9 @@ func loadConfig() (config, error) {
 		return result, err
 	}
 	if result.startTimeout, err = durationOrDefault("START_WAIT_TIMEOUT", 10*time.Minute); err != nil {
+		return result, err
+	}
+	if result.settleTimeout, err = durationOrDefault("START_SETTLE_TIMEOUT", 15*time.Second); err != nil {
 		return result, err
 	}
 	if result.pollInterval, err = durationOrDefault("ROUTE_POLL_INTERVAL", 2*time.Second); err != nil {

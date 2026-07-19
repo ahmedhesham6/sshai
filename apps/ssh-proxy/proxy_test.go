@@ -41,7 +41,8 @@ func TestProxyBridgesAuthenticatedBinaryWebSocketToOwnedReadyRuntime(t *testing.
 			t.Fatal("ready Runtime invoked starter")
 			return "", errors.New("must not start")
 		}),
-		Dialer: dialer,
+		Intents: allowIntentAuthorizer(),
+		Dialer:  dialer,
 	})
 	if err != nil {
 		t.Fatalf("create SSH proxy: %v", err)
@@ -52,7 +53,7 @@ func TestProxyBridgesAuthenticatedBinaryWebSocketToOwnedReadyRuntime(t *testing.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	connection, response, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid-token"}},
+		HTTPHeader: proxyHeaders("valid-token"),
 	})
 	if err != nil {
 		t.Fatalf("open SSH WebSocket: %v; response: %#v", err, response)
@@ -76,6 +77,45 @@ func TestProxyBridgesAuthenticatedBinaryWebSocketToOwnedReadyRuntime(t *testing.
 	}
 	if dialer.address != "10.0.7.12:22" {
 		t.Fatalf("dialed Runtime = %q", dialer.address)
+	}
+}
+
+func TestProxyRequiresOneUnexpiredConnectionIntentBeforeWebSocketUpgrade(t *testing.T) {
+	echoAddress := startTCPEcho(t)
+	intents := &singleUseIntentAuthorizer{}
+	config := testProxyConfig(&mappingDialer{target: echoAddress})
+	config.Intents = intents
+	handler, err := sshproxy.NewHandler(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	dial := func(intentID string) (*websocket.Conn, *http.Response, error) {
+		header := http.Header{"Authorization": {"Bearer valid"}}
+		if intentID != "" {
+			header.Set("X-Connection-Intent-ID", intentID)
+		}
+		return websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{HTTPHeader: header})
+	}
+
+	if connection, response, err := dial(""); err == nil || response == nil || response.StatusCode != http.StatusBadRequest || connection != nil {
+		t.Fatalf("missing Intent handshake = connection:%v response:%v error:%v", connection, response, err)
+	}
+	first, _, err := dial("intent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectControl(t, ctx, first, connectionprotocol.ControlReady)
+	_ = first.CloseNow()
+	if connection, response, err := dial("intent-1"); err == nil || response == nil || response.StatusCode != http.StatusConflict || connection != nil {
+		t.Fatalf("reused Intent handshake = connection:%v response:%v error:%v", connection, response, err)
+	}
+	intents.expired = true
+	if connection, response, err := dial("intent-expired"); err == nil || response == nil || response.StatusCode != http.StatusGone || connection != nil {
+		t.Fatalf("expired Intent handshake = connection:%v response:%v error:%v", connection, response, err)
 	}
 }
 
@@ -106,7 +146,8 @@ func TestProxyStartsUnreadyRuntimeStreamsProgressThenBridgesBytes(t *testing.T) 
 			}
 			return "operation-1", nil
 		}),
-		Dialer: dialer, PollInterval: 5 * time.Millisecond,
+		Intents: allowIntentAuthorizer(),
+		Dialer:  dialer, PollInterval: 5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +157,7 @@ func TestProxyStartsUnreadyRuntimeStreamsProgressThenBridgesBytes(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + bearer}},
+		HTTPHeader: proxyHeaders(bearer),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -161,6 +202,53 @@ func TestProxyStartsUnreadyRuntimeStreamsProgressThenBridgesBytes(t *testing.T) 
 	}
 }
 
+func TestProxyWaitsForConnectionIntentStartWithoutStartingAgain(t *testing.T) {
+	operationID := "operation-from-intent"
+	echoAddress := startTCPEcho(t)
+	routeCalls, startCalls := 0, 0
+	config := testProxyConfig(&mappingDialer{target: echoAddress})
+	config.Intents = intentAuthorizerFunc(func(context.Context, auth.Subject, string, string) (sshproxy.ConnectionIntentAttempt, error) {
+		return sshproxy.ConnectionIntentAttempt{OperationID: &operationID}, nil
+	})
+	config.Routes = routeFunc(func(context.Context, auth.Subject, string) (sshproxy.EnvironmentSSHRoute, error) {
+		routeCalls++
+		if routeCalls < 2 {
+			return sshproxy.EnvironmentSSHRoute{}, sshproxy.ErrRuntimeNotReady
+		}
+		return sshproxy.EnvironmentSSHRoute{RuntimeID: "runtime-1", BootID: "boot-1", PrivateAddress: "10.0.7.12:22"}, nil
+	})
+	config.Starter = starterFunc(func(context.Context, string, string, string) (string, error) {
+		startCalls++
+		return "", errors.New("Intent-attached start must not be duplicated")
+	})
+	config.PollInterval = time.Millisecond
+	handler, err := sshproxy.NewHandler(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{HTTPHeader: proxyHeaders("valid")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.CloseNow()
+	for {
+		frame := expectControl(t, ctx, socket, "")
+		if frame.Type == connectionprotocol.ControlReady {
+			if frame.OperationID != operationID || startCalls != 0 {
+				t.Fatalf("Intent start wait = frame:%#v starter calls:%d", frame, startCalls)
+			}
+			break
+		}
+		if frame.Step == "starting-runtime" {
+			t.Fatalf("Intent-attached start emitted duplicate start progress: %#v", frame)
+		}
+	}
+}
+
 func TestProxyCreditBlockedSendsFailedStartStepWithoutDial(t *testing.T) {
 	dialed := 0
 	config := testProxyConfig(dialerFunc(func(context.Context, string, string) (net.Conn, error) {
@@ -182,7 +270,7 @@ func TestProxyCreditBlockedSendsFailedStartStepWithoutDial(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +278,7 @@ func TestProxyCreditBlockedSendsFailedStartStepWithoutDial(t *testing.T) {
 	defer socket.CloseNow()
 	expectControl(t, ctx, socket, connectionprotocol.ControlProgress)
 	failed := expectControl(t, ctx, socket, connectionprotocol.ControlFailed)
-	if failed.Step != "starting-runtime" || !strings.Contains(failed.Message, "credit policy") || dialed != 0 {
+	if failed.Step != "credits-blocked" || !strings.Contains(failed.Message, "Credit Balance") || dialed != 0 {
 		t.Fatalf("credit failure = %#v, dials:%d", failed, dialed)
 	}
 }
@@ -228,7 +316,7 @@ func TestProxyTerminalFailedStartReplaySendsFailedControlWithoutPolling(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -241,7 +329,7 @@ func TestProxyTerminalFailedStartReplaySendsFailedControlWithoutPolling(t *testi
 	}
 }
 
-func TestProxyConflictWhileRuntimeStoppedPollsUntilActiveStartIsReady(t *testing.T) {
+func TestProxyFallbackOperationConflictFailsWithoutPolling(t *testing.T) {
 	controlPlaneCalls := 0
 	controlPlane := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		controlPlaneCalls++
@@ -259,16 +347,12 @@ func TestProxyConflictWhileRuntimeStoppedPollsUntilActiveStartIsReady(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	echoAddress := startTCPEcho(t)
-	dialer := &mappingDialer{target: echoAddress}
+	dialer := &mappingDialer{}
 	routeCalls := 0
 	config := testProxyConfig(dialer)
 	config.Routes = routeFunc(func(context.Context, auth.Subject, string) (sshproxy.EnvironmentSSHRoute, error) {
 		routeCalls++
-		if routeCalls == 1 {
-			return sshproxy.EnvironmentSSHRoute{}, sshproxy.ErrRuntimeNotReady
-		}
-		return sshproxy.EnvironmentSSHRoute{RuntimeID: "runtime-1", BootID: "boot-1", PrivateAddress: "10.0.0.4:22"}, nil
+		return sshproxy.EnvironmentSSHRoute{}, sshproxy.ErrRuntimeNotReady
 	})
 	config.Starter = starter
 	handler, err := sshproxy.NewHandler(config)
@@ -280,18 +364,61 @@ func TestProxyConflictWhileRuntimeStoppedPollsUntilActiveStartIsReady(t *testing
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer socket.CloseNow()
-	var ready connectionprotocol.ControlFrame
-	for ready.Type != connectionprotocol.ControlReady {
-		ready = expectControl(t, ctx, socket, "")
+	expectControl(t, ctx, socket, connectionprotocol.ControlProgress)
+	failed := expectControl(t, ctx, socket, connectionprotocol.ControlFailed)
+	if failed.Step != "operation-conflict" || controlPlaneCalls != 1 || routeCalls != 1 || dialer.address != "" {
+		t.Fatalf("active Operation conflict = frame:%#v control-plane-calls:%d route-calls:%d dialed:%q", failed, controlPlaneCalls, routeCalls, dialer.address)
 	}
-	if ready.OperationID != "" || controlPlaneCalls != 1 || routeCalls < 3 || dialer.address != "10.0.0.4:22" {
-		t.Fatalf("active start wait = frame:%#v control-plane-calls:%d route-calls:%d dialed:%q", ready, controlPlaneCalls, routeCalls, dialer.address)
+}
+
+func TestProxyFallbackInvalidRuntimeStateReResolvesAndJoinsSettlingStart(t *testing.T) {
+	echoAddress := startTCPEcho(t)
+	dialer := &mappingDialer{target: echoAddress}
+	routeCalls, startCalls := 0, 0
+	config := testProxyConfig(dialer)
+	config.Routes = routeFunc(func(context.Context, auth.Subject, string) (sshproxy.EnvironmentSSHRoute, error) {
+		routeCalls++
+		if routeCalls < 4 {
+			return sshproxy.EnvironmentSSHRoute{}, sshproxy.ErrRuntimeNotReady
+		}
+		return sshproxy.EnvironmentSSHRoute{RuntimeID: "runtime-1", BootID: "boot-1", PrivateAddress: "10.0.0.4:22"}, nil
+	})
+	config.Starter = starterFunc(func(context.Context, string, string, string) (string, error) {
+		startCalls++
+		return "", sshproxy.ErrRuntimeCommandInvalidState
+	})
+	config.PollInterval = time.Millisecond
+	config.SettleTimeout = 100 * time.Millisecond
+	handler, err := sshproxy.NewHandler(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{HTTPHeader: proxyHeaders("valid")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.CloseNow()
+	for {
+		frame := expectControl(t, ctx, socket, "")
+		if frame.Type == connectionprotocol.ControlReady {
+			if startCalls != 1 || routeCalls < 4 || dialer.address != "10.0.0.4:22" {
+				t.Fatalf("settling start = frame:%#v starts:%d routes:%d dialed:%q", frame, startCalls, routeCalls, dialer.address)
+			}
+			break
+		}
+		if frame.Type == connectionprotocol.ControlFailed {
+			t.Fatalf("settling start failed early: %#v", frame)
+		}
 	}
 }
 
@@ -348,7 +475,7 @@ func TestProxyNewConnectionAfterFailedStartUsesFreshKeyAndConnects(t *testing.T)
 	defer cancel()
 	open := func() *websocket.Conn {
 		socket, _, dialErr := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-			HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+			HTTPHeader: proxyHeaders("valid"),
 		})
 		if dialErr != nil {
 			t.Fatal(dialErr)
@@ -394,7 +521,7 @@ func TestProxyReadinessDeadlineSendsFailedWaitingStep(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -433,7 +560,7 @@ func TestProxyRejectsClientTextFrameWhileWaitingForStart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -476,6 +603,7 @@ func TestProxyRejectsUnauthorizedEnvironmentBeforeUpgradeOrStart(t *testing.T) {
 					started++
 					return "", errors.New("must not start")
 				}),
+				Intents: allowIntentAuthorizer(),
 				Dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
 					dialed++
 					return nil, errors.New("must not dial")
@@ -487,6 +615,7 @@ func TestProxyRejectsUnauthorizedEnvironmentBeforeUpgradeOrStart(t *testing.T) {
 			server := httptest.NewServer(handler)
 			defer server.Close()
 			header := http.Header{}
+			header.Set(connectionprotocol.IntentHeader, "intent-allowed")
 			if test.token != "" {
 				header.Set("Authorization", "Bearer "+test.token)
 			}
@@ -537,7 +666,7 @@ func TestProxyHalfClosesRuntimeWhenWebSocketInputEnds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	connection, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -575,7 +704,7 @@ func TestProxyDisconnectCancelsAndClosesThePrivateRuntimeConnection(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	connection, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -619,7 +748,7 @@ func TestProxyStreamContextCancellationClosesThePrivateRuntimeConnection(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	connection, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -648,6 +777,7 @@ func TestProxyRejectsNonPrivateOrNonSSHRoutesBeforeDial(t *testing.T) {
 				Starter: starterFunc(func(context.Context, string, string, string) (string, error) {
 					return "", errors.New("must not start")
 				}),
+				Intents: allowIntentAuthorizer(),
 				Dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
 					dialed = true
 					return nil, errors.New("must not dial")
@@ -661,7 +791,7 @@ func TestProxyRejectsNonPrivateOrNonSSHRoutesBeforeDial(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			connection, response, dialErr := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-				HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+				HTTPHeader: proxyHeaders("valid"),
 			})
 			if connection != nil {
 				connection.CloseNow()
@@ -701,7 +831,7 @@ func TestProxyReplaceBetweenResolveAndDialRepollsWithoutDialingOldRoute(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	socket, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -747,7 +877,7 @@ func TestProxyStreamsConcurrentSSHConnectionsRaceSafely(t *testing.T) {
 	for index := 0; index < cap(results); index++ {
 		go func() {
 			connection, _, dialErr := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-				HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+				HTTPHeader: proxyHeaders("valid"),
 			})
 			if dialErr != nil {
 				results <- dialErr
@@ -814,7 +944,7 @@ func TestProxyIdleDeadlineStaysOpenDuringOneWaySSHActivity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	connection, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -859,7 +989,7 @@ func TestProxyKeepsWebSocketInputOpenAfterRuntimeHalfClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	connection, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -906,7 +1036,7 @@ func TestProxyRejectsTextFramesWithoutForwardingPayload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	connection, _, err := websocket.Dial(ctx, websocketURL(server.URL)+"/v1/environments/env-1/ssh", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer valid"}},
+		HTTPHeader: proxyHeaders("valid"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -947,8 +1077,51 @@ func testProxyConfig(dialer sshproxy.ContextDialer) sshproxy.Config {
 		Starter: starterFunc(func(context.Context, string, string, string) (string, error) {
 			return "", errors.New("ready Runtime must not start")
 		}),
-		Dialer: dialer,
+		Intents: allowIntentAuthorizer(),
+		Dialer:  dialer,
 	}
+}
+
+type intentAuthorizerFunc func(context.Context, auth.Subject, string, string) (sshproxy.ConnectionIntentAttempt, error)
+
+func (authorize intentAuthorizerFunc) Consume(ctx context.Context, subject auth.Subject, intentID, environmentID string) (sshproxy.ConnectionIntentAttempt, error) {
+	return authorize(ctx, subject, intentID, environmentID)
+}
+
+func allowIntentAuthorizer() sshproxy.ConnectionIntentAuthorizer {
+	return intentAuthorizerFunc(func(context.Context, auth.Subject, string, string) (sshproxy.ConnectionIntentAttempt, error) {
+		return sshproxy.ConnectionIntentAttempt{}, nil
+	})
+}
+
+func proxyHeaders(bearer string) http.Header {
+	return http.Header{
+		"Authorization":                 {"Bearer " + bearer},
+		connectionprotocol.IntentHeader: {"intent-allowed"},
+	}
+}
+
+type singleUseIntentAuthorizer struct {
+	mu      sync.Mutex
+	used    bool
+	expired bool
+	result  sshproxy.ConnectionIntentAttempt
+}
+
+func (authorizer *singleUseIntentAuthorizer) Consume(_ context.Context, subject auth.Subject, intentID, environmentID string) (sshproxy.ConnectionIntentAttempt, error) {
+	authorizer.mu.Lock()
+	defer authorizer.mu.Unlock()
+	if subject.WorkOSUserID != "user-1" || intentID == "" || environmentID != "env-1" {
+		return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentNotFound
+	}
+	if authorizer.expired {
+		return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentExpired
+	}
+	if authorizer.used {
+		return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentUsed
+	}
+	authorizer.used = true
+	return authorizer.result, nil
 }
 
 type verifierFunc func(context.Context, string) (auth.Subject, error)
