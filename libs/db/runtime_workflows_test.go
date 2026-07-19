@@ -91,3 +91,27 @@ func TestStoreRunsRuntimeWorkflowPersistenceLifecycle(t *testing.T) {
 		t.Fatalf("persisted statuses = %q/%q", operationStatus, runtimeStatus)
 	}
 }
+
+func TestStoreRecordsRuntimeWorkflowFailureCodeAndMessage(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	insertRuntimeOperationState(t, ctx, pool, createdAt)
+	operation := runtimeOperationCandidate(t, "operation-stop", "environment-1", domain.OperationRuntimeStop, "request-stop", []byte(`{"reason":"manual"}`), createdAt.Add(time.Minute))
+	if _, err := store.ReserveRuntimeOperation(ctx, operation); err != nil {
+		t.Fatalf("reserve Runtime stop: %v", err)
+	}
+
+	const code = "RUNTIME_STOP_FAILED"
+	const message = "provider observation did not converge before the durable deadline"
+	if err := store.RecordRuntimeWorkflowFailure(ctx, "operation-stop", code, message, createdAt.Add(2*time.Minute)); err != nil {
+		t.Fatalf("RecordRuntimeWorkflowFailure(): %v", err)
+	}
+	var status, storedCode, storedMessage string
+	if err := pool.QueryRow(ctx, `SELECT status, error_code, error_message FROM operations WHERE id = 'operation-stop'`).Scan(&status, &storedCode, &storedMessage); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(domain.OperationFailed) || storedCode != code || storedMessage != message {
+		t.Fatalf("failure row = status:%q code:%q message:%q", status, storedCode, storedMessage)
+	}
+}

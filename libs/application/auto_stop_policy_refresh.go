@@ -14,6 +14,7 @@ type AutoStopPolicyRefreshOutbox interface {
 	PendingAutoStopPolicyRefresh(context.Context, string) (domain.AutoStopPolicyRefresh, bool, error)
 	PendingAutoStopPolicyRefreshes(context.Context, int) ([]domain.AutoStopPolicyRefresh, error)
 	AcknowledgeAutoStopPolicyRefresh(context.Context, string, uint64) error
+	DeferAutoStopPolicyRefresh(context.Context, string, uint64, time.Time) error
 }
 
 type AutoStopPolicyRefreshSender interface {
@@ -23,10 +24,11 @@ type AutoStopPolicyRefreshSender interface {
 type AutoStopPolicyRefreshDispatcher struct {
 	outbox AutoStopPolicyRefreshOutbox
 	sender AutoStopPolicyRefreshSender
+	now    func() time.Time
 }
 
 func NewAutoStopPolicyRefreshDispatcher(outbox AutoStopPolicyRefreshOutbox, sender AutoStopPolicyRefreshSender) *AutoStopPolicyRefreshDispatcher {
-	return &AutoStopPolicyRefreshDispatcher{outbox: outbox, sender: sender}
+	return &AutoStopPolicyRefreshDispatcher{outbox: outbox, sender: sender, now: time.Now}
 }
 
 func NewAutoStopPolicyRefreshRecovery(dispatcher *AutoStopPolicyRefreshDispatcher, interval time.Duration, batchSize int, report func(error)) *WorkflowRecovery {
@@ -55,12 +57,13 @@ func (dispatcher *AutoStopPolicyRefreshDispatcher) DispatchPendingAutoStopPolicy
 	if err != nil {
 		return fmt.Errorf("dispatch pending Auto-stop Policy refreshes: read outbox: %w", err)
 	}
+	var failures []error
 	for _, refresh := range refreshes {
 		if err := dispatcher.dispatch(ctx, refresh); err != nil {
-			return err
+			failures = append(failures, err)
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func (dispatcher *AutoStopPolicyRefreshDispatcher) dispatch(ctx context.Context, refresh domain.AutoStopPolicyRefresh) error {
@@ -69,10 +72,19 @@ func (dispatcher *AutoStopPolicyRefreshDispatcher) dispatch(ctx context.Context,
 	}
 	key := "auto-stop-policy-refresh:" + refresh.EnvironmentID + ":" + strconv.FormatUint(refresh.Generation, 10)
 	if err := dispatcher.sender.SendAutoStopPolicyRefresh(ctx, refresh.EnvironmentID, key); err != nil {
-		return fmt.Errorf("dispatch Auto-stop Policy refresh %q generation %d: %w", refresh.EnvironmentID, refresh.Generation, err)
+		failure := fmt.Errorf("dispatch Auto-stop Policy refresh %q generation %d: %w", refresh.EnvironmentID, refresh.Generation, err)
+		return dispatcher.deferRefresh(ctx, refresh, failure)
 	}
 	if err := dispatcher.outbox.AcknowledgeAutoStopPolicyRefresh(ctx, refresh.EnvironmentID, refresh.Generation); err != nil {
-		return fmt.Errorf("acknowledge Auto-stop Policy refresh %q generation %d: %w", refresh.EnvironmentID, refresh.Generation, err)
+		failure := fmt.Errorf("acknowledge Auto-stop Policy refresh %q generation %d: %w", refresh.EnvironmentID, refresh.Generation, err)
+		return dispatcher.deferRefresh(ctx, refresh, failure)
 	}
 	return nil
+}
+
+func (dispatcher *AutoStopPolicyRefreshDispatcher) deferRefresh(ctx context.Context, refresh domain.AutoStopPolicyRefresh, failure error) error {
+	if err := dispatcher.outbox.DeferAutoStopPolicyRefresh(ctx, refresh.EnvironmentID, refresh.Generation, dispatcher.now().Round(0).UTC()); err != nil {
+		return errors.Join(failure, fmt.Errorf("defer Auto-stop Policy refresh %q generation %d: %w", refresh.EnvironmentID, refresh.Generation, err))
+	}
+	return failure
 }

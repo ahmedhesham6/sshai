@@ -79,6 +79,56 @@ func TestStoreUpdatesAutoStopPolicyWithHonestSynchronousOperation(t *testing.T) 
 	assertPostgreSQLCode(t, err, "23514", "workflow success without Restate invocation")
 }
 
+func TestStoreBacksOffAutoStopRefreshAndResetsForNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Date(2026, time.July, 19, 13, 0, 0, 0, time.UTC)
+	insertRuntimeOperationState(t, ctx, pool, createdAt.Add(-time.Hour))
+	policy := autoStopPolicy(t, domain.AutoStopWhenFullyIdle, 300)
+	if _, applied, err := store.UpdateAutoStopPolicy(ctx, "user-1", policy, synchronousPolicyOperation(t, "operation-policy-backoff-1", "request-policy-backoff-1", createdAt)); err != nil || !applied {
+		t.Fatalf("initial Policy update applied:%t error:%v", applied, err)
+	}
+	refresh, pending, err := store.PendingAutoStopPolicyRefresh(ctx, "environment-1")
+	if err != nil || !pending {
+		t.Fatalf("pending refresh = %#v pending:%t error:%v", refresh, pending, err)
+	}
+	attemptedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if err := store.DeferAutoStopPolicyRefresh(ctx, refresh.EnvironmentID, refresh.Generation, attemptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if eligible, err := store.PendingAutoStopPolicyRefreshes(ctx, 10); err != nil || len(eligible) != 0 {
+		t.Fatalf("eligible backed-off refreshes = %#v error:%v", eligible, err)
+	}
+	var attempts int
+	var nextAttemptAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT refresh_attempts, refresh_next_attempt_at FROM auto_stop_policies WHERE environment_id = 'environment-1'`).Scan(&attempts, &nextAttemptAt); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || !nextAttemptAt.Equal(attemptedAt.Add(5*time.Second)) {
+		t.Fatalf("refresh backoff = attempts:%d next:%s", attempts, nextAttemptAt)
+	}
+	if _, applied, err := store.UpdateAutoStopPolicy(ctx, "user-1", policy, synchronousPolicyOperation(t, "operation-policy-backoff-2", "request-policy-backoff-2", createdAt.Add(time.Minute))); err != nil || !applied {
+		t.Fatalf("next Policy update applied:%t error:%v", applied, err)
+	}
+	if eligible, err := store.PendingAutoStopPolicyRefreshes(ctx, 10); err != nil || len(eligible) != 1 || eligible[0].Generation != refresh.Generation+1 {
+		t.Fatalf("new generation refreshes = %#v error:%v", eligible, err)
+	}
+	newGeneration := refresh.Generation + 1
+	newAttemptedAt := attemptedAt.Add(time.Minute)
+	if err := store.DeferAutoStopPolicyRefresh(ctx, refresh.EnvironmentID, newGeneration, newAttemptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AcknowledgeAutoStopPolicyRefresh(ctx, refresh.EnvironmentID, refresh.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT refresh_attempts, refresh_next_attempt_at FROM auto_stop_policies WHERE environment_id = 'environment-1'`).Scan(&attempts, &nextAttemptAt); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || !nextAttemptAt.Equal(newAttemptedAt.Add(5*time.Second)) {
+		t.Fatalf("new generation backoff after stale acknowledgement = attempts:%d next:%s", attempts, nextAttemptAt)
+	}
+}
+
 func TestStoreSerializesRuntimeAndPolicyCommandsBySharedIdempotencyKey(t *testing.T) {
 	tests := []struct {
 		name          string

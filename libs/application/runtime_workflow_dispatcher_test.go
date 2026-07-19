@@ -3,6 +3,7 @@ package application_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +29,12 @@ func TestRuntimeOperationDispatcherRecoversPersistedTarget(t *testing.T) {
 	sender.err = nil
 	sender.onSend = func(domain.RuntimeOperationDispatch) { outbox.pending = nil }
 	if err := dispatcher.DispatchPendingRuntimeOperations(t.Context(), 10); err != nil {
+		t.Fatalf("DispatchPendingRuntimeOperations() during backoff: %v", err)
+	}
+	if len(sender.inputs) != 1 || len(outbox.pending) != 1 {
+		t.Fatalf("backed-off Runtime dispatches = %#v pending = %#v", sender.inputs, outbox.pending)
+	}
+	if err := dispatcher.DispatchPendingRuntimeOperations(t.Context(), 10); err != nil {
 		t.Fatalf("DispatchPendingRuntimeOperations(): %v", err)
 	}
 	if len(sender.inputs) != 2 || sender.inputs[1] != input || len(outbox.pending) != 0 {
@@ -45,6 +52,50 @@ func TestRuntimeOperationDispatcherIgnoresStartedOrMissingOperation(t *testing.T
 	}
 	if len(sender.inputs) != 0 || len(outbox.requested) != 1 || outbox.requested[0] != "operation-started" {
 		t.Fatalf("started Runtime dispatch = requested:%#v sent:%#v", outbox.requested, sender.inputs)
+	}
+}
+
+func TestRuntimeOperationDispatcherContinuesAfterPerItemFailure(t *testing.T) {
+	inputs := []domain.RuntimeOperationDispatch{
+		{OperationID: "operation-1", OperationType: domain.OperationRuntimeStart},
+		{OperationID: "operation-2", OperationType: domain.OperationRuntimeStop},
+		{OperationID: "operation-3", OperationType: domain.OperationRuntimeReplace},
+	}
+	outbox := &runtimeOperationOutboxFake{pending: inputs}
+	sender := &runtimeOperationSenderFake{errorsByOperation: map[string]error{
+		"operation-1": errors.New("first unavailable"),
+		"operation-3": errors.New("third unavailable"),
+	}}
+	dispatcher := application.NewRuntimeOperationDispatcher(outbox, sender)
+
+	err := dispatcher.DispatchPendingRuntimeOperations(t.Context(), len(inputs))
+	if err == nil || !strings.Contains(err.Error(), "operation-1") || !strings.Contains(err.Error(), "operation-3") {
+		t.Fatalf("DispatchPendingRuntimeOperations() error = %v, want both item failures", err)
+	}
+	if len(sender.inputs) != len(inputs) || sender.inputs[1].OperationID != "operation-2" {
+		t.Fatalf("dispatch attempts = %#v, want all inputs in order", sender.inputs)
+	}
+}
+
+func TestRuntimeOperationDispatcherBacksOffPoisonedRowSoNewerWorkRuns(t *testing.T) {
+	inputs := []domain.RuntimeOperationDispatch{
+		{OperationID: "operation-poison", OperationType: domain.OperationRuntimeStart},
+		{OperationID: "operation-new", OperationType: domain.OperationRuntimeStop},
+	}
+	outbox := &runtimeOperationOutboxFake{pending: inputs, deferred: map[string]int{}}
+	sender := &runtimeOperationSenderFake{errorsByOperation: map[string]error{
+		"operation-poison": errors.New("permanent dispatch rejection"),
+	}}
+	dispatcher := application.NewRuntimeOperationDispatcher(outbox, sender)
+
+	if err := dispatcher.DispatchPendingRuntimeOperations(t.Context(), 1); err == nil {
+		t.Fatal("first poisoned dispatch error = nil")
+	}
+	if err := dispatcher.DispatchPendingRuntimeOperations(t.Context(), 1); err != nil {
+		t.Fatalf("newer dispatch: %v", err)
+	}
+	if len(sender.inputs) != 2 || sender.inputs[1].OperationID != "operation-new" {
+		t.Fatalf("dispatch attempts = %#v, want poisoned row then newer row", sender.inputs)
 	}
 }
 
@@ -77,6 +128,7 @@ func TestRuntimeWorkflowRecoveryRetriesPendingOperationsUntilCancellation(t *tes
 type runtimeOperationOutboxFake struct {
 	pending   []domain.RuntimeOperationDispatch
 	requested []string
+	deferred  map[string]int
 }
 
 func (outbox *runtimeOperationOutboxFake) PendingRuntimeOperation(_ context.Context, operationID string) (domain.RuntimeOperationDispatch, bool, error) {
@@ -90,20 +142,40 @@ func (outbox *runtimeOperationOutboxFake) PendingRuntimeOperation(_ context.Cont
 }
 
 func (outbox *runtimeOperationOutboxFake) PendingRuntimeOperations(_ context.Context, limit int) ([]domain.RuntimeOperationDispatch, error) {
-	if limit < len(outbox.pending) {
-		return append([]domain.RuntimeOperationDispatch(nil), outbox.pending[:limit]...), nil
+	var eligible []domain.RuntimeOperationDispatch
+	for _, input := range outbox.pending {
+		if outbox.deferred[input.OperationID] > 0 {
+			outbox.deferred[input.OperationID]--
+			continue
+		}
+		eligible = append(eligible, input)
 	}
-	return append([]domain.RuntimeOperationDispatch(nil), outbox.pending...), nil
+	if limit < len(eligible) {
+		return append([]domain.RuntimeOperationDispatch(nil), eligible[:limit]...), nil
+	}
+	return append([]domain.RuntimeOperationDispatch(nil), eligible...), nil
+}
+
+func (outbox *runtimeOperationOutboxFake) DeferRuntimeOperationDispatch(_ context.Context, operationID string, _ time.Time) error {
+	if outbox.deferred == nil {
+		outbox.deferred = make(map[string]int)
+	}
+	outbox.deferred[operationID] = 1
+	return nil
 }
 
 type runtimeOperationSenderFake struct {
-	inputs []domain.RuntimeOperationDispatch
-	err    error
-	onSend func(domain.RuntimeOperationDispatch)
+	inputs            []domain.RuntimeOperationDispatch
+	err               error
+	errorsByOperation map[string]error
+	onSend            func(domain.RuntimeOperationDispatch)
 }
 
 func (sender *runtimeOperationSenderFake) SendRuntimeOperation(_ context.Context, input domain.RuntimeOperationDispatch) error {
 	sender.inputs = append(sender.inputs, input)
+	if err := sender.errorsByOperation[input.OperationID]; err != nil {
+		return err
+	}
 	if sender.err == nil && sender.onSend != nil {
 		sender.onSend(input)
 	}

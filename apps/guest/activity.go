@@ -171,8 +171,8 @@ func (observer *Observer) Observe(ctx context.Context) (ActivitySnapshot, error)
 		observedAt:         sample.ObservedAt.Round(0).UTC(),
 		guestSequence:      sample.GuestSequence,
 		sshConnections:     len(connections),
-		codexProcesses:     countAgentRoots(processes, sample.UserUID, observer.codex),
-		claudeProcesses:    countAgentRoots(processes, sample.UserUID, observer.claude),
+		codexProcesses:     countAgentRoots(processes, sample.UserUID, observer.codex, selectedContainerIDs),
+		claudeProcesses:    countAgentRoots(processes, sample.UserUID, observer.claude, selectedContainerIDs),
 		protectedProcesses: countProtectedProcesses(processes, sample.UserUID, observer.protected),
 		selectedContainers: countContainers(containers, observer.selected),
 		unknownUserProcesses: countUnknownUserProcesses(
@@ -264,10 +264,10 @@ func uniqueContainers(samples []ContainerSample) (map[string]ContainerSample, er
 	return containers, nil
 }
 
-func countAgentRoots(processes map[int]ProcessSample, userUID int, allowlist map[string]struct{}) int {
+func countAgentRoots(processes map[int]ProcessSample, userUID int, allowlist, selectedContainerIDs map[string]struct{}) int {
 	count := 0
 	for _, process := range processes {
-		if !liveTrackedAllowedProcess(process, userUID, allowlist) || hasTrackedAllowedAncestor(process, processes, userUID, allowlist) {
+		if !liveTrackedAllowedProcess(process, userUID, allowlist, selectedContainerIDs) || hasTrackedAllowedAncestor(process, processes, userUID, allowlist, selectedContainerIDs) {
 			continue
 		}
 		count++
@@ -275,9 +275,9 @@ func countAgentRoots(processes map[int]ProcessSample, userUID int, allowlist map
 	return count
 }
 
-func hasTrackedAllowedAncestor(process ProcessSample, processes map[int]ProcessSample, userUID int, allowlist map[string]struct{}) bool {
+func hasTrackedAllowedAncestor(process ProcessSample, processes map[int]ProcessSample, userUID int, allowlist, selectedContainerIDs map[string]struct{}) bool {
 	for parent, ok := processes[process.ParentPID]; ok; parent, ok = processes[parent.ParentPID] {
-		if liveTrackedAllowedProcess(parent, userUID, allowlist) {
+		if liveTrackedAllowedProcess(parent, userUID, allowlist, selectedContainerIDs) {
 			return true
 		}
 	}
@@ -299,8 +299,9 @@ func liveAllowedProcess(process ProcessSample, allowlist map[string]struct{}) bo
 	return allowed && (process.State == ProcessRunning || process.State == ProcessWaiting)
 }
 
-func liveTrackedAllowedProcess(process ProcessSample, userUID int, allowlist map[string]struct{}) bool {
-	return inUserSessionCgroup(process, userUID) && liveAllowedProcess(process, allowlist)
+func liveTrackedAllowedProcess(process ProcessSample, userUID int, allowlist, selectedContainerIDs map[string]struct{}) bool {
+	_, inSelectedContainer := selectedContainerIDs[process.ContainerID]
+	return (inUserSessionCgroup(process, userUID) || process.ContainerID != "" && inSelectedContainer) && liveAllowedProcess(process, allowlist)
 }
 
 func countUnknownUserProcesses(
@@ -316,14 +317,14 @@ func countUnknownUserProcesses(
 		if isBaselineProcess(process, userUID) {
 			continue
 		}
+		if _, selected := selectedContainerIDs[process.ContainerID]; process.ContainerID != "" && selected {
+			continue
+		}
 		if !inUserSessionCgroup(process, userUID) {
 			count++
 			continue
 		}
-		if _, selected := selectedContainerIDs[process.ContainerID]; process.ContainerID != "" && selected {
-			continue
-		}
-		if belongsToAgentTree(process, processes, userUID, codex) || belongsToAgentTree(process, processes, userUID, claude) {
+		if belongsToAgentTree(process, processes, userUID, codex, selectedContainerIDs) || belongsToAgentTree(process, processes, userUID, claude, selectedContainerIDs) {
 			continue
 		}
 		if liveAllowedProcess(process, protected) {
@@ -352,9 +353,9 @@ func isBaselineProcess(process ProcessSample, userUID int) bool {
 	return process.Executable == "/usr/lib/systemd/systemd" || process.Executable == "/lib/systemd/systemd"
 }
 
-func belongsToAgentTree(process ProcessSample, processes map[int]ProcessSample, userUID int, allowlist map[string]struct{}) bool {
+func belongsToAgentTree(process ProcessSample, processes map[int]ProcessSample, userUID int, allowlist, selectedContainerIDs map[string]struct{}) bool {
 	for current, ok := process, true; ok; current, ok = processes[current.ParentPID] {
-		if liveTrackedAllowedProcess(current, userUID, allowlist) {
+		if liveTrackedAllowedProcess(current, userUID, allowlist, selectedContainerIDs) {
 			return inCgroupSubtree(process.CgroupPath, current.CgroupPath)
 		}
 	}

@@ -63,64 +63,51 @@ func TestCapsuleResolverAdapterRejectsUnconfiguredAdapter(t *testing.T) {
 	}
 }
 
-func TestAutoStopSnapshotSourceWaitsForRequestedFreshness(t *testing.T) {
+func TestAutoStopSnapshotSourceExposesSingleNonBlockingReads(t *testing.T) {
 	now := time.Date(2026, time.July, 19, 15, 0, 0, 0, time.UTC)
 	policy := domain.AutoStopPolicySnapshot{
 		ID: "policy-1", EnvironmentID: "environment-1", Mode: domain.AutoStopWhenFullyIdle, GracePeriodSeconds: 60,
 	}
-	stale := dbstore.AutoStopSnapshotState{
+	state := dbstore.AutoStopSnapshotState{
 		RuntimeID: "runtime-1", Policy: policy, PolicyGeneration: 1,
-		Snapshot: &domain.AutoStopActivitySnapshot{RuntimeID: "runtime-1", Sequence: 7, ObservedAt: now.Add(-time.Minute)},
 	}
-	fresh := dbstore.AutoStopSnapshotState{
-		RuntimeID: "runtime-1", Policy: policy, PolicyGeneration: 1,
-		Snapshot: &domain.AutoStopActivitySnapshot{RuntimeID: "runtime-1", Sequence: 8, ObservedAt: now.Add(time.Second)},
+	snapshot := &domain.AutoStopActivitySnapshot{RuntimeID: "runtime-1", Sequence: 7, ObservedAt: now.Add(-time.Minute)}
+	store := &autoStopSnapshotStoreFake{state: state, snapshot: snapshot}
+	source := newAutoStopSnapshotSource(store)
+	request := workflows.AutoStopRefreshRequest{
+		EnvironmentID: "environment-1", RuntimeID: "runtime-1", AfterSnapshotSequence: 7, FreshAfter: now,
 	}
-	tests := []struct {
-		name         string
-		states       []dbstore.AutoStopSnapshotState
-		pollTimeout  time.Duration
-		wantSequence uint64
-		wantCalls    int
-	}{
-		{name: "slow arriving fresh Snapshot", states: []dbstore.AutoStopSnapshotState{stale, stale, fresh}, pollTimeout: 100 * time.Millisecond, wantSequence: 8, wantCalls: 3},
-		{name: "bounded wait returns stale Snapshot", states: []dbstore.AutoStopSnapshotState{stale}, pollTimeout: 5 * time.Millisecond, wantSequence: 7, wantCalls: 2},
+	observation, err := source.ReadAutoStopState(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			store := &autoStopSnapshotStoreFake{states: test.states}
-			source := newAutoStopSnapshotSource(store)
-			source.pollTimeout = test.pollTimeout
-			source.pollInitialBackoff = time.Millisecond
-			source.pollMaxBackoff = 2 * time.Millisecond
-			observation, err := source.RefreshAutoStop(t.Context(), workflows.AutoStopRefreshRequest{
-				EnvironmentID: "environment-1", RuntimeID: "runtime-1", AfterSnapshotSequence: 7, FreshAfter: now,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if observation.Snapshot == nil || observation.Snapshot.Sequence != test.wantSequence {
-				t.Fatalf("RefreshAutoStop() Snapshot = %#v", observation.Snapshot)
-			}
-			if store.calls < test.wantCalls {
-				t.Fatalf("LatestAutoStopSnapshot() calls = %d, want at least %d", store.calls, test.wantCalls)
-			}
-		})
+	latest, err := source.ReadLatestSnapshot(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Policy != policy || observation.Snapshot != nil || latest != snapshot {
+		t.Fatalf("state/Snapshot = %#v/%#v", observation, latest)
+	}
+	if store.stateCalls != 1 || store.snapshotCalls != 1 {
+		t.Fatalf("store calls = state:%d Snapshot:%d, want one each", store.stateCalls, store.snapshotCalls)
 	}
 }
 
 type autoStopSnapshotStoreFake struct {
-	states []dbstore.AutoStopSnapshotState
-	calls  int
+	state         dbstore.AutoStopSnapshotState
+	snapshot      *domain.AutoStopActivitySnapshot
+	stateCalls    int
+	snapshotCalls int
 }
 
-func (fake *autoStopSnapshotStoreFake) LatestAutoStopSnapshot(context.Context, string, string) (dbstore.AutoStopSnapshotState, error) {
-	index := fake.calls
-	fake.calls++
-	if index >= len(fake.states) {
-		index = len(fake.states) - 1
-	}
-	return fake.states[index], nil
+func (fake *autoStopSnapshotStoreFake) LoadAutoStopSnapshotState(context.Context, string, string) (dbstore.AutoStopSnapshotState, error) {
+	fake.stateCalls++
+	return fake.state, nil
+}
+
+func (fake *autoStopSnapshotStoreFake) LatestActivitySnapshot(context.Context, string, string) (*domain.AutoStopActivitySnapshot, error) {
+	fake.snapshotCalls++
+	return fake.snapshot, nil
 }
 
 // TestPinnedProfileVersionResolverResolvesPinnedVersionIntoALock exercises the

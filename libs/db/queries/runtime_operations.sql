@@ -1,8 +1,3 @@
--- name: LockRuntimeOperationIdempotency :one
-SELECT pg_advisory_xact_lock(
-    hashtextextended('runtime-operation' || chr(31) || sqlc.arg(owner_user_id)::text || chr(31) || sqlc.arg(idempotency_key)::text, 0)
-);
-
 -- name: GetOperationByIdempotencyKey :one
 SELECT id, environment_id, type, status, requested_by_user_id, idempotency_key,
        restate_invocation_id, input, created_at, completed_at
@@ -89,6 +84,7 @@ JOIN runtime_operation_targets target
 JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.operation_id = sqlc.arg(operation_id)
   AND outbox.started_at IS NULL
+  AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at <= statement_timestamp())
   AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace');
 
 -- name: ListPendingRuntimeOperations :many
@@ -103,5 +99,16 @@ JOIN runtime_operation_targets target
 JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.started_at IS NULL
   AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace')
-ORDER BY outbox.created_at, outbox.operation_id
+  AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at <= statement_timestamp())
+ORDER BY outbox.dispatch_attempts, outbox.next_attempt_at NULLS FIRST, outbox.created_at, outbox.operation_id
 LIMIT sqlc.arg(limit_count);
+
+-- name: DeferRuntimeOperationDispatch :execrows
+UPDATE workflow_outbox
+SET dispatch_attempts = dispatch_attempts + 1,
+    next_attempt_at = sqlc.arg(attempted_at)::timestamptz + LEAST(
+        INTERVAL '1 hour',
+        INTERVAL '5 seconds' * power(2::numeric, LEAST(dispatch_attempts, 10))::double precision
+    )
+WHERE operation_id = sqlc.arg(operation_id)
+  AND started_at IS NULL;

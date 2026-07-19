@@ -62,6 +62,11 @@ func (service *RuntimeCommandService) StartRuntime(ctx context.Context, input Ru
 	if present {
 		return service.dispatchRuntimeOperation(ctx, replayed)
 	}
+	// Credit Balance is shared across a User's Environments, while Runtime
+	// reservation locks only one Environment. Concurrent starts may therefore
+	// both observe a positive balance. The private-alpha policy in spec 10
+	// explicitly accepts slight negative balances, so this admission race is
+	// intentional until paid-launch enforcement introduces User-wide admission.
 	balance, err := service.credits.CreditBalance(ctx, input.OwnerUserID)
 	if err != nil {
 		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("start Runtime: load Credit Balance: %w", err)

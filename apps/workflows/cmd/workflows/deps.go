@@ -235,8 +235,8 @@ func (actions *runtimeWorkflowActions) CompleteRuntimeOperation(ctx context.Cont
 	return actions.store.CompleteRuntimeWorkflowOperation(ctx, operationID, at)
 }
 
-func (actions *runtimeWorkflowActions) RecordRuntimeFailure(ctx context.Context, operationID, code string, at time.Time) error {
-	return actions.store.RecordRuntimeWorkflowFailure(ctx, operationID, code, at)
+func (actions *runtimeWorkflowActions) RecordRuntimeFailure(ctx context.Context, operationID, code, message string, at time.Time) error {
+	return actions.store.RecordRuntimeWorkflowFailure(ctx, operationID, code, message, at)
 }
 
 func (actions *runtimeWorkflowActions) RecordRuntimeStartDecision(ctx context.Context, operationID, decision, image string) error {
@@ -255,72 +255,36 @@ func (actions *runtimeWorkflowActions) RecordRuntimeStopAudit(ctx context.Contex
 	return actions.store.RecordRuntimeStopAuditEvidence(ctx, operationID, evidence, actions.now())
 }
 
-const (
-	autoStopSnapshotPollTimeout        = 90 * time.Second
-	autoStopSnapshotPollInitialBackoff = 250 * time.Millisecond
-	autoStopSnapshotPollMaxBackoff     = 5 * time.Second
-)
-
 type autoStopSnapshotStore interface {
-	LatestAutoStopSnapshot(context.Context, string, string) (db.AutoStopSnapshotState, error)
+	LoadAutoStopSnapshotState(context.Context, string, string) (db.AutoStopSnapshotState, error)
+	LatestActivitySnapshot(context.Context, string, string) (*domain.AutoStopActivitySnapshot, error)
 }
 
-type autoStopSnapshotSource struct {
-	store              autoStopSnapshotStore
-	pollTimeout        time.Duration
-	pollInitialBackoff time.Duration
-	pollMaxBackoff     time.Duration
-}
+type autoStopSnapshotSource struct{ store autoStopSnapshotStore }
 
 func newAutoStopSnapshotSource(store autoStopSnapshotStore) autoStopSnapshotSource {
-	return autoStopSnapshotSource{
-		store: store, pollTimeout: autoStopSnapshotPollTimeout,
-		pollInitialBackoff: autoStopSnapshotPollInitialBackoff, pollMaxBackoff: autoStopSnapshotPollMaxBackoff,
-	}
+	return autoStopSnapshotSource{store: store}
 }
 
-func (source autoStopSnapshotSource) RefreshAutoStop(ctx context.Context, request workflows.AutoStopRefreshRequest) (workflows.AutoStopObservation, error) {
-	if source.store == nil || source.pollTimeout <= 0 || source.pollInitialBackoff <= 0 || source.pollMaxBackoff <= 0 {
-		return workflows.AutoStopObservation{}, errors.New("refresh Auto-stop Snapshot: source is not configured")
+func (source autoStopSnapshotSource) ReadAutoStopState(ctx context.Context, request workflows.AutoStopRefreshRequest) (workflows.AutoStopObservation, error) {
+	if source.store == nil {
+		return workflows.AutoStopObservation{}, errors.New("read Auto-stop Snapshot state: source is not configured")
 	}
-	deadline := time.NewTimer(source.pollTimeout)
-	defer deadline.Stop()
-	backoff := source.pollInitialBackoff
-	var latest workflows.AutoStopObservation
-	for {
-		state, err := source.store.LatestAutoStopSnapshot(ctx, request.EnvironmentID, request.RuntimeID)
-		if err != nil {
-			return workflows.AutoStopObservation{}, err
-		}
-		latest = workflows.AutoStopObservation{
-			RuntimeID: state.RuntimeID, Policy: state.Policy, PolicyGeneration: state.PolicyGeneration,
-			FreshAfter: request.FreshAfter, Snapshot: state.Snapshot, Conflicts: state.Conflicts,
-		}
-		if autoStopSnapshotSatisfies(latest.Snapshot, request) {
-			return latest, nil
-		}
-		wait := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			if !wait.Stop() {
-				<-wait.C
-			}
-			return workflows.AutoStopObservation{}, ctx.Err()
-		case <-deadline.C:
-			if !wait.Stop() {
-				<-wait.C
-			}
-			return latest, nil
-		case <-wait.C:
-		}
-		backoff = min(backoff*2, source.pollMaxBackoff)
+	state, err := source.store.LoadAutoStopSnapshotState(ctx, request.EnvironmentID, request.RuntimeID)
+	if err != nil {
+		return workflows.AutoStopObservation{}, err
 	}
+	return workflows.AutoStopObservation{
+		RuntimeID: state.RuntimeID, Policy: state.Policy, PolicyGeneration: state.PolicyGeneration,
+		FreshAfter: request.FreshAfter, Conflicts: state.Conflicts,
+	}, nil
 }
 
-func autoStopSnapshotSatisfies(snapshot *domain.AutoStopActivitySnapshot, request workflows.AutoStopRefreshRequest) bool {
-	return snapshot != nil &&
-		(request.AfterSnapshotSequence == 0 || snapshot.Sequence > request.AfterSnapshotSequence) &&
-		(request.FreshAfter.IsZero() || !snapshot.ObservedAt.Before(request.FreshAfter))
+func (source autoStopSnapshotSource) ReadLatestSnapshot(ctx context.Context, request workflows.AutoStopRefreshRequest) (*domain.AutoStopActivitySnapshot, error) {
+	if source.store == nil {
+		return nil, errors.New("read latest Activity Snapshot: source is not configured")
+	}
+	return source.store.LatestActivitySnapshot(ctx, request.EnvironmentID, request.RuntimeID)
 }
 
 type runtimeDataVolumeVerifier struct{ store *db.Store }

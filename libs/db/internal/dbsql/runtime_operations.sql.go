@@ -11,6 +11,30 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deferRuntimeOperationDispatch = `-- name: DeferRuntimeOperationDispatch :execrows
+UPDATE workflow_outbox
+SET dispatch_attempts = dispatch_attempts + 1,
+    next_attempt_at = $1::timestamptz + LEAST(
+        INTERVAL '1 hour',
+        INTERVAL '5 seconds' * power(2::numeric, LEAST(dispatch_attempts, 10))::double precision
+    )
+WHERE operation_id = $2
+  AND started_at IS NULL
+`
+
+type DeferRuntimeOperationDispatchParams struct {
+	AttemptedAt pgtype.Timestamptz
+	OperationID string
+}
+
+func (q *Queries) DeferRuntimeOperationDispatch(ctx context.Context, arg DeferRuntimeOperationDispatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferRuntimeOperationDispatch, arg.AttemptedAt, arg.OperationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getOperationByIdempotencyKey = `-- name: GetOperationByIdempotencyKey :one
 SELECT id, environment_id, type, status, requested_by_user_id, idempotency_key,
        restate_invocation_id, input, created_at, completed_at
@@ -201,6 +225,7 @@ JOIN runtime_operation_targets target
 JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.operation_id = $1
   AND outbox.started_at IS NULL
+  AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at <= statement_timestamp())
   AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace')
 `
 
@@ -326,7 +351,8 @@ JOIN runtime_operation_targets target
 JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.started_at IS NULL
   AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace')
-ORDER BY outbox.created_at, outbox.operation_id
+  AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at <= statement_timestamp())
+ORDER BY outbox.dispatch_attempts, outbox.next_attempt_at NULLS FIRST, outbox.created_at, outbox.operation_id
 LIMIT $1
 `
 
@@ -366,22 +392,4 @@ func (q *Queries) ListPendingRuntimeOperations(ctx context.Context, limitCount i
 		return nil, err
 	}
 	return items, nil
-}
-
-const lockRuntimeOperationIdempotency = `-- name: LockRuntimeOperationIdempotency :one
-SELECT pg_advisory_xact_lock(
-    hashtextextended('runtime-operation' || chr(31) || $1::text || chr(31) || $2::text, 0)
-)
-`
-
-type LockRuntimeOperationIdempotencyParams struct {
-	OwnerUserID    string
-	IdempotencyKey string
-}
-
-func (q *Queries) LockRuntimeOperationIdempotency(ctx context.Context, arg LockRuntimeOperationIdempotencyParams) (interface{}, error) {
-	row := q.db.QueryRow(ctx, lockRuntimeOperationIdempotency, arg.OwnerUserID, arg.IdempotencyKey)
-	var pg_advisory_xact_lock interface{}
-	err := row.Scan(&pg_advisory_xact_lock)
-	return pg_advisory_xact_lock, err
 }

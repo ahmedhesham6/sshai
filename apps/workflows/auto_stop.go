@@ -8,19 +8,23 @@ import (
 	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/db"
+	"github.com/ahmedhesham6/sshai/libs/domain"
 	restate "github.com/restatedev/sdk-go"
 	"github.com/restatedev/sdk-go/ingress"
 )
 
 const (
-	AutoStopService         = "EnvironmentAutoStop"
-	AutoStopObserveHandler  = "Observe"
-	AutoStopExpireHandler   = "Expire"
-	AutoStopSuppressHandler = "Suppress"
-	AutoStopResumeHandler   = "Resume"
-	AutoStopRefreshHandler  = "Refresh"
-	autoStopStateKey        = "coordination"
-	autoStopStaleThreshold  = 5 * time.Minute
+	AutoStopService                    = "EnvironmentAutoStop"
+	AutoStopObserveHandler             = "Observe"
+	AutoStopExpireHandler              = "Expire"
+	AutoStopSuppressHandler            = "Suppress"
+	AutoStopResumeHandler              = "Resume"
+	AutoStopRefreshHandler             = "Refresh"
+	autoStopStateKey                   = "coordination"
+	autoStopStaleThreshold             = 5 * time.Minute
+	autoStopSnapshotPollTimeout        = 90 * time.Second
+	autoStopSnapshotPollInitialBackoff = 250 * time.Millisecond
+	autoStopSnapshotPollMaxBackoff     = 5 * time.Second
 )
 
 type AutoStopRefreshRequest struct {
@@ -31,7 +35,8 @@ type AutoStopRefreshRequest struct {
 }
 
 type AutoStopSnapshotSource interface {
-	RefreshAutoStop(context.Context, AutoStopRefreshRequest) (AutoStopObservation, error)
+	ReadAutoStopState(context.Context, AutoStopRefreshRequest) (AutoStopObservation, error)
+	ReadLatestSnapshot(context.Context, AutoStopRefreshRequest) (*domain.AutoStopActivitySnapshot, error)
 }
 
 type AutoStopRuntimeRequest struct {
@@ -58,6 +63,20 @@ type autoStopSnapshotRead struct {
 	Observation          AutoStopObservation
 	ReferenceUnavailable bool
 }
+
+type autoStopSnapshotPolling struct {
+	timeout        time.Duration
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
+	now            func() time.Time
+}
+
+type autoStopDispatchDisposition string
+
+const (
+	autoStopDispatchConflict             autoStopDispatchDisposition = "idempotency_conflict"
+	autoStopDispatchReferenceUnavailable autoStopDispatchDisposition = "reference_unavailable"
+)
 
 func AutoStopDefinition(source AutoStopSnapshotSource, dispatcher RuntimeStopDispatcher) restate.ServiceDefinition {
 	object := &autoStopObject{source: source, dispatcher: dispatcher}
@@ -144,16 +163,11 @@ func (object *autoStopObject) Refresh(ctx restate.ObjectContext, _ AutoStopRefre
 	if err != nil {
 		return AutoStopTransition{}, err
 	}
-	read, err := restate.Run(ctx, func(runCtx restate.RunContext) (autoStopSnapshotRead, error) {
-		observation, err := object.source.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
-			EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID,
-			FreshAfter: processedAt.Add(-autoStopStaleThreshold),
-		})
-		if errors.Is(err, db.ErrReferenceNotOwned) {
-			return autoStopSnapshotRead{ReferenceUnavailable: true}, nil
-		}
-		return autoStopSnapshotRead{Observation: observation}, err
-	}, restate.WithName("refresh-auto-stop-policy"))
+	request := AutoStopRefreshRequest{
+		EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID,
+		FreshAfter: processedAt.Add(-autoStopStaleThreshold),
+	}
+	read, err := refreshAutoStopSnapshot(ctx, object.source, request, autoStopSnapshotPolling{}, "refresh-auto-stop-policy")
 	if err != nil {
 		return AutoStopTransition{}, err
 	}
@@ -182,19 +196,17 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 	if !currentAutoStopTimer(state, timer) {
 		return AutoStopTransition{State: state}, nil
 	}
-	read, err := restate.Run(ctx, func(runCtx restate.RunContext) (autoStopSnapshotRead, error) {
-		freshAfter := time.Now().UTC()
-		observation, err := object.source.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
-			EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID,
-			AfterSnapshotSequence: state.LastSnapshotSequence, FreshAfter: freshAfter,
-		})
-		observation.FreshAfter = freshAfter
-		observation.ProcessedAt = time.Now().UTC()
-		if errors.Is(err, db.ErrReferenceNotOwned) {
-			return autoStopSnapshotRead{ReferenceUnavailable: true}, nil
-		}
-		return autoStopSnapshotRead{Observation: observation}, err
-	}, restate.WithName("refresh-activity-snapshot"))
+	freshAfter, timeErr := restate.Run(ctx, func(restate.RunContext) (time.Time, error) {
+		return time.Now().UTC(), nil
+	}, restate.WithName("record-auto-stop-expiry-refresh-time"))
+	if timeErr != nil {
+		return AutoStopTransition{}, timeErr
+	}
+	request := AutoStopRefreshRequest{
+		EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID,
+		AfterSnapshotSequence: state.LastSnapshotSequence, FreshAfter: freshAfter,
+	}
+	read, err := refreshAutoStopSnapshot(ctx, object.source, request, autoStopSnapshotPolling{}, "refresh-activity-snapshot")
 	if err != nil {
 		return AutoStopTransition{}, err
 	}
@@ -204,6 +216,13 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 		return transition, nil
 	}
 	observation := read.Observation
+	processedAt, timeErr := restate.Run(ctx, func(restate.RunContext) (time.Time, error) {
+		return time.Now().UTC(), nil
+	}, restate.WithName("record-auto-stop-expiry-processing-time"))
+	if timeErr != nil {
+		return AutoStopTransition{}, timeErr
+	}
+	observation.ProcessedAt = processedAt
 	transition, evaluationErr := (AutoStopCoordinator{}).Expire(state, AutoStopExpiry{
 		RuntimeID: timer.RuntimeID, Generation: timer.Generation, Observation: observation,
 	})
@@ -212,18 +231,19 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 	}
 	if transition.Stop != nil {
 		request := *transition.Stop
-		conflict, err := restate.Run(ctx, func(runCtx restate.RunContext) (bool, error) {
+		disposition, err := restate.Run(ctx, func(runCtx restate.RunContext) (autoStopDispatchDisposition, error) {
 			err := object.dispatcher.DispatchRuntimeStop(runCtx, request)
-			if errors.Is(err, db.ErrIdempotencyConflict) {
-				return true, nil
-			}
-			return false, err
+			return classifyAutoStopDispatchError(err)
 		}, restate.WithName("dispatch-runtime-stop"))
 		if err != nil {
 			return AutoStopTransition{}, err
 		}
-		if conflict {
-			slog.WarnContext(ctx, "automatic Runtime stop idempotency conflict ended dispatch cycle",
+		if disposition != "" {
+			message := "automatic Runtime stop idempotency conflict ended dispatch cycle"
+			if disposition == autoStopDispatchReferenceUnavailable {
+				message = "automatic Runtime stop target disappeared; dispatch cycle ended"
+			}
+			slog.WarnContext(ctx, message,
 				"environment_id", request.EnvironmentID, "runtime_id", request.RuntimeID,
 				"timer_generation", transition.State.TimerGeneration, "idempotency_key", request.IdempotencyKey)
 			transition.Stop = nil
@@ -237,6 +257,96 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 	restate.Set(ctx, autoStopStateKey, transition.State)
 	object.schedule(ctx, transition.Timer)
 	return transition, nil
+}
+
+func classifyAutoStopDispatchError(err error) (autoStopDispatchDisposition, error) {
+	switch {
+	case err == nil:
+		return "", nil
+	case errors.Is(err, db.ErrIdempotencyConflict):
+		return autoStopDispatchConflict, nil
+	case errors.Is(err, db.ErrReferenceNotOwned):
+		return autoStopDispatchReferenceUnavailable, nil
+	default:
+		return "", classifyDurableError(err)
+	}
+}
+
+func refreshAutoStopSnapshot(ctx restate.Context, source AutoStopSnapshotSource, request AutoStopRefreshRequest, polling autoStopSnapshotPolling, stepPrefix string) (autoStopSnapshotRead, error) {
+	if source == nil || request.EnvironmentID == "" || request.RuntimeID == "" {
+		return autoStopSnapshotRead{}, restate.TerminalErrorf("refresh Auto-stop Snapshot: source, Environment, and Runtime are required")
+	}
+	if polling.timeout <= 0 {
+		polling.timeout = autoStopSnapshotPollTimeout
+	}
+	if polling.initialBackoff <= 0 {
+		polling.initialBackoff = autoStopSnapshotPollInitialBackoff
+	}
+	if polling.maxBackoff <= 0 {
+		polling.maxBackoff = autoStopSnapshotPollMaxBackoff
+	}
+	if polling.now == nil {
+		polling.now = time.Now
+	}
+	readState := func(name string) (autoStopSnapshotRead, error) {
+		return restate.Run(ctx, func(runCtx restate.RunContext) (autoStopSnapshotRead, error) {
+			observation, err := source.ReadAutoStopState(runCtx, request)
+			if errors.Is(err, db.ErrReferenceNotOwned) {
+				return autoStopSnapshotRead{ReferenceUnavailable: true}, nil
+			}
+			return autoStopSnapshotRead{Observation: observation}, classifyDurableError(err)
+		}, restate.WithName(name))
+	}
+	initial, err := readState(stepPrefix + "-state-before")
+	if err != nil || initial.ReferenceUnavailable {
+		return initial, err
+	}
+
+	poll, err := durableDeadlinePoll[*domain.AutoStopActivitySnapshot](ctx, nil, durableDeadlinePollConfig{
+		timeout: polling.timeout, initialDelay: polling.initialBackoff, maxDelay: polling.maxBackoff,
+		stepPrefix: stepPrefix, readStepPrefix: stepPrefix + "-read-snapshot", now: polling.now,
+	}, func(runCtx restate.RunContext, pollStartedAt time.Time) (durableDeadlinePollRead[*domain.AutoStopActivitySnapshot], error) {
+		readRequest := request
+		if readRequest.FreshAfter.IsZero() {
+			readRequest.FreshAfter = pollStartedAt
+		}
+		snapshot, readErr := source.ReadLatestSnapshot(runCtx, readRequest)
+		if readErr == nil {
+			return durableDeadlinePollRead[*domain.AutoStopActivitySnapshot]{Value: snapshot, UseValue: true}, nil
+		}
+		classified := classifyDurableError(readErr)
+		if restate.IsTerminalError(classified) {
+			return durableDeadlinePollRead[*domain.AutoStopActivitySnapshot]{}, classified
+		}
+		return durableDeadlinePollRead[*domain.AutoStopActivitySnapshot]{RetryableFailure: true}, nil
+	}, func(snapshot *domain.AutoStopActivitySnapshot, pollStartedAt time.Time) (*domain.AutoStopActivitySnapshot, bool) {
+		effectiveRequest := request
+		if effectiveRequest.FreshAfter.IsZero() {
+			effectiveRequest.FreshAfter = pollStartedAt
+		}
+		return snapshot, autoStopSnapshotSatisfies(snapshot, effectiveRequest)
+	}, nil)
+	if err != nil {
+		return autoStopSnapshotRead{}, err
+	}
+	effectiveRequest := request
+	if effectiveRequest.FreshAfter.IsZero() {
+		effectiveRequest.FreshAfter = poll.startedAt
+	}
+
+	final, err := readState(stepPrefix + "-state-after")
+	if err != nil || final.ReferenceUnavailable {
+		return final, err
+	}
+	final.Observation.Snapshot = poll.value
+	final.Observation.FreshAfter = effectiveRequest.FreshAfter
+	return final, nil
+}
+
+func autoStopSnapshotSatisfies(snapshot *domain.AutoStopActivitySnapshot, request AutoStopRefreshRequest) bool {
+	return snapshot != nil &&
+		(request.AfterSnapshotSequence == 0 || snapshot.Sequence > request.AfterSnapshotSequence) &&
+		(request.FreshAfter.IsZero() || !snapshot.ObservedAt.Before(request.FreshAfter))
 }
 
 func (object *autoStopObject) schedule(ctx restate.ObjectContext, timer *AutoStopTimer) {

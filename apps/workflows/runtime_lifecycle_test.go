@@ -302,6 +302,44 @@ func TestRuntimeStopReconcilesStoredStoppedRuntime(t *testing.T) {
 	}
 }
 
+func TestRuntimeStopAllowsMissingUsageIntervalOnlyForStoredStoppedRuntime(t *testing.T) {
+	tests := []struct {
+		name        string
+		ready       bool
+		wantFailure bool
+	}{
+		{name: "stored stopped Runtime was already reconciled", ready: false},
+		{name: "normal stop requires open interval", ready: true, wantFailure: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newRuntimeWorkflowHarness(test.ready)
+			harness.actions.state.ComputeUsageIntervalID = ""
+			if !test.ready {
+				harness.provider.runtime.PrivateIPv4 = ""
+			}
+			environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
+			input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
+			if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			_, err := ingress.WorkflowHandle[RuntimeStopOutput](environment.Ingress(), RuntimeStopService, input.OperationID).Attach(ctx)
+			if test.wantFailure {
+				if err == nil || !strings.Contains(err.Error(), "open Compute Usage Interval is required") {
+					t.Fatalf("Runtime stop error = %v, want missing interval failure", err)
+				}
+			} else if err != nil {
+				t.Fatalf("Runtime stop error = %v, want already-reconciled success", err)
+			}
+			if harness.usage.closeCalls != 0 {
+				t.Fatalf("usage close calls = %d, want 0 without an open interval", harness.usage.closeCalls)
+			}
+		})
+	}
+}
+
 func TestRuntimeStopProviderFailureMarksRuntimeError(t *testing.T) {
 	harness := newRuntimeWorkflowHarness(true)
 	harness.provider.stopErr = provider.NewError(provider.ErrorCodeResourceDiverged, "wrong instance", nil)
@@ -451,6 +489,7 @@ func TestRuntimeStopFailureReleasesAutoStopSuppression(t *testing.T) {
 func TestRuntimeStopRejectsSnapshotThatRemainsStaleAfterBoundedRefresh(t *testing.T) {
 	harness := newRuntimeWorkflowHarness(true)
 	harness.guest.snapshotLag = time.Minute
+	harness.guest.afterSnapshotRead = func() { harness.advanceClock(time.Millisecond) }
 	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
 	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
 	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
@@ -464,6 +503,46 @@ func TestRuntimeStopRejectsSnapshotThatRemainsStaleAfterBoundedRefresh(t *testin
 	}
 	if harness.actions.runtimeStatus() != domain.RuntimeReady || harness.auto.suppressCalls != 1 || harness.auto.resumeCalls != 1 || harness.guest.shutdownCalls != 0 {
 		t.Fatalf("stale Snapshot status/suppress/resume/shutdown = %q/%d/%d/%d", harness.actions.runtimeStatus(), harness.auto.suppressCalls, harness.auto.resumeCalls, harness.guest.shutdownCalls)
+	}
+}
+
+func TestRuntimeStopPollsSnapshotAsDurablePerAttemptReads(t *testing.T) {
+	harness := newRuntimeWorkflowHarness(true)
+	freshAfter := harness.clock
+	harness.guest.snapshots = []*domain.AutoStopActivitySnapshot{
+		{RuntimeID: "runtime-1", Sequence: 1, ObservedAt: freshAfter.Add(-time.Minute)},
+		{RuntimeID: "runtime-1", Sequence: 2, ObservedAt: freshAfter.Add(time.Second)},
+	}
+	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
+	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
+	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingress.WorkflowHandle[RuntimeStopOutput](environment.Ingress(), RuntimeStopService, input.OperationID).Attach(t.Context()); err != nil {
+		t.Fatalf("Runtime stop: %v", err)
+	}
+	if harness.guest.snapshotCalls != 2 {
+		t.Fatalf("latest Snapshot reads = %d, want stale attempt then fresh attempt", harness.guest.snapshotCalls)
+	}
+}
+
+func TestRuntimeStopSnapshotPollingDeadlineAdvancesPastTransientReadFailure(t *testing.T) {
+	harness := newRuntimeWorkflowHarness(true)
+	harness.guest.snapshotErr = runtimeTransientError{error: errors.New("snapshot database unavailable")}
+	harness.guest.afterSnapshotRead = func() { harness.advanceClock(time.Second) }
+	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
+	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
+	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	_, err := ingress.WorkflowHandle[RuntimeStopOutput](environment.Ingress(), RuntimeStopService, input.OperationID).Attach(ctx)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), RuntimeStopFailed) {
+		t.Fatalf("Runtime stop error = %v, want bounded stale/missing Snapshot failure", err)
+	}
+	if harness.guest.snapshotCalls != 1 {
+		t.Fatalf("Snapshot reads = %d, want one failed read before durable deadline", harness.guest.snapshotCalls)
 	}
 }
 
@@ -556,6 +635,7 @@ func (h *runtimeWorkflowHarness) stopDependencies() RuntimeStopDependencies {
 		Provider: h.provider, Actions: h.actions, DataVolumes: h.volume, Snapshots: h.guest,
 		Guest: h.guest, Usage: h.usage, AutoStop: h.auto, Now: h.now,
 		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
+		SnapshotPollTimeout: 2 * time.Millisecond, SnapshotPollInitialBackoff: time.Millisecond, SnapshotPollMaxBackoff: time.Millisecond,
 	}
 }
 
@@ -571,6 +651,12 @@ func (h *runtimeWorkflowHarness) setClock(now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clock = now
+}
+
+func (h *runtimeWorkflowHarness) advanceClock(delta time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clock = h.clock.Add(delta)
 }
 
 func runtimeDispatch(operationType domain.OperationType, reason domain.RuntimeStopReason) domain.RuntimeOperationDispatch {
@@ -630,6 +716,7 @@ type runtimeActionsFake struct {
 	snapshotCalls   int
 	completeCalls   int
 	failureCode     string
+	failureMessage  string
 	stopAudit       *domain.RuntimeStopAuditEvidence
 }
 
@@ -659,10 +746,11 @@ func (fake *runtimeActionsFake) CompleteRuntimeOperation(context.Context, string
 	return nil
 }
 
-func (fake *runtimeActionsFake) RecordRuntimeFailure(_ context.Context, _ string, code string, _ time.Time) error {
+func (fake *runtimeActionsFake) RecordRuntimeFailure(_ context.Context, _ string, code, message string, _ time.Time) error {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	fake.failureCode = code
+	fake.failureMessage = message
 	return nil
 }
 
@@ -875,6 +963,8 @@ type runtimeGuestFake struct {
 	readiness                 RuntimeGuestReadiness
 	snapshotErr               error
 	snapshotLag               time.Duration
+	snapshots                 []*domain.AutoStopActivitySnapshot
+	afterSnapshotRead         func()
 }
 
 func (fake *runtimeGuestFake) WaitForRuntimeReady(_ context.Context, request RuntimeGuestReadinessRequest) (RuntimeGuestReadiness, error) {
@@ -905,15 +995,23 @@ func (fake *runtimeGuestFake) PrepareRuntimeShutdown(_ context.Context, request 
 	fake.shutdownCalls++
 	return nil
 }
-func (fake *runtimeGuestFake) RefreshAutoStop(_ context.Context, request AutoStopRefreshRequest) (AutoStopObservation, error) {
+func (fake *runtimeGuestFake) ReadAutoStopState(_ context.Context, request AutoStopRefreshRequest) (AutoStopObservation, error) {
+	return AutoStopObservation{RuntimeID: request.RuntimeID}, nil
+}
+func (fake *runtimeGuestFake) ReadLatestSnapshot(_ context.Context, request AutoStopRefreshRequest) (*domain.AutoStopActivitySnapshot, error) {
 	fake.snapshotCalls++
-	if fake.snapshotErr != nil {
-		return AutoStopObservation{}, fake.snapshotErr
+	if fake.afterSnapshotRead != nil {
+		fake.afterSnapshotRead()
 	}
-	return AutoStopObservation{
-		RuntimeID: request.RuntimeID,
-		Snapshot:  &domain.AutoStopActivitySnapshot{RuntimeID: request.RuntimeID, Sequence: 1, ObservedAt: request.FreshAfter.Add(-fake.snapshotLag)},
-	}, nil
+	if fake.snapshotErr != nil {
+		return nil, fake.snapshotErr
+	}
+	if len(fake.snapshots) > 0 {
+		index := min(fake.snapshotCalls-1, len(fake.snapshots)-1)
+		snapshot := *fake.snapshots[index]
+		return &snapshot, nil
+	}
+	return &domain.AutoStopActivitySnapshot{RuntimeID: request.RuntimeID, Sequence: 1, ObservedAt: request.FreshAfter.Add(-fake.snapshotLag)}, nil
 }
 
 type runtimeAutoStopFake struct{ suppressCalls, resumeCalls int }

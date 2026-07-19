@@ -54,6 +54,7 @@ type EnvironmentCreateSender interface {
 type RuntimeOperationOutbox interface {
 	PendingRuntimeOperation(context.Context, string) (domain.RuntimeOperationDispatch, bool, error)
 	PendingRuntimeOperations(context.Context, int) ([]domain.RuntimeOperationDispatch, error)
+	DeferRuntimeOperationDispatch(context.Context, string, time.Time) error
 }
 
 type RuntimeOperationSender interface {
@@ -99,10 +100,11 @@ func (dispatcher *WorkflowDispatcher) DispatchPendingEnvironmentCreates(ctx cont
 type RuntimeWorkflowDispatcher struct {
 	outbox RuntimeOperationOutbox
 	sender RuntimeOperationSender
+	now    func() time.Time
 }
 
 func NewRuntimeOperationDispatcher(outbox RuntimeOperationOutbox, sender RuntimeOperationSender) *RuntimeWorkflowDispatcher {
-	return &RuntimeWorkflowDispatcher{outbox: outbox, sender: sender}
+	return &RuntimeWorkflowDispatcher{outbox: outbox, sender: sender, now: time.Now}
 }
 
 func (dispatcher *RuntimeWorkflowDispatcher) DispatchRuntimeOperation(ctx context.Context, operationID string) error {
@@ -114,7 +116,7 @@ func (dispatcher *RuntimeWorkflowDispatcher) DispatchRuntimeOperation(ctx contex
 		return nil
 	}
 	if err := dispatcher.sender.SendRuntimeOperation(ctx, input); err != nil {
-		return fmt.Errorf("dispatch Runtime Operation: %w", err)
+		return dispatcher.deferRuntimeOperation(ctx, input.OperationID, fmt.Errorf("dispatch Runtime Operation: %w", err))
 	}
 	return nil
 }
@@ -124,10 +126,19 @@ func (dispatcher *RuntimeWorkflowDispatcher) DispatchPendingRuntimeOperations(ct
 	if err != nil {
 		return fmt.Errorf("dispatch pending Runtime Operations: read outbox: %w", err)
 	}
+	var failures []error
 	for _, input := range inputs {
 		if err := dispatcher.sender.SendRuntimeOperation(ctx, input); err != nil {
-			return fmt.Errorf("dispatch pending Runtime Operation %q: %w", input.OperationID, err)
+			failure := fmt.Errorf("dispatch pending Runtime Operation %q: %w", input.OperationID, err)
+			failures = append(failures, dispatcher.deferRuntimeOperation(ctx, input.OperationID, failure))
 		}
 	}
-	return nil
+	return errors.Join(failures...)
+}
+
+func (dispatcher *RuntimeWorkflowDispatcher) deferRuntimeOperation(ctx context.Context, operationID string, failure error) error {
+	if err := dispatcher.outbox.DeferRuntimeOperationDispatch(ctx, operationID, dispatcher.now().Round(0).UTC()); err != nil {
+		return errors.Join(failure, fmt.Errorf("defer Runtime Operation %q after dispatch failure: %w", operationID, err))
+	}
+	return failure
 }

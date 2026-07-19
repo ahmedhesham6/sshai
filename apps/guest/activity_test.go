@@ -307,6 +307,20 @@ func TestObserverClassifiesUnknownAndCgroupScopedProcesses(t *testing.T) {
 			userSession: 2,
 		},
 		{
+			name: "agent in selected container is recognized",
+			processes: []guest.ProcessSample{
+				{
+					PID: 10, ParentPID: 1, OwnerUID: 1000, Executable: "/usr/local/bin/codex",
+					State: guest.ProcessWaiting, CgroupPath: "/system.slice/docker-container-agent.scope", ContainerID: "container-agent",
+				},
+			},
+			containers: []guest.ContainerSample{
+				{ID: "container-agent", Selection: "project-db", State: guest.ContainerRunning},
+			},
+			codex:       1,
+			escapedUser: 1,
+		},
+		{
 			name: "escaped recognized executable becomes unknown",
 			processes: []guest.ProcessSample{
 				{PID: 10, ParentPID: 1, OwnerUID: 1000, Executable: "/usr/local/bin/codex", State: guest.ProcessRunning, CgroupPath: "/system.slice/escaped.scope"},

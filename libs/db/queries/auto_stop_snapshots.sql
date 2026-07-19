@@ -29,6 +29,7 @@ SELECT runtime_id, sequence, environment_id, observed_at,
        protected_processes, selected_containers, unknown_user_processes
 FROM activity_snapshots
 WHERE runtime_id = sqlc.arg(runtime_id)
+  AND environment_id = sqlc.arg(environment_id)
 ORDER BY sequence DESC
 LIMIT 1;
 
@@ -45,20 +46,35 @@ WHERE runtime_id = sqlc.arg(runtime_id)
 SELECT environment_id, generation
 FROM auto_stop_policies
 WHERE environment_id = sqlc.arg(environment_id)
-  AND refresh_acknowledged_generation < generation;
+  AND refresh_acknowledged_generation < generation
+  AND (refresh_next_attempt_at IS NULL OR refresh_next_attempt_at <= statement_timestamp());
 
 -- name: ListPendingAutoStopPolicyRefreshes :many
 SELECT environment_id, generation
 FROM auto_stop_policies
 WHERE refresh_acknowledged_generation < generation
-ORDER BY environment_id
+  AND (refresh_next_attempt_at IS NULL OR refresh_next_attempt_at <= statement_timestamp())
+ORDER BY refresh_attempts, refresh_next_attempt_at NULLS FIRST, environment_id
 LIMIT sqlc.arg(limit_count);
 
 -- name: AcknowledgeAutoStopPolicyRefresh :execrows
 UPDATE auto_stop_policies
-SET refresh_acknowledged_generation = GREATEST(refresh_acknowledged_generation, sqlc.arg(generation))
+SET refresh_acknowledged_generation = GREATEST(refresh_acknowledged_generation, sqlc.arg(generation)),
+    refresh_attempts = CASE WHEN generation = sqlc.arg(generation) THEN 0 ELSE refresh_attempts END,
+    refresh_next_attempt_at = CASE WHEN generation = sqlc.arg(generation) THEN NULL ELSE refresh_next_attempt_at END
 WHERE environment_id = sqlc.arg(environment_id)
   AND generation >= sqlc.arg(generation);
+
+-- name: DeferAutoStopPolicyRefresh :execrows
+UPDATE auto_stop_policies
+SET refresh_attempts = refresh_attempts + 1,
+    refresh_next_attempt_at = sqlc.arg(attempted_at)::timestamptz + LEAST(
+        INTERVAL '1 hour',
+        INTERVAL '5 seconds' * power(2::numeric, LEAST(refresh_attempts, 10))::double precision
+    )
+WHERE environment_id = sqlc.arg(environment_id)
+  AND generation = sqlc.arg(generation)
+  AND refresh_acknowledged_generation < generation;
 
 -- name: ListActiveAutoStopOperationTypes :many
 SELECT type
@@ -72,3 +88,7 @@ ORDER BY type;
 SELECT owner_user_id, current_runtime_id
 FROM environments
 WHERE id = sqlc.arg(environment_id);
+
+-- name: PruneActivitySnapshots :execrows
+DELETE FROM activity_snapshots
+WHERE observed_at < sqlc.arg(retain_after);
