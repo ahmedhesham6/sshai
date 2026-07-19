@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/pelletier/go-toml/v2"
@@ -36,11 +38,16 @@ type localProfileSelection struct {
 
 func authoringProfileFromContracts(profileID, name, head string, refs []contracts.CapsuleRef) localAuthoringProfile {
 	result := localAuthoringProfile{Version: localStateVersion, ProfileID: profileID, Name: name, LastObservedHeadVersionID: head}
-	result.CapsuleRefs = make([]localCapsuleRef, len(refs))
+	result.CapsuleRefs = localCapsuleRefsFromContracts(refs)
+	return result
+}
+
+func localCapsuleRefsFromContracts(refs []contracts.CapsuleRef) []localCapsuleRef {
+	result := make([]localCapsuleRef, len(refs))
 	for index, ref := range refs {
-		result.CapsuleRefs[index] = localCapsuleRef{Ref: ref.Ref, FreshnessPolicy: string(ref.FreshnessPolicy)}
+		result[index] = localCapsuleRef{Ref: ref.Ref, FreshnessPolicy: string(ref.FreshnessPolicy)}
 		if ref.Exclusions != nil {
-			result.CapsuleRefs[index].Exclusions = append([]string(nil), (*ref.Exclusions)...)
+			result[index].Exclusions = append([]string(nil), (*ref.Exclusions)...)
 		}
 	}
 	return result
@@ -59,7 +66,8 @@ func (profile localAuthoringProfile) contractRefs() []contracts.CapsuleRef {
 }
 
 func (store localStateStore) SaveAuthoringProfile(ctx context.Context, profile localAuthoringProfile) error {
-	if err := validateLocalAuthoringProfile(profile); err != nil {
+	content, err := encodeLocalAuthoringProfile(profile)
+	if err != nil {
 		return err
 	}
 	profiles, lock, err := store.openProfilesForUpdate(ctx)
@@ -68,7 +76,22 @@ func (store localStateStore) SaveAuthoringProfile(ctx context.Context, profile l
 	}
 	defer profiles.Close()
 	defer lock.Close()
-	return writeAuthoringProfileAndSelection(profiles, profile)
+	existing, found, err := readAuthoringProfileFrom(profiles, profile.ProfileID)
+	if err != nil {
+		return err
+	}
+	if found {
+		if existing.Name != profile.Name {
+			return errors.New("save authoring Profile: existing record has a different identity")
+		}
+		if reflect.DeepEqual(existing, profile) {
+			if err := profiles.writePrivate(profile.ProfileID+".toml", content); err != nil {
+				return fmt.Errorf("write authoring Profile: %w", err)
+			}
+		}
+		return writeProfileSelection(profiles, profile.ProfileID)
+	}
+	return writeAuthoringProfileAndSelection(profiles, profile, content)
 }
 
 func (store localStateStore) ReadAuthoringProfile(profileID string) (localAuthoringProfile, bool, error) {
@@ -154,22 +177,57 @@ func (store localStateStore) UpdateSelectedAuthoringProfile(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	profile, found, err := readAuthoringProfileFrom(profiles, selection.ProfileID)
+	return updateAuthoringProfileFrom(profiles, selection.ProfileID, update)
+}
+
+func (store localStateStore) UpdateAuthoringProfile(ctx context.Context, profileID string, update func(*localAuthoringProfile) error) error {
+	if update == nil {
+		return errors.New("update authoring Profile: update is required")
+	}
+	if !localProfileIDPattern.MatchString(profileID) {
+		return errors.New("update authoring Profile: Profile ID is invalid")
+	}
+	profiles, lock, err := store.openProfilesForUpdate(ctx)
+	if err != nil {
+		return err
+	}
+	defer profiles.Close()
+	defer lock.Close()
+	return updateAuthoringProfileFrom(profiles, profileID, update)
+}
+
+func (store localStateStore) SelectAuthoringProfile(ctx context.Context, profileID string) error {
+	if !localProfileIDPattern.MatchString(profileID) {
+		return errors.New("select authoring Profile: Profile ID is invalid")
+	}
+	profiles, lock, err := store.openProfilesForUpdate(ctx)
+	if err != nil {
+		return err
+	}
+	defer profiles.Close()
+	defer lock.Close()
+	if _, found, err := readAuthoringProfileFrom(profiles, profileID); err != nil {
+		return err
+	} else if !found {
+		return fmt.Errorf("select authoring Profile: local record %q was not found", profileID)
+	}
+	return writeProfileSelection(profiles, profileID)
+}
+
+func updateAuthoringProfileFrom(profiles *anchoredDirectory, profileID string, update func(*localAuthoringProfile) error) error {
+	profile, found, err := readAuthoringProfileFrom(profiles, profileID)
 	if err != nil {
 		return err
 	}
 	if !found {
-		return errors.New("selected authoring Profile record is missing")
+		return errors.New("authoring Profile record is missing")
 	}
 	if err := update(&profile); err != nil {
 		return err
 	}
-	if err := validateLocalAuthoringProfile(profile); err != nil {
-		return err
-	}
-	content, err := toml.Marshal(profile)
+	content, err := encodeLocalAuthoringProfile(profile)
 	if err != nil {
-		return errors.New("encode authoring Profile")
+		return err
 	}
 	return profiles.writePrivate(profile.ProfileID+".toml", content)
 }
@@ -194,15 +252,15 @@ func (store localStateStore) openProfilesForUpdate(ctx context.Context) (*anchor
 
 type ioCloser interface{ Close() error }
 
-func writeAuthoringProfileAndSelection(profiles *anchoredDirectory, profile localAuthoringProfile) error {
-	content, err := toml.Marshal(profile)
-	if err != nil {
-		return errors.New("encode authoring Profile")
-	}
+func writeAuthoringProfileAndSelection(profiles *anchoredDirectory, profile localAuthoringProfile, content []byte) error {
 	if err := profiles.writePrivate(profile.ProfileID+".toml", content); err != nil {
 		return fmt.Errorf("write authoring Profile: %w", err)
 	}
-	selection, err := toml.Marshal(localProfileSelection{Version: localStateVersion, ProfileID: profile.ProfileID})
+	return writeProfileSelection(profiles, profile.ProfileID)
+}
+
+func writeProfileSelection(profiles *anchoredDirectory, profileID string) error {
+	selection, err := toml.Marshal(localProfileSelection{Version: localStateVersion, ProfileID: profileID})
 	if err != nil {
 		return errors.New("encode authoring Profile selection")
 	}
@@ -258,21 +316,47 @@ func validateLocalAuthoringProfile(profile localAuthoringProfile) error {
 	}
 	seen := make(map[string]struct{}, len(profile.CapsuleRefs))
 	for _, ref := range profile.CapsuleRefs {
-		if _, err := contracts.ParseOwnedCapsuleRef(ref.Ref); err != nil {
-			return fmt.Errorf("authoring Profile contains invalid Capsule Ref: %w", err)
-		}
-		if !contracts.CapsuleRefFreshnessPolicy(ref.FreshnessPolicy).Valid() {
-			return errors.New("authoring Profile contains an invalid freshness policy")
+		if err := validateLocalCapsuleRef(ref); err != nil {
+			return err
 		}
 		if _, exists := seen[ref.Ref]; exists {
 			return errors.New("authoring Profile contains a duplicate Capsule Ref")
 		}
 		seen[ref.Ref] = struct{}{}
-		for _, exclusion := range ref.Exclusions {
-			if strings.TrimSpace(exclusion) == "" || exclusion != strings.TrimSpace(exclusion) {
-				return errors.New("authoring Profile contains an invalid component exclusion")
-			}
-		}
 	}
 	return nil
+}
+
+func validateLocalCapsuleRef(ref localCapsuleRef) error {
+	if _, err := contracts.ParseOwnedCapsuleRef(ref.Ref); err != nil {
+		return fmt.Errorf("authoring Profile contains invalid Capsule Ref: %w", err)
+	}
+	if !contracts.CapsuleRefFreshnessPolicy(ref.FreshnessPolicy).Valid() {
+		return errors.New("authoring Profile contains an invalid freshness policy")
+	}
+	seenExclusions := make(map[string]struct{}, len(ref.Exclusions))
+	for _, exclusion := range ref.Exclusions {
+		if strings.TrimSpace(exclusion) == "" || exclusion != strings.TrimSpace(exclusion) || utf8.RuneCountInString(exclusion) > 256 {
+			return errors.New("authoring Profile contains an invalid component exclusion (must be 1-256 characters without surrounding whitespace)")
+		}
+		if _, duplicate := seenExclusions[exclusion]; duplicate {
+			return errors.New("authoring Profile contains a duplicate component exclusion")
+		}
+		seenExclusions[exclusion] = struct{}{}
+	}
+	return nil
+}
+
+func encodeLocalAuthoringProfile(profile localAuthoringProfile) ([]byte, error) {
+	if err := validateLocalAuthoringProfile(profile); err != nil {
+		return nil, err
+	}
+	content, err := toml.Marshal(profile)
+	if err != nil {
+		return nil, errors.New("encode authoring Profile")
+	}
+	if len(content) > maxLocalStateFileSize {
+		return nil, errors.New("authoring Profile record exceeds the local-state size limit")
+	}
+	return content, nil
 }
