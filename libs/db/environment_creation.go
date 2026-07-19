@@ -14,12 +14,14 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/db/internal/dbsql"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 var (
-	ErrIdempotencyConflict = permanent(errors.New("idempotency key reused with different input"))
-	ErrReferenceNotOwned   = permanent(errors.New("referenced resource is absent or not owned"))
+	ErrIdempotencyConflict     = permanent(errors.New("idempotency key reused with different input"))
+	ErrReferenceNotOwned       = permanent(errors.New("referenced resource is absent or not owned"))
+	ErrEnvironmentNameConflict = permanent(errors.New("an active Environment already uses this name"))
 )
 
 func (store *Store) ReserveEnvironmentCreation(ctx context.Context, candidate domain.EnvironmentCreation) (domain.EnvironmentCreation, error) {
@@ -149,6 +151,10 @@ func insertEnvironmentCreation(ctx context.Context, queries *dbsql.Queries, crea
 		DeletedAt: optionalTimestamp(environment.DeletedAt), Version: environment.Version,
 	})
 	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" && postgresError.ConstraintName == "environments_owner_slug_active_key" {
+			return ErrEnvironmentNameConflict
+		}
 		return fmt.Errorf("reserve Environment creation: insert Environment: %w", err)
 	}
 	if inserted != 1 {

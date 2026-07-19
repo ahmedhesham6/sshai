@@ -17,4 +17,5 @@ func acquirePrivateFileLock(context.Context, *anchoredDirectory, string) (*token
 	return nil, errors.New("secure local-state locking is unsupported on this platform")
 }
 
-func (*tokenFileLock) Close() error { return nil }
+func (*tokenFileLock) Close() error       { return nil }
+func (*tokenFileLock) StillCurrent() bool { return false }

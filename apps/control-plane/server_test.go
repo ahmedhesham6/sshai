@@ -106,6 +106,31 @@ func TestCreateEnvironmentRequiresBearerAuthentication(t *testing.T) {
 	}
 }
 
+func TestCreateEnvironmentMapsActiveNameConflict(t *testing.T) {
+	repository := &creationRepositoryFake{reserveErr: db.ErrEnvironmentNameConflict}
+	handler := controlplane.NewHandler(controlplane.Config{
+		CreateEnvironment: application.NewCreateEnvironmentService(
+			repository, &completingWorkflowFake{repository: repository},
+			&idsFake{values: []string{"environment-1", "policy-1", "operation-1"}}, time.Now,
+			map[string]string{"us-east-1": "us-east-1a"},
+		),
+		Verifier: verifierFake{}, Users: &usersFake{}, UserIDs: &idsFake{values: []string{"user-1"}},
+		RequestIDs: &idsFake{values: []string{"request-conflict"}}, DefaultRegion: "us-east-1", Now: time.Now,
+	})
+	body := []byte(`{"name":"API Workspace","region":"us-east-1","runtimePreset":"standard","profileVersionId":"profile-version-1","projectSeedId":"project-seed-1","autoStopPolicy":{"mode":"manual","gracePeriodSeconds":0},"sshKeyIds":["ssh-key-1"]}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/environments", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer valid-token")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "request-key-0001")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict || !bytes.Contains(response.Body.Bytes(), []byte(`"code":"ENVIRONMENT_NAME_CONFLICT"`)) {
+		t.Fatalf("name conflict response = status:%d body:%s", response.Code, response.Body.String())
+	}
+}
+
 func TestCreateProjectSeedRegistersAuthenticatedImmutableMetadata(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	repository := &projectSeedHTTPRepositoryFake{}
@@ -323,6 +348,7 @@ type creationRepositoryFake struct {
 	saved        domain.EnvironmentCreation
 	completed    domain.EnvironmentCreation
 	reserveCalls int
+	reserveErr   error
 }
 
 type projectSeedHTTPRepositoryFake struct {
@@ -338,6 +364,9 @@ func (repository *projectSeedHTTPRepositoryFake) RegisterProjectSeed(_ context.C
 
 func (repository *creationRepositoryFake) ReserveEnvironmentCreation(_ context.Context, creation domain.EnvironmentCreation) (domain.EnvironmentCreation, error) {
 	repository.reserveCalls++
+	if repository.reserveErr != nil {
+		return domain.EnvironmentCreation{}, repository.reserveErr
+	}
 	if repository.saved.Environment().Snapshot().ID == "" {
 		repository.saved = creation
 	}

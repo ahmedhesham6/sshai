@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	maxLocalStateFileSize = 256 << 10
-	localStateVersion     = 1
+	maxLocalStateFileSize     = 256 << 10
+	maxRepositoryIdentitySize = 16 << 10
+	localStateVersion         = 1
 )
 
 // localConfig contains only user-owned defaults and references. Authentication
@@ -29,7 +30,6 @@ type localConfig struct {
 	DefaultRegion           string   `toml:"default_region"`
 	RuntimePreset           string   `toml:"runtime_preset"`
 	ProfileVersionID        string   `toml:"profile_version_id"`
-	ProjectSeedID           string   `toml:"project_seed_id"`
 	SSHKeyIDs               []string `toml:"ssh_key_ids"`
 	AutoStopMode            string   `toml:"auto_stop_mode"`
 	AutoStopGracePeriodSecs int      `toml:"auto_stop_grace_period_seconds"`
@@ -46,6 +46,7 @@ type projectBinding struct {
 	Version            int    `toml:"version"`
 	RepositoryIdentity string `toml:"repository_identity"`
 	EnvironmentID      string `toml:"environment_id"`
+	ProjectSeedID      string `toml:"project_seed_id"`
 }
 
 type localStateStore struct{ directory string }
@@ -120,6 +121,9 @@ func (store localStateStore) UpdateConfig(ctx context.Context, update func(*loca
 	if err != nil {
 		return errors.New("encode config.toml")
 	}
+	if !lock.StillCurrent() {
+		return errLocalStateConflict
+	}
 	return directory.writePrivate("config.toml", encoded)
 }
 
@@ -152,9 +156,12 @@ func validateLocalConfig(config localConfig) error {
 		return errors.New("config.toml has an unknown Auto-stop Policy mode")
 	}
 	seen := make(map[string]struct{}, len(config.SSHKeyIDs))
+	if config.ProfileVersionID != "" && (config.ProfileVersionID != strings.TrimSpace(config.ProfileVersionID) || !sshIdentifierPattern.MatchString(config.ProfileVersionID)) {
+		return errors.New("config.toml contains an invalid Profile Version ID")
+	}
 	for _, id := range config.SSHKeyIDs {
-		if strings.TrimSpace(id) == "" {
-			return errors.New("config.toml contains an empty SSH key ID")
+		if id != strings.TrimSpace(id) || !sshIdentifierPattern.MatchString(id) {
+			return errors.New("config.toml contains an invalid SSH key ID")
 		}
 		if _, exists := seen[id]; exists {
 			return errors.New("config.toml contains a duplicate SSH key ID")
@@ -198,16 +205,48 @@ func (store localStateStore) ReadProject(identity string) (projectBinding, bool,
 	var binding projectBinding
 	decoder := toml.NewDecoder(bytes.NewReader(content))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&binding); err != nil || binding.Version != localStateVersion || binding.RepositoryIdentity != identity || strings.TrimSpace(binding.EnvironmentID) == "" {
+	if err := decoder.Decode(&binding); err != nil || !validProjectBinding(binding, identity) {
 		return projectBinding{}, false, errors.New("Project Binding is malformed or does not match this repository")
 	}
-	return binding, true, nil
+	return binding, strings.TrimSpace(binding.EnvironmentID) != "", nil
+}
+
+func validProjectBinding(binding projectBinding, identity string) bool {
+	return validRepositoryIdentity(identity) && binding.Version == localStateVersion && binding.RepositoryIdentity == identity &&
+		sshIdentifierPattern.MatchString(binding.ProjectSeedID) &&
+		(binding.EnvironmentID == "" || sshIdentifierPattern.MatchString(binding.EnvironmentID))
+}
+
+func (store localStateStore) SetProjectSeed(ctx context.Context, identity, projectSeedID string) error {
+	if !validRepositoryIdentity(identity) || !sshIdentifierPattern.MatchString(projectSeedID) {
+		return errors.New("write Project Binding: repository identity and Project Seed ID are required")
+	}
+	return store.updateProject(ctx, identity, func(binding *projectBinding) error {
+		if binding.ProjectSeedID != "" && binding.ProjectSeedID != projectSeedID {
+			return errLocalStateConflict
+		}
+		binding.ProjectSeedID = projectSeedID
+		return nil
+	})
 }
 
 func (store localStateStore) BindProject(ctx context.Context, identity, environmentID string) error {
-	if identity == "" || strings.TrimSpace(environmentID) == "" {
+	if !validRepositoryIdentity(identity) || !sshIdentifierPattern.MatchString(environmentID) {
 		return errors.New("write Project Binding: repository identity and Environment ID are required")
 	}
+	return store.updateProject(ctx, identity, func(binding *projectBinding) error {
+		if binding.EnvironmentID == environmentID {
+			return nil
+		}
+		if binding.EnvironmentID != "" {
+			return errLocalStateConflict
+		}
+		binding.EnvironmentID = environmentID
+		return nil
+	})
+}
+
+func (store localStateStore) updateProject(ctx context.Context, identity string, update func(*projectBinding) error) error {
 	state, err := openOwnedDirectory(store.directory)
 	if err != nil {
 		return fmt.Errorf("open local state: %w", err)
@@ -223,18 +262,24 @@ func (store localStateStore) BindProject(ctx context.Context, identity, environm
 		return fmt.Errorf("lock Project Bindings: %w", err)
 	}
 	defer lock.Close()
+	binding := projectBinding{Version: localStateVersion, RepositoryIdentity: identity}
 	if current, found, readErr := store.readProjectFrom(projects, identity); readErr != nil {
 		return readErr
 	} else if found {
-		if current.EnvironmentID == environmentID {
-			return nil
-		}
-		return errLocalStateConflict
+		binding = current
 	}
-	binding := projectBinding{Version: localStateVersion, RepositoryIdentity: identity, EnvironmentID: environmentID}
+	if err := update(&binding); err != nil {
+		return err
+	}
+	if !validProjectBinding(binding, identity) {
+		return errors.New("write Project Binding: Project Seed ID is required")
+	}
 	content, err := toml.Marshal(binding)
 	if err != nil {
 		return errors.New("encode Project Binding")
+	}
+	if !lock.StillCurrent() {
+		return errLocalStateConflict
 	}
 	return projects.writePrivate(projectBindingName(identity), content)
 }
@@ -248,7 +293,9 @@ func (store localStateStore) readProjectFrom(projects *anchoredDirectory, identi
 		return projectBinding{}, false, errors.New("existing Project Binding is unsafe")
 	}
 	var binding projectBinding
-	if toml.Unmarshal(content, &binding) != nil || binding.Version != localStateVersion || binding.RepositoryIdentity != identity || binding.EnvironmentID == "" {
+	decoder := toml.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&binding) != nil || !validProjectBinding(binding, identity) {
 		return projectBinding{}, false, errors.New("existing Project Binding is malformed")
 	}
 	return binding, true, nil
@@ -291,6 +338,10 @@ func projectBindingName(identity string) string {
 	return hex.EncodeToString(digest[:]) + ".toml"
 }
 
+func validRepositoryIdentity(identity string) bool {
+	return strings.TrimSpace(identity) != "" && len(identity) <= maxRepositoryIdentitySize && !strings.ContainsAny(identity, "\r\n\x00")
+}
+
 type gitRunner func(context.Context, string, ...string) (string, error)
 
 func runGit(ctx context.Context, directory string, arguments ...string) (string, error) {
@@ -305,9 +356,11 @@ func runGit(ctx context.Context, directory string, arguments ...string) (string,
 }
 
 // canonicalRepositoryIdentity prefers origin's fetch URL so separate local
-// clones bind to one Environment. It normalizes URL scheme/host case, removes
-// credentials, query/fragment, trailing slash and a terminal .git. Repositories
-// without origin use the symlink-resolved absolute Git root prefixed by file://.
+// clones bind to one Environment. HTTP(S) credentials are stripped. SSH/SCP
+// usernames are identity-bearing, default ports are removed, host case is
+// folded, and ssh://host:22/path is equivalent to host:path. Query/fragment,
+// trailing slash and a terminal .git are removed. Repositories without origin
+// use the symlink-resolved absolute Git root prefixed by file://.
 func canonicalRepositoryIdentity(ctx context.Context, directory string, git gitRunner) (identity, root string, err error) {
 	if git == nil {
 		git = runGit
@@ -326,9 +379,16 @@ func canonicalRepositoryIdentity(ctx context.Context, directory string, git gitR
 		if err != nil {
 			return "", "", fmt.Errorf("resolve repository: origin URL: %w", err)
 		}
+		if !validRepositoryIdentity(identity) {
+			return "", "", errors.New("resolve repository: canonical origin identity is too large or unsafe")
+		}
 		return identity, root, nil
 	}
-	return "file://" + filepath.ToSlash(root), root, nil
+	identity = "file://" + filepath.ToSlash(root)
+	if !validRepositoryIdentity(identity) {
+		return "", "", errors.New("resolve repository: canonical Git root is too large or unsafe")
+	}
+	return identity, root, nil
 }
 
 func normalizeGitRemote(remote string) (string, error) {
@@ -343,13 +403,15 @@ func normalizeGitRemoteAt(remote, repositoryRoot string) (string, error) {
 	// Canonicalize the common SCP-style SSH form without treating a Windows
 	// drive letter as a host separator.
 	if !strings.Contains(remote, "://") {
+		user := ""
 		if at := strings.LastIndex(remote, "@"); at >= 0 {
+			user = remote[:at]
 			remote = remote[at+1:]
 		}
 		if separator := strings.IndexByte(remote, ':'); separator > 0 {
 			host := strings.ToLower(remote[:separator])
 			path := strings.TrimPrefix(remote[separator+1:], "/")
-			return finishRemoteIdentity(host, path)
+			return finishRemoteIdentity(user, host, path)
 		}
 		absolute, err := filepath.Abs(remote)
 		if repositoryRoot != "" && !filepath.IsAbs(remote) {
@@ -362,7 +424,11 @@ func normalizeGitRemoteAt(remote, repositoryRoot string) (string, error) {
 		if err != nil {
 			return "", errors.New("local origin path cannot be resolved")
 		}
-		return "file://" + filepath.ToSlash(filepath.Clean(resolved)), nil
+		identity := "file://" + filepath.ToSlash(filepath.Clean(resolved))
+		if !validRepositoryIdentity(identity) {
+			return "", errors.New("local origin identity is too large or unsafe")
+		}
+		return identity, nil
 	}
 	parsed, err := url.Parse(remote)
 	if err != nil {
@@ -380,19 +446,38 @@ func normalizeGitRemoteAt(remote, repositoryRoot string) (string, error) {
 		if err != nil || !filepath.IsAbs(resolved) {
 			return "", errors.New("file URL path cannot be resolved")
 		}
-		return "file://" + filepath.ToSlash(resolved), nil
+		identity := "file://" + filepath.ToSlash(resolved)
+		if !validRepositoryIdentity(identity) {
+			return "", errors.New("file URL identity is too large or unsafe")
+		}
+		return identity, nil
 	}
 	if parsed.Hostname() == "" {
 		return "", errors.New("URL is invalid")
 	}
 	host := strings.ToLower(parsed.Hostname())
-	if port := parsed.Port(); port != "" {
+	port := parsed.Port()
+	if isDefaultGitPort(strings.ToLower(parsed.Scheme), port) {
+		port = ""
+	}
+	if port != "" {
 		host += ":" + port
 	}
-	return finishRemoteIdentity(host, parsed.EscapedPath())
+	user := ""
+	if strings.EqualFold(parsed.Scheme, "ssh") || strings.EqualFold(parsed.Scheme, "git+ssh") {
+		if parsed.User != nil {
+			user = parsed.User.Username()
+		}
+	}
+	return finishRemoteIdentity(user, host, parsed.EscapedPath())
 }
 
-func finishRemoteIdentity(host, path string) (string, error) {
+func isDefaultGitPort(scheme, port string) bool {
+	return port != "" && ((scheme == "ssh" || scheme == "git+ssh") && port == "22" ||
+		scheme == "http" && port == "80" || scheme == "https" && port == "443" || scheme == "git" && port == "9418")
+}
+
+func finishRemoteIdentity(user, host, path string) (string, error) {
 	path, err := url.PathUnescape(path)
 	if err != nil {
 		return "", errors.New("URL path is invalid")
@@ -415,5 +500,16 @@ func finishRemoteIdentity(host, path string) (string, error) {
 	if len(filtered) == 0 {
 		return "", errors.New("URL repository path is invalid")
 	}
-	return "git://" + host + "/" + strings.Join(filtered, "/"), nil
+	authority := host
+	if user != "" {
+		if strings.ContainsAny(user, "\r\n\x00/:@") {
+			return "", errors.New("SSH user is invalid")
+		}
+		authority = url.User(user).String() + "@" + authority
+	}
+	identity := "git://" + authority + "/" + strings.Join(filtered, "/")
+	if !validRepositoryIdentity(identity) {
+		return "", errors.New("URL repository identity is too large or unsafe")
+	}
+	return identity, nil
 }

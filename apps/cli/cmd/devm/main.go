@@ -31,24 +31,26 @@ func run(ctx context.Context, arguments []string) error {
 }
 
 type cli struct {
-	output           io.Writer
-	errorOutput      io.Writer
-	input            io.Reader
-	clientID         string
-	controlPlaneURL  string
-	httpClient       *http.Client
-	now              func() time.Time
-	workingDirectory func() (string, error)
-	configDirectory  func() (string, error)
-	sshDirectory     func() (string, error)
-	newLoginFlow     func(string) (loginFlow, error)
-	newRefreshClient func(string) (tokenRefresher, error)
-	newAttempt       func() (string, error)
-	git              gitRunner
-	runSSHClient     sshClientRunner
-	wait             func(context.Context, time.Duration) error
-	stopPollInterval time.Duration
-	stopWaitTimeout  time.Duration
+	output             io.Writer
+	errorOutput        io.Writer
+	input              io.Reader
+	clientID           string
+	controlPlaneURL    string
+	httpClient         *http.Client
+	now                func() time.Time
+	workingDirectory   func() (string, error)
+	configDirectory    func() (string, error)
+	sshDirectory       func() (string, error)
+	newLoginFlow       func(string) (loginFlow, error)
+	newRefreshClient   func(string) (tokenRefresher, error)
+	newAttempt         func() (string, error)
+	git                gitRunner
+	runSSHClient       sshClientRunner
+	wait               func(context.Context, time.Duration) error
+	createPollInterval time.Duration
+	createWaitTimeout  time.Duration
+	stopPollInterval   time.Duration
+	stopWaitTimeout    time.Duration
 }
 
 func newCLI() cli {
@@ -79,12 +81,14 @@ func newCLI() cli {
 		newRefreshClient: func(clientID string) (tokenRefresher, error) {
 			return auth.NewRefreshClient(clientID)
 		},
-		newAttempt:       newCLIAttempt,
-		git:              runGit,
-		runSSHClient:     runOpenSSH,
-		wait:             waitForContext,
-		stopPollInterval: time.Second,
-		stopWaitTimeout:  60 * time.Second,
+		newAttempt:         newCLIAttempt,
+		git:                runGit,
+		runSSHClient:       runOpenSSH,
+		wait:               waitForContext,
+		createPollInterval: time.Second,
+		createWaitTimeout:  10 * time.Minute,
+		stopPollInterval:   time.Second,
+		stopWaitTimeout:    60 * time.Second,
 	}
 }
 

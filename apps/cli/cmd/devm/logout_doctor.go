@@ -8,9 +8,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/contracts"
+	"github.com/pelletier/go-toml/v2"
 )
 
 func (application cli) runLogout(ctx context.Context, arguments []string) error {
@@ -77,16 +80,39 @@ func (application cli) runDoctor(ctx context.Context, arguments []string) error 
 
 	var client lifecycleClient
 	var authOK bool
-	if configErr != nil || strings.TrimSpace(application.clientID) == "" || application.newRefreshClient == nil {
+	if configErr != nil || strings.TrimSpace(application.clientID) == "" || application.newRefreshClient == nil || application.now == nil {
 		results = append(results, doctorResult{"authentication", doctorFail, "login configuration is unavailable; set DEVM_WORKOS_CLIENT_ID and run `devm login`"})
 	} else {
 		var err error
-		client, err = application.lifecycleClient(ctx)
+		refresher, err := application.newRefreshClient(application.clientID)
+		if err == nil {
+			var expiresAt time.Time
+			var refreshed bool
+			var token string
+			if _, urlErr := secureControlPlaneURL(application.controlPlaneURL); urlErr != nil {
+				err = urlErr
+			} else {
+				token, expiresAt, refreshed, err = newTokenSession(configDirectory, refresher, application.now).freshAccessToken(ctx)
+			}
+			if err == nil {
+				api, apiErr := contracts.NewClientWithResponses(application.controlPlaneURL, contracts.WithHTTPClient(cloneProxyHTTPClient(application.httpClient)))
+				if apiErr != nil {
+					err = apiErr
+				} else {
+					client = lifecycleClient{api: api, token: token}
+				}
+			}
+			if err == nil {
+				authOK = true
+				detail := "access token valid until " + expiresAt.UTC().Format(time.RFC3339) + "; refresh not exercised"
+				if refreshed {
+					detail = "safe refresh exercised successfully; access token valid until " + expiresAt.UTC().Format(time.RFC3339)
+				}
+				results = append(results, doctorResult{"authentication", doctorPass, detail})
+			}
+		}
 		if err != nil {
 			results = append(results, doctorResult{"authentication", doctorFail, "session is missing or cannot be refreshed; run `devm login`"})
-		} else {
-			authOK = true
-			results = append(results, doctorResult{"authentication", doctorPass, "local session is present and refreshable"})
 		}
 	}
 	results = append(results, checkDoctorSSHInclude(configDirectory, sshDirectory, configErr, sshErr))
@@ -142,10 +168,96 @@ func checkDoctorLocalState(directory string, resolveErr error) doctorResult {
 	if err := requirePrivateDirectory(state, "local state"); err != nil {
 		return doctorResult{"local-state", doctorFail, "directory must be mode 0700"}
 	}
-	if _, err := newLocalStateStore(directory).ReadConfig(); err != nil {
-		return doctorResult{"local-state", doctorFail, "config.toml is unsafe or malformed; repair it with mode 0600"}
+	if info, err := state.root.Lstat("state.lock"); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			return doctorResult{"local-state", doctorFail, "state.lock is unsafe; repair it with mode 0600"}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return doctorResult{"local-state", doctorFail, "state.lock cannot be inspected safely"}
 	}
-	return doctorResult{"local-state", doctorPass, "private directory and config.toml are valid"}
+	configInfo, err := state.root.Lstat("config.toml")
+	configMissing := errors.Is(err, os.ErrNotExist)
+	if err != nil && !configMissing {
+		return doctorResult{"local-state", doctorFail, "config.toml cannot be inspected safely"}
+	}
+	if !configMissing && (!configInfo.Mode().IsRegular() || configInfo.Mode().Perm() != 0o600) {
+		return doctorResult{"local-state", doctorFail, "config.toml is unsafe; repair it with mode 0600"}
+	}
+	if !configMissing {
+		if _, err := newLocalStateStore(directory).ReadConfig(); err != nil {
+			return doctorResult{"local-state", doctorFail, "config.toml is unsafe or malformed; repair it with mode 0600"}
+		}
+	}
+	if err := checkDoctorProjectBindings(state); err != nil {
+		return doctorResult{"local-state", doctorFail, err.Error()}
+	}
+	if configMissing {
+		return doctorResult{"local-state", doctorWarn, "config.toml is absent; defaults will be created on first use"}
+	}
+	return doctorResult{"local-state", doctorPass, "private directory, config.toml, and Project Bindings are valid"}
+}
+
+var projectBindingFilePattern = regexp.MustCompile(`^[0-9a-f]{64}\.toml$`)
+
+func checkDoctorProjectBindings(state *anchoredDirectory) error {
+	projects, err := openAnchoredChild(state, "projects", false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("projects directory is unsafe; remove symlinks and use mode 0700")
+	}
+	defer projects.Close()
+	handle, err := projects.root.Open(".")
+	if err != nil {
+		return errors.New("projects directory cannot be read")
+	}
+	entries, err := handle.ReadDir(-1)
+	handle.Close()
+	if err != nil {
+		return errors.New("projects directory cannot be read")
+	}
+	for _, entry := range entries {
+		if entry.Name() == "bindings.lock" {
+			info, statErr := projects.root.Lstat(entry.Name())
+			if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+				return errors.New("bindings.lock is unsafe; repair it with mode 0600")
+			}
+			continue
+		}
+		if !projectBindingFilePattern.MatchString(entry.Name()) {
+			return errors.New("projects directory contains an unexpected entry")
+		}
+		content, info, readErr := projects.readRegular(entry.Name(), maxLocalStateFileSize)
+		if readErr != nil || info.Mode().Perm() != 0o600 {
+			return errors.New("a Project Binding is unsafe; repair it with mode 0600")
+		}
+		var binding projectBinding
+		decoder := toml.NewDecoder(bytes.NewReader(content))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&binding) != nil || !validProjectBinding(binding, binding.RepositoryIdentity) || projectBindingName(binding.RepositoryIdentity) != entry.Name() {
+			return errors.New("a Project Binding is malformed or stored under the wrong identity")
+		}
+	}
+	return nil
+}
+
+func checkDoctorManagedSSHConfig(configDirectory string) error {
+	state, err := openAnchoredDirectory(configDirectory, false, 0)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	managed, err := openAnchoredChild(state, "ssh", false)
+	if err != nil {
+		return err
+	}
+	defer managed.Close()
+	_, info, err := managed.readRegular("config", maxUserSSHConfigSize)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		return errors.New("managed SSH config is absent or unsafe")
+	}
+	return nil
 }
 
 func checkDoctorSSHInclude(configDirectory, sshDirectory string, configErr, sshErr error) doctorResult {
@@ -174,6 +286,9 @@ func checkDoctorSSHInclude(configDirectory, sshDirectory string, configErr, sshE
 	want := "Include " + argument
 	for _, line := range bytes.Split(content, []byte("\n")) {
 		if strings.TrimSpace(string(line)) == want {
+			if err := checkDoctorManagedSSHConfig(configDirectory); err != nil {
+				return doctorResult{"ssh-include", doctorFail, "managed Include target is absent or unsafe; run `devm ssh setup`"}
+			}
 			return doctorResult{"ssh-include", doctorPass, "primary SSH config includes devm's managed config"}
 		}
 	}
@@ -224,36 +339,48 @@ func doctorCurrentUser(ctx context.Context, client lifecycleClient) (contracts.U
 
 func doctorEnvironmentReadModels(environments []contracts.Environment, available bool) (doctorResult, doctorResult) {
 	if !available {
-		detail := "Environment read models are unavailable; restore control-plane access"
-		return doctorResult{"proxy-state", doctorFail, detail}, doctorResult{"guest-state", doctorFail, detail}
+		detail := "control-plane-derived observation unavailable; restore control-plane access"
+		return doctorResult{"proxy-observation", doctorFail, detail}, doctorResult{"guest-observation", doctorFail, detail}
 	}
 	if environments == nil {
-		detail := "GET /v1/environments failed; retry after control-plane recovery"
-		return doctorResult{"proxy-state", doctorFail, detail}, doctorResult{"guest-state", doctorFail, detail}
+		detail := "control-plane-derived observation unavailable because GET /v1/environments failed"
+		return doctorResult{"proxy-observation", doctorFail, detail}, doctorResult{"guest-observation", doctorFail, detail}
 	}
 	if len(environments) == 0 {
-		return doctorResult{"proxy-state", doctorWarn, "no Environment read models to inspect"},
-			doctorResult{"guest-state", doctorWarn, "no Runtime readiness state to inspect"}
+		return doctorResult{"proxy-observation", doctorWarn, "control-plane-derived only; no Environment exists and the proxy was not directly probed"},
+			doctorResult{"guest-observation", doctorWarn, "control-plane-derived only; no Runtime exists and the guest was not directly probed"}
 	}
-	activeOperations, ready, transitioning, runtimeErrors := 0, 0, 0, 0
+	activeOperations, ready, transitioning, runtimeErrors, degraded, blocked, unknown := 0, 0, 0, 0, 0, 0, 0
 	for _, environment := range environments {
 		if environment.ActiveOperationId != nil && *environment.ActiveOperationId != "" {
 			activeOperations++
 		}
 		if environment.Runtime == nil {
-			continue
+			// Health is still authoritative even when no Runtime projection exists.
+		} else {
+			switch environment.Runtime.Status {
+			case contracts.RuntimeStatusReady:
+				ready++
+			case contracts.RuntimeStatusError:
+				runtimeErrors++
+			case contracts.RuntimeStatusProvisioning, contracts.RuntimeStatusStarting,
+				contracts.RuntimeStatusStopping, contracts.RuntimeStatusReplacing:
+				transitioning++
+			}
 		}
-		switch environment.Runtime.Status {
-		case contracts.RuntimeStatusReady:
-			ready++
-		case contracts.RuntimeStatusError:
-			runtimeErrors++
-		case contracts.RuntimeStatusProvisioning, contracts.RuntimeStatusStarting,
-			contracts.RuntimeStatusStopping, contracts.RuntimeStatusReplacing:
-			transitioning++
+		switch environment.Health {
+		case contracts.EnvironmentHealthBlocked:
+			blocked++
+		case contracts.EnvironmentHealthDegraded:
+			degraded++
+		case contracts.EnvironmentHealthUnknown:
+			unknown++
+		case contracts.EnvironmentHealthHealthy:
+		default:
+			unknown++
 		}
 	}
-	proxy := doctorResult{"proxy-state", doctorPass, fmt.Sprintf("read models reachable; %d active Operation(s)", activeOperations)}
+	proxy := doctorResult{"proxy-observation", doctorPass, fmt.Sprintf("control-plane-derived only; proxy not directly probed; %d active Operation(s)", activeOperations)}
 	if activeOperations > 0 || transitioning > 0 {
 		proxy.level = doctorWarn
 		proxy.detail += "; wait for active transitions before connecting"
@@ -262,14 +389,25 @@ func doctorEnvironmentReadModels(environments []contracts.Environment, available
 		proxy.level = doctorFail
 		proxy.detail = fmt.Sprintf("%d Runtime(s) report error; inspect `devm status`", runtimeErrors)
 	}
-	guest := doctorResult{"guest-state", doctorWarn, "no Runtime currently reports ready; start or connect to an Environment"}
+	guest := doctorResult{"guest-observation", doctorWarn, "control-plane-derived only; guest not directly probed; no Runtime reports ready"}
 	if ready > 0 {
-		guest = doctorResult{"guest-state", doctorPass, fmt.Sprintf("%d Runtime(s) report ready through Environment read models", ready)}
+		guest = doctorResult{"guest-observation", doctorPass, fmt.Sprintf("control-plane-derived only; guest not directly probed; %d Runtime(s) report ready", ready)}
 	}
 	if runtimeErrors > 0 {
 		guest = doctorResult{"guest-state", doctorFail, fmt.Sprintf("%d Runtime(s) report error; inspect `devm status`", runtimeErrors)}
 	} else if transitioning > 0 && ready == 0 {
-		guest = doctorResult{"guest-state", doctorWarn, fmt.Sprintf("%d Runtime(s) are transitioning; retry after the active Operation", transitioning)}
+		guest = doctorResult{"guest-observation", doctorWarn, fmt.Sprintf("control-plane-derived only; %d Runtime(s) are transitioning", transitioning)}
+	}
+	if blocked > 0 {
+		proxy = doctorResult{"proxy-observation", doctorFail, fmt.Sprintf("control-plane-derived: %d Environment(s) are blocked; proxy not directly probed", blocked)}
+		guest = doctorResult{"guest-observation", doctorFail, fmt.Sprintf("control-plane-derived: %d Environment(s) are blocked; guest not directly probed", blocked)}
+	} else if runtimeErrors > 0 {
+		proxy = doctorResult{"proxy-observation", doctorFail, fmt.Sprintf("control-plane-derived: %d Runtime(s) report error; proxy not directly probed; inspect `devm status`", runtimeErrors)}
+		guest = doctorResult{"guest-observation", doctorFail, fmt.Sprintf("control-plane-derived: %d Runtime(s) report error; guest not directly probed; inspect `devm status`", runtimeErrors)}
+	} else if degraded > 0 || unknown > 0 {
+		detail := fmt.Sprintf("control-plane-derived: %d degraded and %d unknown Environment(s); not directly probed", degraded, unknown)
+		proxy = doctorResult{"proxy-observation", doctorWarn, detail}
+		guest = doctorResult{"guest-observation", doctorWarn, detail}
 	}
 	return proxy, guest
 }

@@ -12,7 +12,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type tokenFileLock struct{ file *os.File }
+type tokenFileLock struct {
+	directory *anchoredDirectory
+	file      *os.File
+	name      string
+	info      os.FileInfo
+}
 
 func acquireTokenFileLock(ctx context.Context, directory *anchoredDirectory) (*tokenFileLock, error) {
 	return acquirePrivateFileLock(ctx, directory, "tokens.lock")
@@ -43,7 +48,11 @@ func acquirePrivateFileLock(ctx context.Context, directory *anchoredDirectory, n
 	for {
 		err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
-			return &tokenFileLock{file: file}, nil
+			lock := &tokenFileLock{directory: directory, file: file, name: name, info: opened}
+			if !lock.StillCurrent() {
+				return closeOnError(errors.New("lock file changed before acquisition completed"))
+			}
+			return lock, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
 			return closeOnError(err)
@@ -54,6 +63,21 @@ func acquirePrivateFileLock(ctx context.Context, directory *anchoredDirectory, n
 		case <-ticker.C:
 		}
 	}
+}
+
+// StillCurrent verifies that the pathname still names the inode on which this
+// process holds flock. Callers recheck immediately before each protected
+// mutation, matching the SSH include edit discipline.
+func (lock *tokenFileLock) StillCurrent() bool {
+	if lock == nil || lock.directory == nil || lock.file == nil || lock.info == nil {
+		return false
+	}
+	opened, err := lock.file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(opened, lock.info) {
+		return false
+	}
+	current, err := lock.directory.root.Lstat(lock.name)
+	return err == nil && current.Mode().IsRegular() && os.SameFile(opened, current)
 }
 
 func (lock *tokenFileLock) Close() error {

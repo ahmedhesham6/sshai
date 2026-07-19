@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -26,7 +27,7 @@ func TestCanonicalRepositoryIdentityUsesNormalizedOriginOrResolvedRoot(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity != "git://github.com/Owner/Repo" || gotRoot != root {
+	if identity != "git://Git@github.com/Owner/Repo" || gotRoot != root {
 		t.Fatalf("canonical repository = identity:%q root:%q", identity, gotRoot)
 	}
 
@@ -47,6 +48,40 @@ func TestCanonicalRepositoryIdentityUsesNormalizedOriginOrResolvedRoot(t *testin
 	identity, err = normalizeGitRemoteAt("./origin.git", root)
 	if err != nil || identity != "file://"+filepath.ToSlash(localRemote) {
 		t.Fatalf("relative local origin = %q, %v", identity, err)
+	}
+}
+
+func TestNormalizeGitRemoteCollapsesEquivalentFormsWithoutCollidingSSHUsers(t *testing.T) {
+	for _, remote := range []string{
+		"git@EXAMPLE.test:owner/repo.git",
+		"ssh://git@example.test:22/owner/repo",
+		"git+ssh://git@Example.Test/owner//repo.git/?ignored=no#fragment",
+	} {
+		identity, err := normalizeGitRemote(remote)
+		if err != nil || identity != "git://git@example.test/owner/repo" {
+			t.Fatalf("normalizeGitRemote(%q) = %q, %v", remote, identity, err)
+		}
+	}
+	alice, err := normalizeGitRemote("alice@example.test:owner/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := normalizeGitRemote("ssh://bob@example.test:22/owner/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alice == bob || alice != "git://alice@example.test/owner/repo" || bob != "git://bob@example.test/owner/repo" {
+		t.Fatalf("SSH user identities collided: alice=%q bob=%q", alice, bob)
+	}
+	httpsIdentity, err := normalizeGitRemote("https://token:secret@EXAMPLE.test:443/owner/repo.git?access_token=secret#ignored")
+	if err != nil || httpsIdentity != "git://example.test/owner/repo" || strings.Contains(httpsIdentity, "secret") || strings.Contains(httpsIdentity, "token") {
+		t.Fatalf("HTTPS credential normalization = %q, %v", httpsIdentity, err)
+	}
+	if _, err := normalizeGitRemote("token:secret@example.test:owner/repo.git"); err == nil {
+		t.Fatal("SCP-form user containing credential syntax was accepted")
+	}
+	if _, err := normalizeGitRemote("ssh://git@example.test/" + strings.Repeat("hostile/", maxRepositoryIdentitySize)); err == nil {
+		t.Fatal("oversized repository identity was accepted")
 	}
 }
 
@@ -85,6 +120,9 @@ func TestLocalStateStorePrivatePermissionsConcurrentUpdatesAndBindings(t *testin
 	assertMode(t, filepath.Join(configDirectory, "config.toml"), 0o600)
 
 	identity := "git://example.test/owner/repository"
+	if err := store.SetProjectSeed(context.Background(), identity, "seed_01"); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.BindProject(context.Background(), identity, "env_01"); err != nil {
 		t.Fatal(err)
 	}
@@ -139,4 +177,30 @@ func TestLocalStateStoreRejectsSymlinksAndUnsafeModes(t *testing.T) {
 			t.Fatal("open config permissions were accepted")
 		}
 	})
+}
+
+func TestPrivateFileLockRejectsReplacedInodeAfterFlock(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := openAnchoredDirectory(root, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	lock, err := acquirePrivateFileLock(context.Background(), directory, "state.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := os.Rename(filepath.Join(root, "state.lock"), filepath.Join(root, "old.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "state.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if lock.StillCurrent() {
+		t.Fatal("lock replacement was not detected before mutation")
+	}
 }

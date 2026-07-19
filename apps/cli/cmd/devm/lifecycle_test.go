@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -49,6 +51,8 @@ func newLifecycleFixture(t *testing.T, server *httptest.Server) lifecycleFixture
 		sshDirectory:     func() (string, error) { return sshDirectory, nil },
 		newRefreshClient: func(string) (tokenRefresher, error) { return &singleUseRefreshFake{}, nil },
 		git:              runGit, runSSHClient: runOpenSSH, wait: waitForContext,
+		newAttempt:         func() (string, error) { return "fixture-nonce", nil },
+		createPollInterval: time.Millisecond, createWaitTimeout: time.Second,
 		stopPollInterval: time.Millisecond, stopWaitTimeout: time.Second,
 	}
 	return lifecycleFixture{application: application, configDirectory: configDirectory, sshDirectory: sshDirectory, accessToken: accessToken}
@@ -80,6 +84,10 @@ func TestBareDevmBoundAndUnboundThenHandsOffToGeneratedAlias(t *testing.T) {
 						t.Errorf("bound method = %s", request.Method)
 					}
 					_ = json.NewEncoder(response).Encode(environment)
+				case "/v1/operations/op_create":
+					operation := lifecycleOperation("op_create", contracts.OperationStatusSucceeded)
+					operation.Type = "environment.create"
+					_ = json.NewEncoder(response).Encode(operation)
 				case "/v1/environments":
 					switch request.Method {
 					case http.MethodGet:
@@ -98,7 +106,9 @@ func TestBareDevmBoundAndUnboundThenHandsOffToGeneratedAlias(t *testing.T) {
 							t.Errorf("create body = %#v", body)
 						}
 						response.WriteHeader(http.StatusAccepted)
-						_ = json.NewEncoder(response).Encode(contracts.EnvironmentOperation{Environment: environment, Operation: lifecycleOperation("op_create", contracts.OperationStatusQueued)})
+						operation := lifecycleOperation("op_create", contracts.OperationStatusQueued)
+						operation.Type = "environment.create"
+						_ = json.NewEncoder(response).Encode(contracts.EnvironmentOperation{Environment: environment, Operation: operation})
 					default:
 						http.Error(response, "method", http.StatusMethodNotAllowed)
 					}
@@ -119,17 +129,19 @@ func TestBareDevmBoundAndUnboundThenHandsOffToGeneratedAlias(t *testing.T) {
 			if err := os.Mkdir(repositoryRoot, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			identity := "git://example.test/owner/repo"
+			identity := "git://git@example.test/owner/repo"
 			fixture.application.workingDirectory = func() (string, error) { return repositoryRoot, nil }
 			fixture.application.git = lifecycleGitFake(repositoryRoot, "git@example.test:owner/repo.git")
 			store := newLocalStateStore(fixture.configDirectory)
+			if err := store.SetProjectSeed(context.Background(), identity, "project-seed-01"); err != nil {
+				t.Fatal(err)
+			}
 			if test.bound {
 				if err := store.BindProject(context.Background(), identity, "env_01"); err != nil {
 					t.Fatal(err)
 				}
 			} else if err := store.UpdateConfig(context.Background(), func(config *localConfig) error {
 				config.ProfileVersionID = "profile-version-01"
-				config.ProjectSeedID = "project-seed-01"
 				config.SSHKeyIDs = []string{"key_01"}
 				return nil
 			}); err != nil {
@@ -179,6 +191,253 @@ func TestBareDevmUnauthenticatedPointsToLogin(t *testing.T) {
 	}
 }
 
+func TestBareDevmFirstRunSelfProvisionsRequiredReferences(t *testing.T) {
+	var token string
+	var key *contracts.SSHKey
+	var created bool
+	var seedRepositoryURL string
+	var uploads atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.URL.Path, "/storage/") {
+			if request.Header.Get("Authorization") != "" {
+				t.Error("storage upload received the bearer token")
+			}
+			content, err := io.ReadAll(request.Body)
+			if err != nil || request.ContentLength != int64(len(content)) {
+				t.Errorf("upload content length = %d/%d error=%v", request.ContentLength, len(content), err)
+			}
+			uploads.Add(1)
+			response.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if request.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(response, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		environment := lifecycleEnvironment("env_first", "repo-first", contracts.RuntimeStatusReady)
+		switch request.URL.Path {
+		case "/v1/ssh-keys":
+			if request.Method == http.MethodPost {
+				var body contracts.CreateSSHKeyJSONRequestBody
+				_ = json.NewDecoder(request.Body).Decode(&body)
+				key = &contracts.SSHKey{Id: "key_first", Label: body.Label, Algorithm: contracts.SshEd25519, PublicKey: body.PublicKey}
+				_, key.Fingerprint, _ = parseEd25519PublicKey([]byte(body.PublicKey))
+				response.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(response).Encode(key)
+				return
+			}
+			items := []contracts.SSHKey{}
+			if key != nil {
+				items = append(items, *key)
+			}
+			_ = json.NewEncoder(response).Encode(contracts.SSHKeyPage{Items: items})
+		case "/v1/profiles":
+			if request.Method == http.MethodPost {
+				response.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(response).Encode(contracts.ProfileSummary{Id: "profile_first", Name: "Default", Slug: "default"})
+				return
+			}
+			_ = json.NewEncoder(response).Encode(contracts.ProfilePage{Items: []contracts.ProfileSummary{}})
+		case "/v1/profiles/profile_first/versions":
+			var body contracts.PublishProfileVersionJSONRequestBody
+			_ = json.NewDecoder(request.Body).Decode(&body)
+			if body.CapsuleRefs == nil || len(body.CapsuleRefs) != 0 {
+				t.Errorf("minimal Profile Version refs = %#v", body.CapsuleRefs)
+			}
+			response.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(response).Encode(contracts.ProfileVersion{Id: "profile_version_first", ProfileId: "profile_first", CapsuleRefs: []contracts.CapsuleRef{}})
+		case "/v1/uploads":
+			var body contracts.CreateUploadIntentJSONRequestBody
+			_ = json.NewDecoder(request.Body).Decode(&body)
+			response.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"uploadId": "upload_" + string(body.Kind), "url": server.URL + "/storage/" + string(body.Kind),
+				"expiresAt": time.Now().Add(time.Hour), "requiredHeaders": map[string]string{"Content-Length": fmt.Sprint(body.SizeBytes)},
+			})
+		case "/v1/project-seeds":
+			var body contracts.CreateProjectSeedJSONRequestBody
+			_ = json.NewDecoder(request.Body).Decode(&body)
+			seedRepositoryURL = body.RepositoryUrl
+			if strings.Contains(body.RepositoryUrl, "token") || strings.Contains(body.RepositoryUrl, "secret") {
+				t.Errorf("Project Seed repository URL leaked credentials: %q", body.RepositoryUrl)
+			}
+			response.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(response).Encode(map[string]string{"id": "seed_first", "digest": body.Digest})
+		case "/v1/environments":
+			if request.Method == http.MethodPost {
+				var body contracts.CreateEnvironmentJSONRequestBody
+				_ = json.NewDecoder(request.Body).Decode(&body)
+				if body.ProfileVersionId != "profile_version_first" || body.ProjectSeedId != "seed_first" || len(body.SshKeyIds) != 1 || body.SshKeyIds[0] != "key_first" {
+					t.Errorf("first-run create body = %#v", body)
+				}
+				created = true
+				operation := lifecycleOperation("op_first", contracts.OperationStatusQueued)
+				operation.EnvironmentId, operation.Type = "env_first", "environment.create"
+				response.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(response).Encode(contracts.EnvironmentOperation{Environment: environment, Operation: operation})
+				return
+			}
+			items := []contracts.Environment{}
+			if created {
+				items = append(items, environment)
+			}
+			_ = json.NewEncoder(response).Encode(contracts.EnvironmentPage{Items: items})
+		case "/v1/operations/op_first":
+			operation := lifecycleOperation("op_first", contracts.OperationStatusSucceeded)
+			operation.EnvironmentId, operation.Type = "env_first", "environment.create"
+			_ = json.NewEncoder(response).Encode(operation)
+		case "/v1/environments/env_first":
+			_ = json.NewEncoder(response).Encode(environment)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	fixture := newLifecycleFixture(t, server)
+	token = fixture.accessToken
+	repository := filepath.Join(t.TempDir(), "repo")
+	if err := os.Mkdir(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, arguments := range [][]string{{"init"}, {"config", "user.email", "test@example.test"}, {"config", "user.name", "Test"}} {
+		command := exec.Command("git", append([]string{"-C", repository}, arguments...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", arguments, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("first run\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, arguments := range [][]string{{"add", "README.md"}, {"commit", "-m", "initial"}, {"remote", "add", "origin", "https://token:secret@example.test/owner/repo.git?access_token=secret#credential"}} {
+		command := exec.Command("git", append([]string{"-C", repository}, arguments...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", arguments, err, output)
+		}
+	}
+	fixture.application.workingDirectory = func() (string, error) { return repository, nil }
+	var alias string
+	fixture.application.runSSHClient = func(_ context.Context, got string, _ io.Reader, _, _ io.Writer) error { alias = got; return nil }
+	var output, errorOutput bytes.Buffer
+	fixture.application.output, fixture.application.errorOutput = &output, &errorOutput
+	if err := fixture.application.runBare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if alias != "repo-first" || !created || uploads.Load() != 4 || seedRepositoryURL != "https://example.test/owner/repo.git" {
+		t.Fatalf("first run alias=%q created=%t uploads=%d repository=%q", alias, created, uploads.Load(), seedRepositoryURL)
+	}
+	config, err := newLocalStateStore(fixture.configDirectory).ReadConfig()
+	if err != nil || config.ProfileVersionID != "profile_version_first" || len(config.SSHKeyIDs) != 1 {
+		t.Fatalf("first-run config = %#v error=%v", config, err)
+	}
+	identity := "git://example.test/owner/repo"
+	binding, bound, err := newLocalStateStore(fixture.configDirectory).ReadProject(identity)
+	if err != nil || !bound || binding.ProjectSeedID != "seed_first" || binding.EnvironmentID != "env_first" {
+		t.Fatalf("first-run binding = %#v bound=%t error=%v", binding, bound, err)
+	}
+	assertLifecycleOutputSafe(t, output.String()+errorOutput.String(), fixture.accessToken)
+}
+
+func TestBareDevmResumesBoundCreateBeforeSSHWithoutPostingAnotherCreate(t *testing.T) {
+	var token, publicKey, fingerprint string
+	var environmentGets atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(response, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		environment := lifecycleEnvironment("env_01", "repo-dev", contracts.RuntimeStatusReady)
+		switch request.URL.Path {
+		case "/v1/environments/env_01":
+			if environmentGets.Add(1) == 1 {
+				active := "op_create"
+				environment.Lifecycle = contracts.Creating
+				environment.ActiveOperationId = &active
+			}
+			_ = json.NewEncoder(response).Encode(environment)
+		case "/v1/operations/op_create":
+			operation := lifecycleOperation("op_create", contracts.OperationStatusSucceeded)
+			operation.Type = "environment.create"
+			_ = json.NewEncoder(response).Encode(operation)
+		case "/v1/environments":
+			if request.Method == http.MethodPost {
+				t.Errorf("resume raced a second create")
+			}
+			_ = json.NewEncoder(response).Encode(contracts.EnvironmentPage{Items: []contracts.Environment{environment}})
+		case "/v1/ssh-keys":
+			_ = json.NewEncoder(response).Encode(contracts.SSHKeyPage{Items: []contracts.SSHKey{{
+				Id: "key_01", Label: "id_test", Algorithm: contracts.SshEd25519, PublicKey: publicKey, Fingerprint: fingerprint,
+			}}})
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	fixture := newLifecycleFixture(t, server)
+	token = fixture.accessToken
+	publicKey, fingerprint = writeEd25519KeyPair(t, fixture.sshDirectory, "id_test", "")
+	root := filepath.Join(t.TempDir(), "repo")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity := "git://git@example.test/owner/repo"
+	fixture.application.workingDirectory = func() (string, error) { return root, nil }
+	fixture.application.git = lifecycleGitFake(root, "git@example.test:owner/repo.git")
+	store := newLocalStateStore(fixture.configDirectory)
+	if err := store.SetProjectSeed(context.Background(), identity, "seed_01"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindProject(context.Background(), identity, "env_01"); err != nil {
+		t.Fatal(err)
+	}
+	var alias string
+	fixture.application.runSSHClient = func(_ context.Context, got string, _ io.Reader, _, _ io.Writer) error { alias = got; return nil }
+	if err := fixture.application.runBare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if alias != "repo-dev" || environmentGets.Load() < 2 {
+		t.Fatalf("resume result alias=%q environment GETs=%d", alias, environmentGets.Load())
+	}
+}
+
+func TestCreateEnvironmentRetriesTypedNameConflictWithIdentityHash(t *testing.T) {
+	var names, keys []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var body contracts.CreateEnvironmentJSONRequestBody
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		names = append(names, body.Name)
+		keys = append(keys, request.Header.Get("Idempotency-Key"))
+		response.Header().Set("Content-Type", "application/json")
+		if len(names) == 1 {
+			response.WriteHeader(http.StatusConflict)
+			_, _ = response.Write([]byte(`{"error":{"code":"ENVIRONMENT_NAME_CONFLICT","message":"conflict"},"requestId":"request_01"}`))
+			return
+		}
+		operation := lifecycleOperation("op_create", contracts.OperationStatusQueued)
+		operation.Type = "environment.create"
+		response.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(response).Encode(contracts.EnvironmentOperation{
+			Environment: lifecycleEnvironment("env_01", "repo-dev", contracts.RuntimeStatusReady), Operation: operation,
+		})
+	}))
+	defer server.Close()
+	api, err := contracts.NewClientWithResponses(server.URL, contracts.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := contracts.CreateEnvironmentJSONRequestBody{Name: "repo", AutoStopPolicy: contracts.AutoStopPolicy{Mode: contracts.AutoStopPolicyModeManual}}
+	if _, err := createLifecycleEnvironment(context.Background(), lifecycleClient{api: api, token: "safe"}, "git://alice@example.test/owner/repo", body); err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 || names[0] != "repo" || names[1] != conflictEnvironmentName("repo", "git://alice@example.test/owner/repo") || keys[0] == keys[1] {
+		t.Fatalf("conflict retry names=%#v keys=%#v", names, keys)
+	}
+}
+
 func TestStatusComposesEnvironmentOperationBillingAndJSON(t *testing.T) {
 	active := "op_01"
 	environment := lifecycleEnvironment("env_01", "repo-dev", contracts.RuntimeStatusReady)
@@ -211,7 +470,7 @@ func TestStatusComposesEnvironmentOperationBillingAndJSON(t *testing.T) {
 		check func(*testing.T, string)
 	}{
 		{name: "table", args: []string{"status", "--environment", "env_01"}, check: func(t *testing.T, output string) {
-			for _, want := range []string{"Runtime\tready", "Auto-stop\twhen_fully_idle, 300s grace", "environment.stop (running)", "987 (active)"} {
+			for _, want := range []string{"Runtime\tready", "Auto-stop\twhen_fully_idle, 300s grace", "environment.stop (running)", "Activity\tnot exposed by API yet", "987 (active)"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("status output %q lacks %q", output, want)
 				}
@@ -219,7 +478,7 @@ func TestStatusComposesEnvironmentOperationBillingAndJSON(t *testing.T) {
 		}},
 		{name: "json", args: []string{"status", "--environment", "env_01", "--json"}, check: func(t *testing.T, output string) {
 			var result statusResult
-			if err := json.Unmarshal([]byte(output), &result); err != nil || result.Environment.Id != "env_01" || result.Operation == nil || result.Billing.CreditBalance != 987 {
+			if err := json.Unmarshal([]byte(output), &result); err != nil || result.Environment.Id != "env_01" || result.Operation == nil || result.Billing.CreditBalance != 987 || result.Activity != "not exposed by API yet" {
 				t.Fatalf("status JSON = %#v error:%v", result, err)
 			}
 		}},
@@ -236,6 +495,30 @@ func TestStatusComposesEnvironmentOperationBillingAndJSON(t *testing.T) {
 	}
 }
 
+func TestStatusRejectsOperationFromAnotherEnvironment(t *testing.T) {
+	active := "op_01"
+	environment := lifecycleEnvironment("env_01", "repo", contracts.RuntimeStatusReady)
+	environment.ActiveOperationId = &active
+	operation := lifecycleOperation(active, contracts.OperationStatusRunning)
+	operation.EnvironmentId = "env_other"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v1/environments/env_01":
+			_ = json.NewEncoder(response).Encode(environment)
+		case "/v1/operations/op_01":
+			_ = json.NewEncoder(response).Encode(operation)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	fixture := newLifecycleFixture(t, server)
+	if err := fixture.application.runStatus(context.Background(), []string{"--environment", "env_01", "--json"}); err == nil || !strings.Contains(err.Error(), "another Environment") {
+		t.Fatalf("mismatched status Operation error = %v", err)
+	}
+}
+
 func TestStopPollsToTerminalAndNoWaitSkipsPolling(t *testing.T) {
 	for _, noWait := range []bool{false, true} {
 		t.Run(map[bool]string{false: "poll", true: "no-wait"}[noWait], func(t *testing.T) {
@@ -247,16 +530,14 @@ func TestStopPollsToTerminalAndNoWaitSkipsPolling(t *testing.T) {
 				}
 				response.Header().Set("Content-Type", "application/json")
 				switch request.URL.Path {
+				case "/v1/environments/env_01":
+					_ = json.NewEncoder(response).Encode(lifecycleEnvironment("env_01", "repo-dev", contracts.RuntimeStatusReady))
 				case "/v1/environments/env_01/stop":
 					if request.Method != http.MethodPost {
 						t.Errorf("stop method = %s", request.Method)
 					}
 					key := request.Header.Get("Idempotency-Key")
-					if idempotency == "" {
-						idempotency = key
-					} else if key != idempotency {
-						t.Errorf("nondeterministic idempotency = %q / %q", idempotency, key)
-					}
+					idempotency = key
 					response.WriteHeader(http.StatusAccepted)
 					_ = json.NewEncoder(response).Encode(contracts.EnvironmentOperation{Operation: lifecycleOperation("op_stop", contracts.OperationStatusRunning)})
 				case "/v1/operations/op_stop":
@@ -283,11 +564,43 @@ func TestStopPollsToTerminalAndNoWaitSkipsPolling(t *testing.T) {
 			if noWait {
 				wantPolls = 0
 			}
-			if polls.Load() != wantPolls || idempotency != deterministicKey("environment-stop", "env_01") {
+			wantKey := deterministicKey("environment-stop", "env_01\x00runtime_01\x00fixture-nonce")
+			if polls.Load() != wantPolls || idempotency != wantKey {
 				t.Fatalf("stop polls:%d key:%q", polls.Load(), idempotency)
 			}
 			assertLifecycleOutputSafe(t, output.String(), fixture.accessToken)
 		})
+	}
+}
+
+func TestStopUsesFreshNoncePerInvocationAndCurrentRuntime(t *testing.T) {
+	var keys []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v1/environments/env_01":
+			environment := lifecycleEnvironment("env_01", "repo", contracts.RuntimeStatusReady)
+			environment.Runtime.Id = "runtime_current"
+			_ = json.NewEncoder(response).Encode(environment)
+		case "/v1/environments/env_01/stop":
+			keys = append(keys, request.Header.Get("Idempotency-Key"))
+			response.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(response).Encode(contracts.EnvironmentOperation{Operation: lifecycleOperation("op_stop", contracts.OperationStatusQueued)})
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	fixture := newLifecycleFixture(t, server)
+	var nonce atomic.Int32
+	fixture.application.newAttempt = func() (string, error) { return fmt.Sprintf("nonce-%d", nonce.Add(1)), nil }
+	for range 2 {
+		if err := fixture.application.runStop(context.Background(), []string{"--environment", "env_01", "--no-wait"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(keys) != 2 || keys[0] == keys[1] || keys[0] != deterministicKey("environment-stop", "env_01\x00runtime_current\x00nonce-1") {
+		t.Fatalf("stop invocation keys = %#v", keys)
 	}
 }
 
@@ -347,7 +660,7 @@ func TestDoctorPassesAllChecksFromLocalAndEnvironmentReadModels(t *testing.T) {
 	if strings.Count(output.String(), "pass\t") != 7 {
 		t.Fatalf("doctor output = %q", output.String())
 	}
-	for _, check := range []string{"local-state", "authentication", "ssh-include", "ssh-key", "control-plane", "proxy-state", "guest-state"} {
+	for _, check := range []string{"local-state", "authentication", "ssh-include", "ssh-key", "control-plane", "proxy-observation", "guest-observation"} {
 		if !strings.Contains(output.String(), "\t"+check+"\t") {
 			t.Fatalf("doctor output lacks %s: %q", check, output.String())
 		}
@@ -378,6 +691,16 @@ func TestDoctorChecksWarnAndFailWithActionableClientOwnedText(t *testing.T) {
 		if result := checkDoctorSSHInclude(root, link, nil, nil); result.level != doctorFail {
 			t.Fatalf("unsafe SSH include check = %#v", result)
 		}
+		state := filepath.Join(root, "state")
+		if err := os.Mkdir(state, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(outside, "lock"), filepath.Join(state, "state.lock")); err != nil {
+			t.Fatal(err)
+		}
+		if result := checkDoctorLocalState(state, nil); result.level != doctorFail {
+			t.Fatalf("unsafe state lock check = %#v", result)
+		}
 	})
 	t.Run("read model outcomes", func(t *testing.T) {
 		proxy, guest := doctorEnvironmentReadModels([]contracts.Environment{}, true)
@@ -392,6 +715,12 @@ func TestDoctorChecksWarnAndFailWithActionableClientOwnedText(t *testing.T) {
 		proxy, guest = doctorEnvironmentReadModels(nil, false)
 		if proxy.level != doctorFail || guest.level != doctorFail {
 			t.Fatalf("unavailable read models = %#v %#v", proxy, guest)
+		}
+		invalidHealth := lifecycleEnvironment("env_02", "repo", contracts.RuntimeStatusReady)
+		invalidHealth.Health = ""
+		proxy, guest = doctorEnvironmentReadModels([]contracts.Environment{invalidHealth}, true)
+		if proxy.level == doctorPass || guest.level == doctorPass {
+			t.Fatalf("invalid health produced a pass = %#v %#v", proxy, guest)
 		}
 	})
 	t.Run("authentication and control plane failures", func(t *testing.T) {

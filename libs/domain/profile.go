@@ -202,9 +202,6 @@ func publishProfileVersion(snapshot ProfileVersionSnapshot) (ProfileVersion, err
 // ValidateCapsuleRefs validates the ordered Capsule Ref composition of a
 // Profile Version without requiring a Profile aggregate.
 func ValidateCapsuleRefs(refs []CapsuleRef) error {
-	if len(refs) == 0 {
-		return errors.New("Capsule Refs are required")
-	}
 	seenRefs := make(map[string]struct{}, len(refs))
 	for index, ref := range refs {
 		if err := validateCapsuleRef(ref); err != nil {

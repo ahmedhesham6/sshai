@@ -99,6 +99,12 @@ func (application cli) runBare(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("resolve bound Environment: %w", err)
 		}
+		if environment.Lifecycle == contracts.Creating {
+			environment, err = application.resumeEnvironmentCreate(ctx, client, environment)
+			if err != nil {
+				return err
+			}
+		}
 	} else {
 		if err := store.EnsureConfig(ctx); err != nil {
 			return err
@@ -107,34 +113,58 @@ func (application cli) runBare(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if config.ProfileVersionID == "" || config.ProjectSeedID == "" || len(config.SSHKeyIDs) == 0 {
-			return errors.New("create Environment: config.toml must set profile_version_id, project_seed_id, and at least one ssh_key_ids entry")
+		if len(config.SSHKeyIDs) == 0 {
+			config.SSHKeyIDs, err = application.ensureLifecycleSSHKeyIDs(ctx, client)
+			if err != nil {
+				return err
+			}
+			if err := store.UpdateConfig(ctx, func(current *localConfig) error {
+				current.SSHKeyIDs = append([]string(nil), config.SSHKeyIDs...)
+				return nil
+			}); err != nil {
+				return fmt.Errorf("save SSH key selection: %w", err)
+			}
+		}
+		if config.ProfileVersionID == "" {
+			config.ProfileVersionID, err = ensureLifecycleProfileVersion(ctx, client)
+			if err != nil {
+				return err
+			}
+			if err := store.UpdateConfig(ctx, func(current *localConfig) error {
+				current.ProfileVersionID = config.ProfileVersionID
+				return nil
+			}); err != nil {
+				return fmt.Errorf("save Profile Version selection: %w", err)
+			}
+		}
+		if binding.ProjectSeedID == "" {
+			binding.ProjectSeedID, err = application.ensureLifecycleProjectSeed(ctx, client, root, identity, store)
+			if err != nil {
+				return err
+			}
 		}
 		body := contracts.CreateEnvironmentJSONRequestBody{
 			Name: repositoryEnvironmentName(root), Region: config.DefaultRegion, RuntimePreset: config.RuntimePreset,
-			ProfileVersionId: config.ProfileVersionID, ProjectSeedId: config.ProjectSeedID,
+			ProfileVersionId: config.ProfileVersionID, ProjectSeedId: binding.ProjectSeedID,
 			SshKeyIds: append([]string(nil), config.SSHKeyIDs...),
 			AutoStopPolicy: contracts.AutoStopPolicy{
 				Mode: contracts.AutoStopPolicyMode(config.AutoStopMode), GracePeriodSeconds: config.AutoStopGracePeriodSecs,
 			},
 		}
-		idempotencyKey := deterministicKey("environment-create", identity)
-		requestContext, cancel := context.WithTimeout(ctx, lifecycleRequestTimeout)
-		response, requestErr := client.api.CreateEnvironmentWithResponse(requestContext,
-			&contracts.CreateEnvironmentParams{IdempotencyKey: idempotencyKey}, body, client.editor())
-		cancel()
-		if requestErr != nil {
-			return lifecycleUnavailable(ctx, "create Environment", requestErr)
+		response, err := createLifecycleEnvironment(ctx, client, identity, body)
+		if err != nil {
+			return err
 		}
-		if response.StatusCode() != http.StatusAccepted || response.JSON202 == nil || response.JSON202.Environment.Id == "" {
-			return fmt.Errorf("create Environment: control plane returned HTTP %d", response.StatusCode())
-		}
-		environment = response.JSON202.Environment
+		environment = response.Environment
 		if err := store.BindProject(ctx, identity, environment.Id); err != nil {
 			return fmt.Errorf("save Project Binding: %w", err)
 		}
+		environment, err = application.pollEnvironmentCreate(ctx, client, response.Operation)
+		if err != nil {
+			return err
+		}
 	}
-	if environment.Lifecycle == contracts.Deleted || environment.Id == "" || !sshIdentifierPattern.MatchString(environment.Slug) {
+	if environment.Lifecycle != contracts.Active || environment.Id == "" || !sshIdentifierPattern.MatchString(environment.Slug) {
 		return errors.New("connect to Environment: control plane returned invalid Environment identity")
 	}
 	if err := application.ensureSSHSetup(ctx); err != nil {
@@ -147,6 +177,9 @@ func (application cli) runBare(ctx context.Context) error {
 }
 
 func (application cli) ensureSSHSetup(ctx context.Context) error {
+	if application.newRefreshClient == nil || application.configDirectory == nil || application.sshDirectory == nil {
+		return errors.New("configure SSH access: command is incomplete; run `devm ssh setup`")
+	}
 	refresher, err := application.newRefreshClient(application.clientID)
 	if err != nil {
 		return errors.New("configure SSH access: initialize token refresh")
@@ -214,6 +247,9 @@ func lifecycleUnavailable(ctx context.Context, action string, _ error) error {
 
 func (application cli) resolveEnvironmentID(ctx context.Context, explicit string) (string, error) {
 	if explicit != "" {
+		if !sshIdentifierPattern.MatchString(explicit) {
+			return "", errors.New("Environment ID is invalid")
+		}
 		return explicit, nil
 	}
 	workingDirectory, err := application.workingDirectory()
@@ -242,6 +278,7 @@ type statusResult struct {
 	Environment contracts.Environment    `json:"environment"`
 	Operation   *contracts.Operation     `json:"operation"`
 	Billing     contracts.BillingSummary `json:"billing"`
+	Activity    string                   `json:"activity"`
 }
 
 func (application cli) runStatus(ctx context.Context, arguments []string) error {
@@ -270,12 +307,15 @@ func (application cli) runStatus(ctx context.Context, arguments []string) error 
 		if err != nil {
 			return fmt.Errorf("show status: %w", err)
 		}
+		if operation.EnvironmentId != environment.Id {
+			return errors.New("show status: control plane returned an Operation for another Environment")
+		}
 	}
 	billing, err := getLifecycleBilling(ctx, client)
 	if err != nil {
 		return fmt.Errorf("show status: %w", err)
 	}
-	result := statusResult{Environment: environment, Operation: operation, Billing: billing}
+	result := statusResult{Environment: environment, Operation: operation, Billing: billing, Activity: "not exposed by API yet"}
 	if *jsonOutput {
 		encoder := json.NewEncoder(writerOrDiscard(application.output))
 		encoder.SetEscapeHTML(true)
@@ -294,9 +334,9 @@ func (application cli) runStatus(ctx context.Context, arguments []string) error 
 	}
 	output := writerOrDiscard(application.output)
 	_, err = fmt.Fprintf(output,
-		"FIELD\tVALUE\nEnvironment\t%s (%s)\nRuntime\t%s\nAuto-stop\t%s, %ds grace\nActive operation\t%s\nCredits\t%d (%s)\n",
+		"FIELD\tVALUE\nEnvironment\t%s (%s)\nRuntime\t%s\nAuto-stop\t%s, %ds grace\nActive operation\t%s\nActivity\t%s\nCredits\t%d (%s)\n",
 		environment.Name, environment.Id, runtimeStatus, environment.AutoStopPolicy.Mode,
-		environment.AutoStopPolicy.GracePeriodSeconds, activeOperation, billing.CreditBalance, billing.SubscriptionStatus)
+		environment.AutoStopPolicy.GracePeriodSeconds, activeOperation, result.Activity, billing.CreditBalance, billing.SubscriptionStatus)
 	if err != nil {
 		return errors.New("write status")
 	}
@@ -345,10 +385,24 @@ func (application cli) runStop(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
+	environment, err := getLifecycleEnvironment(ctx, client, environmentID)
+	if err != nil {
+		return fmt.Errorf("stop Runtime: %w", err)
+	}
+	if environment.Runtime == nil || strings.TrimSpace(environment.Runtime.Id) == "" {
+		return errors.New("stop Runtime: Environment has no current Runtime")
+	}
+	if application.newAttempt == nil {
+		return errors.New("stop Runtime: random nonce source is unavailable")
+	}
+	nonce, err := application.newAttempt()
+	if err != nil || strings.TrimSpace(nonce) == "" {
+		return errors.New("stop Runtime: generate invocation nonce")
+	}
 	reason := contracts.StopEnvironmentRuntimeJSONBodyReasonManual
 	requestContext, cancel := context.WithTimeout(ctx, lifecycleRequestTimeout)
 	response, requestErr := client.api.StopEnvironmentRuntimeWithResponse(requestContext, environmentID,
-		&contracts.StopEnvironmentRuntimeParams{IdempotencyKey: deterministicKey("environment-stop", environmentID)},
+		&contracts.StopEnvironmentRuntimeParams{IdempotencyKey: deterministicKey("environment-stop", environmentID+"\x00"+environment.Runtime.Id+"\x00"+nonce)},
 		contracts.StopEnvironmentRuntimeJSONRequestBody{Reason: &reason}, client.editor())
 	cancel()
 	if requestErr != nil {
@@ -358,6 +412,9 @@ func (application cli) runStop(ctx context.Context, arguments []string) error {
 		return fmt.Errorf("stop Runtime: control plane returned HTTP %d", response.StatusCode())
 	}
 	operation := response.JSON202.Operation
+	if operation.EnvironmentId != environmentID || operation.Type != "environment.stop" {
+		return errors.New("stop Runtime: control plane returned a mismatched Operation")
+	}
 	if _, err := fmt.Fprintf(writerOrDiscard(application.output), "Stop requested: %s (%s).\n", operation.Id, operation.Status); err != nil {
 		return errors.New("write stop result")
 	}
@@ -392,6 +449,9 @@ func (application cli) pollStopOperation(ctx context.Context, client lifecycleCl
 		current, err := getLifecycleOperation(waitContext, client, operation.Id)
 		if err != nil {
 			return fmt.Errorf("poll stop Operation: %w", err)
+		}
+		if current.EnvironmentId != operation.EnvironmentId || current.Type != "environment.stop" {
+			return errors.New("poll stop Operation: control plane returned a mismatched Operation")
 		}
 		operation = *current
 	}

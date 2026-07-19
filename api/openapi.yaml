@@ -209,7 +209,6 @@ paths:
                 expectedHeadVersionId: { type: string, nullable: true }
                 capsuleRefs:
                   type: array
-                  minItems: 1
                   items: { $ref: '#/components/schemas/CapsuleRef' }
       responses:
         '201':

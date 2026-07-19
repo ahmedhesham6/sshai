@@ -53,7 +53,6 @@ func TestProfileVersionRejectsInvalidCapsuleRefs(t *testing.T) {
 		name   string
 		mutate func(*domain.ProfileVersionPublication)
 	}{
-		{name: "missing Capsule Ref", mutate: func(input *domain.ProfileVersionPublication) { input.CapsuleRefs = nil }},
 		{name: "empty Ref", mutate: func(input *domain.ProfileVersionPublication) { input.CapsuleRefs[0].Ref = " " }},
 		{name: "malformed Ref", mutate: func(input *domain.ProfileVersionPublication) { input.CapsuleRefs[0].Ref = "not a registry reference" }},
 		{name: "invalid freshness policy", mutate: func(input *domain.ProfileVersionPublication) {

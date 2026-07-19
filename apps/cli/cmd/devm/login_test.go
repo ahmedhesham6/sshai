@@ -40,6 +40,7 @@ func TestRunLoginPrintsOnlyPromptAndAtomicallyPersistsPrivateTokens(t *testing.T
 	assertMode(t, authDirectory, 0o700)
 	tokenPath := filepath.Join(authDirectory, "tokens.json")
 	assertMode(t, tokenPath, 0o600)
+	assertMode(t, filepath.Join(authDirectory, "tokens.lock"), 0o600)
 	content, err := os.ReadFile(tokenPath)
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +52,7 @@ func TestRunLoginPrintsOnlyPromptAndAtomicallyPersistsPrivateTokens(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "tokens.json" {
+	if len(entries) != 2 || entries[0].Name() != "tokens.json" || entries[1].Name() != "tokens.lock" {
 		t.Fatalf("atomic write left temporary files: %v", entries)
 	}
 }
