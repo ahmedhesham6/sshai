@@ -24,6 +24,59 @@ func (server *server) StopEnvironmentRuntime(response http.ResponseWriter, reque
 	server.handleRuntimeCommand(response, request, string(environmentID), params.IdempotencyKey, false)
 }
 
+func (server *server) ApplyEnvironmentProfile(response http.ResponseWriter, request *http.Request, environmentID contracts.EnvironmentID, params contracts.ApplyEnvironmentProfileParams) {
+	var body contracts.ApplyEnvironmentProfileJSONRequestBody
+	if err := decodeRequiredJSON(request, &body); err != nil {
+		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", "The request body is not valid JSON.")
+		return
+	}
+	user, present := userFromContext(request.Context())
+	if !present {
+		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
+		return
+	}
+	detail, err := server.environmentReads.GetOwnedEnvironment(request.Context(), user.ID, string(environmentID))
+	if err != nil {
+		server.writeRuntimeCommandError(response, request, err, nil)
+		return
+	}
+	if server.profileReads == nil {
+		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The command could not be accepted safely.")
+		return
+	}
+	if _, err := server.profileReads.GetOwnedProfileVersion(request.Context(), user.ID, body.ProfileVersionId); err != nil {
+		if errors.Is(err, db.ErrReferenceNotOwned) {
+			writeError(response, request, http.StatusNotFound, "PROFILE_VERSION_NOT_FOUND", "The Profile Version was not found.")
+		} else {
+			writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The command could not be accepted safely.")
+		}
+		return
+	}
+	approved := []string(nil)
+	if body.ApprovedReviewItems != nil {
+		approved = append(approved, (*body.ApprovedReviewItems)...)
+	}
+	command, err := server.runtimeCommands.ApplyProfile(request.Context(), application.ProfileApplyCommandInput{
+		OwnerUserID: user.ID, EnvironmentID: string(environmentID), ProfileVersionID: body.ProfileVersionId,
+		ApprovedReviewItems: approved, IdempotencyKey: params.IdempotencyKey,
+	})
+	if err != nil {
+		server.writeRuntimeCommandError(response, request, err, detail.ActiveOperationID)
+		return
+	}
+	operation := command.Operation().Snapshot()
+	if operation.Status == domain.OperationQueued || operation.Status == domain.OperationRunning {
+		detail.ActiveOperationID = &operation.ID
+	}
+	result := contracts.ApplyEnvironmentProfile202JSONResponse{
+		Headers: contracts.ApplyEnvironmentProfile202ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
+		Body:    environmentOperationResponse(detail, command.Operation()),
+	}
+	if err := result.VisitApplyEnvironmentProfileResponse(response); err != nil {
+		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
+	}
+}
+
 func (server *server) handleRuntimeCommand(response http.ResponseWriter, request *http.Request, environmentID, idempotencyKey string, start bool) {
 	user, present := userFromContext(request.Context())
 	if !present {
@@ -125,7 +178,7 @@ func (server *server) writeRuntimeCommandError(response http.ResponseWriter, req
 	case errors.Is(err, db.ErrOperationConflict):
 		writeErrorWithOperation(response, request, http.StatusConflict, "OPERATION_CONFLICT", "The Environment already has an active Operation.", activeOperationID)
 	case errors.Is(err, domain.ErrRuntimeCommandState):
-		writeError(response, request, http.StatusUnprocessableEntity, "RUNTIME_COMMAND_INVALID_STATE", "The Runtime command cannot be applied to its current state.")
+		writeError(response, request, http.StatusUnprocessableEntity, "RUNTIME_COMMAND_INVALID_STATE", "The command requires a compatible current Runtime state.")
 	default:
 		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The command could not be accepted safely.")
 	}

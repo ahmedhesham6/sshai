@@ -65,6 +65,36 @@ func TestStoreReservesRuntimeOperationWithExactIdempotencyIdentity(t *testing.T)
 	}
 }
 
+func TestStoreReservesProfileApplyOnlyForReadyRuntime(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Date(2026, time.July, 19, 16, 0, 0, 0, time.UTC)
+	insertRuntimeOperationState(t, ctx, pool, createdAt)
+	input := []byte(`{"profileVersionId":"profile-version-2","approvedReviewItems":["config:editor"]}`)
+	stopped := runtimeOperationCandidate(t, "operation-stopped", "environment-1", domain.OperationProfileApply, "apply-stopped", input, createdAt.Add(time.Hour))
+	if _, err := store.ReserveRuntimeOperation(ctx, stopped); !errors.Is(err, domain.ErrRuntimeCommandState) {
+		t.Fatalf("stopped Profile apply error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE runtimes
+		SET status = 'ready', private_address = '10.0.0.8', boot_id = 'boot-1', stopped_at = NULL, updated_at = $1, version = version + 1
+		WHERE id = 'runtime-1'`, createdAt.Add(2*time.Hour)); err != nil {
+		t.Fatalf("mark Runtime ready: %v", err)
+	}
+	ready := runtimeOperationCandidate(t, "operation-apply", "environment-1", domain.OperationProfileApply, "apply-ready", input, createdAt.Add(3*time.Hour))
+	reserved, err := store.ReserveRuntimeOperation(ctx, ready)
+	if err != nil {
+		t.Fatalf("ReserveRuntimeOperation(Profile apply): %v", err)
+	}
+	if reserved.Operation().Snapshot().Type != domain.OperationProfileApply || reserved.Runtime().Snapshot().Status != domain.RuntimeReady {
+		t.Fatalf("reserved Profile apply = Operation:%#v Runtime:%#v", reserved.Operation().Snapshot(), reserved.Runtime().Snapshot())
+	}
+	pending, present, err := store.PendingRuntimeOperation(ctx, "operation-apply")
+	if err != nil || !present || pending.OperationType != domain.OperationProfileApply || pending.RuntimeID != "runtime-1" {
+		t.Fatalf("pending Profile apply = %#v present:%t error:%v", pending, present, err)
+	}
+}
+
 func TestStoreHistoricalRuntimeOperationReplayKeepsOriginalTarget(t *testing.T) {
 	ctx := context.Background()
 	store, pool := openTestStoreAndPool(t, ctx)

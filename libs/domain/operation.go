@@ -16,6 +16,7 @@ const (
 	OperationRuntimeStart              OperationType = "runtime.start"
 	OperationRuntimeStop               OperationType = "runtime.stop"
 	OperationRuntimeReplace            OperationType = "runtime.replace"
+	OperationProfileApply              OperationType = "profile.apply"
 	OperationProfileResolve            OperationType = "profile.resolve"
 )
 

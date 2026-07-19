@@ -136,6 +136,9 @@ func run(ctx context.Context) error {
 		HostIdentity: guest, SSHKeys: guest, Managed: guest, Toolchain: guest, AutoStop: workflowClient,
 		IDs: idGenerator{}, Now: time.Now,
 	})
+	profileApply := workflows.ProfileApplyDefinition(workflows.ProfileApplyDependencies{
+		Actions: runtimeActions, Resolver: capsuleResolver, CapsuleApplication: guest, IDs: idGenerator{}, Now: time.Now,
+	})
 
 	restateServer := server.NewRestate()
 	for _, service := range buildServices(serviceDependencies{
@@ -151,6 +154,7 @@ func run(ctx context.Context) error {
 		runtimeStart:   runtimeStart,
 		runtimeStop:    runtimeStop,
 		runtimeReplace: runtimeReplace,
+		profileApply:   profileApply,
 	}) {
 		restateServer.Bind(service)
 	}
@@ -174,6 +178,7 @@ type serviceDependencies struct {
 	runtimeStart      restate.ServiceDefinition
 	runtimeStop       restate.ServiceDefinition
 	runtimeReplace    restate.ServiceDefinition
+	profileApply      restate.ServiceDefinition
 }
 
 func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition {
@@ -183,6 +188,7 @@ func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition
 	for _, pending := range []restate.ServiceDefinition{
 		dependencies.environmentCreate, dependencies.profileResolve, dependencies.autoStop,
 		dependencies.runtimeStart, dependencies.runtimeStop, dependencies.runtimeReplace,
+		dependencies.profileApply,
 	} {
 		if pending != nil {
 			services = append(services, pending)

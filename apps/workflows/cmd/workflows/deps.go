@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -224,7 +225,7 @@ func (actions *runtimeWorkflowActions) LoadRuntimeOperation(ctx context.Context,
 	}
 	return workflows.RuntimeOperationState{
 		OwnerUserID: state.OwnerUserID, Runtime: state.Runtime, DataVolumeProviderID: state.DataVolumeProviderID,
-		ComputeUsageIntervalID: state.ComputeUsageIntervalID,
+		ComputeUsageIntervalID: state.ComputeUsageIntervalID, OperationInput: state.OperationInput,
 	}, nil
 }
 
@@ -266,6 +267,60 @@ func (actions *runtimeWorkflowActions) RecordRuntimeStopSnapshot(ctx context.Con
 
 func (actions *runtimeWorkflowActions) RecordRuntimeStopAudit(ctx context.Context, operationID string, evidence domain.RuntimeStopAuditEvidence) error {
 	return actions.store.RecordRuntimeStopAuditEvidence(ctx, operationID, evidence, actions.now())
+}
+
+func (actions *runtimeWorkflowActions) LoadProfileApplyOperation(ctx context.Context, input domain.RuntimeOperationDispatch, invocationID string, at time.Time) (workflows.ProfileApplyState, error) {
+	runtimeState, err := actions.store.LoadRuntimeWorkflowOperation(ctx, input, invocationID, at)
+	if err != nil {
+		return workflows.ProfileApplyState{}, err
+	}
+	var request workflows.ProfileApplyOperationInput
+	if err := json.Unmarshal(runtimeState.OperationInput, &request); err != nil {
+		return workflows.ProfileApplyState{}, fmt.Errorf("load Profile apply Operation: decode persisted input: %w", err)
+	}
+	version, err := actions.store.LoadProfileVersion(ctx, input.EnvironmentID, request.ProfileVersionID)
+	if err != nil {
+		return workflows.ProfileApplyState{}, err
+	}
+	capsuleState, err := actions.store.LoadEnvironmentCapsuleApplyState(ctx, input.EnvironmentID)
+	if err != nil {
+		return workflows.ProfileApplyState{}, err
+	}
+	installed := make([]profile.InstalledMaterialization, len(capsuleState.Materializations))
+	for index, record := range capsuleState.Materializations {
+		installed[index] = profile.InstalledMaterialization{
+			ID: record.ID, LockID: record.LockID, LockDigest: record.LockDigest, CapsuleDigest: record.CapsuleDigest,
+			ComponentID: record.ComponentID, ComponentDigest: record.ComponentDigest, AdapterID: record.AdapterID,
+			AdapterVersion: record.AdapterVersion, TargetAgentVersion: record.TargetAgentVersion, Scope: record.Scope,
+			NonSecretOverridesDigest: record.NonSecretOverridesDigest, SecretVersionIdentifiers: append([]string(nil), record.SecretVersionIdentifiers...),
+			EffectiveCacheKey: record.EffectiveCacheKey, Mode: profile.MaterializationMode(record.Mode), Root: profile.MaterializationRoot(record.Root),
+			Target: record.Target, Selector: record.Selector, Directory: record.Directory, FilePaths: append([]string(nil), record.FilePaths...),
+			LastAppliedDigest: record.LastAppliedDigest, ObservedDigest: record.ObservedDigest, CredentialRequirementDigest: record.CredentialRequirementDigest,
+		}
+	}
+	return workflows.ProfileApplyState{
+		OwnerUserID: runtimeState.OwnerUserID, Runtime: runtimeState.Runtime, Version: version,
+		PreviousLock: capsuleState.PreviousLock, Materializations: installed, UpgradePolicy: capsuleState.UpgradePolicy, Request: request,
+	}, nil
+}
+
+func (actions *runtimeWorkflowActions) CompleteProfileApply(ctx context.Context, operationID string, previousLockID *string, state workflows.EnvironmentCapsuleState, at time.Time) error {
+	lock, err := domain.CreateCapsuleLock(state.CapsuleLock)
+	if err != nil {
+		return err
+	}
+	records, err := workflows.EnvironmentMaterializationRecords(lock.Snapshot(), state.Materializations)
+	if err != nil {
+		return err
+	}
+	return actions.store.CompleteProfileApply(ctx, db.CompleteProfileApplyInput{
+		OperationID: operationID, PreviousLockID: previousLockID, CapsuleLock: lock,
+		UpgradePolicy: state.UpgradePolicy, Materializations: records, CompletedAt: at,
+	})
+}
+
+func (actions *runtimeWorkflowActions) RecordProfileApplyFailure(ctx context.Context, operationID, code, message string, at time.Time) error {
+	return actions.store.RecordProfileApplyFailure(ctx, operationID, code, message, at)
 }
 
 type autoStopSnapshotStore interface {
@@ -322,6 +377,8 @@ type unavailableGuestTransportError struct{ operation string }
 func (err unavailableGuestTransportError) Error() string {
 	return "guest control transport is unavailable for " + err.operation
 }
+
+func (unavailableGuestTransportError) Unwrap() error { return workflows.ErrGuestUnavailable }
 
 func (unavailableGuestTransportError) Transient() bool { return false }
 
