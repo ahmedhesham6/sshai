@@ -32,7 +32,7 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if err != nil {
 		t.Fatalf("EnsureRuntime(): %v", err)
 	}
-	assertRuntimeOwnership(t, ensured, harness.Request.RuntimeSpec)
+	assertRuntimeAllocationOwnership(t, ensured, harness.Request.RuntimeSpec)
 	replayed, err := harness.Adapter.EnsureRuntime(ctx, harness.Request)
 	if err != nil {
 		t.Fatalf("EnsureRuntime() replay: %v", err)
@@ -44,7 +44,10 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if err != nil {
 		t.Fatalf("EnsureRuntimeDataVolumeAttachment(): %v", err)
 	}
-	assertSameRuntime(t, attached, ensured)
+	assertRuntimeOwnership(t, attached, harness.Request.RuntimeSpec)
+	if attached.Provider != ensured.Provider || attached.ProviderID != ensured.ProviderID || attached.RuntimeSpec != ensured.RuntimeSpec {
+		t.Fatalf("attached Runtime changed allocation identity = before %#v, after %#v", ensured, attached)
+	}
 	replayed, err = harness.Adapter.EnsureRuntimeDataVolumeAttachment(ctx, request)
 	if err != nil {
 		t.Fatalf("EnsureRuntimeDataVolumeAttachment() replay: %v", err)
@@ -185,12 +188,28 @@ func awaitRunning(
 
 func assertRuntimeOwnership(t *testing.T, runtime provider.Runtime, spec provider.RuntimeSpec) {
 	t.Helper()
-	if runtime.Provider == "" || runtime.ProviderID == "" || runtime.SystemVolumeProviderID == "" || runtime.RuntimeID != spec.RuntimeID || runtime.EnvironmentID != spec.EnvironmentID ||
+	if runtime.SystemVolumeProviderID == "" {
+		t.Fatalf("attached Runtime has no system volume identity: %#v", runtime)
+	}
+	assertRuntimeIdentity(t, runtime, spec)
+}
+
+func assertRuntimeIdentity(t *testing.T, runtime provider.Runtime, spec provider.RuntimeSpec) {
+	t.Helper()
+	if runtime.Provider == "" || runtime.ProviderID == "" || runtime.RuntimeID != spec.RuntimeID || runtime.EnvironmentID != spec.EnvironmentID ||
 		runtime.Sequence != spec.Sequence || runtime.Region != spec.Region || runtime.AvailabilityZone != spec.AvailabilityZone ||
 		runtime.RuntimePreset != spec.RuntimePreset || runtime.ImageVersion != spec.ImageVersion ||
 		runtime.DataVolumeProviderID != spec.DataVolumeProviderID || (runtime.PrivateIPv4 != "" && !privateIPv4(runtime.PrivateIPv4)) {
 		t.Fatalf("Runtime ownership = %#v, want %#v", runtime, spec)
 	}
+}
+
+func assertRuntimeAllocationOwnership(t *testing.T, runtime provider.Runtime, spec provider.RuntimeSpec) {
+	t.Helper()
+	if runtime.SystemVolumeProviderID != "" {
+		t.Fatalf("allocation-only Runtime unexpectedly resolved system volume identity: %#v", runtime)
+	}
+	assertRuntimeIdentity(t, runtime, spec)
 }
 
 func hasCode(err error, code provider.ErrorCode) bool {

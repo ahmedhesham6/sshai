@@ -505,7 +505,7 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	}, restate.WithName("restore-environment-ssh-identity")); err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
 	}
-	ready, err := waitForEnvironmentGuestReadiness(ctx, dependencies.GuestReadiness, guestRequest.RuntimeGuestReadinessRequest, dependencies.GuestPollInterval, dependencies.GuestPollTimeout, dependencies.Now)
+	ready, err := waitForRuntimeGuestReadiness(ctx, dependencies.GuestReadiness, guestRequest.RuntimeGuestReadinessRequest, dependencies.GuestPollInterval, dependencies.GuestPollTimeout, dependencies.Now)
 	if err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: GuestNotReady, Message: err.Error()}, dependencies.Now)
 	}
@@ -678,13 +678,13 @@ func validateCreatedRuntimeNetworking(input domain.EnvironmentCreateDispatch, sp
 	return nil
 }
 
-type environmentGuestReadinessOutcome struct {
+type runtimeGuestReadinessOutcome struct {
 	Readiness        RuntimeGuestReadiness `json:"readiness"`
 	RetryableFailure bool                  `json:"retryableFailure,omitempty"`
 	Failure          string                `json:"failure,omitempty"`
 }
 
-func waitForEnvironmentGuestReadiness(ctx restate.WorkflowContext, source RuntimeGuestReadinessSource, request RuntimeGuestReadinessRequest, interval, timeout time.Duration, now func() time.Time) (RuntimeGuestReadiness, error) {
+func waitForRuntimeGuestReadiness(ctx restate.WorkflowContext, source RuntimeGuestReadinessSource, request RuntimeGuestReadinessRequest, interval, timeout time.Duration, now func() time.Time) (RuntimeGuestReadiness, error) {
 	if interval <= 0 {
 		interval = defaultProviderPollInterval
 	}
@@ -694,17 +694,17 @@ func waitForEnvironmentGuestReadiness(ctx restate.WorkflowContext, source Runtim
 	poll, err := durableDeadlinePoll(ctx, nil, durableDeadlinePollConfig{
 		timeout: timeout, initialDelay: interval, maxDelay: 30 * time.Second,
 		stepPrefix: "wait-created-runtime-guest-ready", readStepPrefix: "read-created-runtime-guest-readiness", now: now,
-	}, func(runCtx restate.RunContext, _ time.Time) (durableDeadlinePollRead[environmentGuestReadinessOutcome], error) {
+	}, func(runCtx restate.RunContext, _ time.Time) (durableDeadlinePollRead[runtimeGuestReadinessOutcome], error) {
 		readiness, readErr := source.WaitForRuntimeReady(runCtx, request)
 		if readErr == nil {
-			return durableDeadlinePollRead[environmentGuestReadinessOutcome]{Value: environmentGuestReadinessOutcome{Readiness: readiness}, UseValue: true}, nil
+			return durableDeadlinePollRead[runtimeGuestReadinessOutcome]{Value: runtimeGuestReadinessOutcome{Readiness: readiness}, UseValue: true}, nil
 		}
 		var classified interface{ Transient() bool }
 		if errors.As(readErr, &classified) && classified.Transient() {
-			return durableDeadlinePollRead[environmentGuestReadinessOutcome]{Value: environmentGuestReadinessOutcome{RetryableFailure: true}, UseValue: true, RetryableFailure: true}, nil
+			return durableDeadlinePollRead[runtimeGuestReadinessOutcome]{Value: runtimeGuestReadinessOutcome{RetryableFailure: true}, UseValue: true, RetryableFailure: true}, nil
 		}
-		return durableDeadlinePollRead[environmentGuestReadinessOutcome]{Value: environmentGuestReadinessOutcome{Failure: readErr.Error()}, UseValue: true}, nil
-	}, func(outcome environmentGuestReadinessOutcome, _ time.Time) (environmentGuestReadinessOutcome, bool) {
+		return durableDeadlinePollRead[runtimeGuestReadinessOutcome]{Value: runtimeGuestReadinessOutcome{Failure: readErr.Error()}, UseValue: true}, nil
+	}, func(outcome runtimeGuestReadinessOutcome, _ time.Time) (runtimeGuestReadinessOutcome, bool) {
 		if outcome.RetryableFailure {
 			return outcome, false
 		}

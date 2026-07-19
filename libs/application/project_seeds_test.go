@@ -126,6 +126,24 @@ func TestRegisterProjectSeedServiceRejectsVerifierFailureBeforePersistence(t *te
 	}
 }
 
+func TestRegisterProjectSeedServiceRejectsAggregateContentAboveTransportLimit(t *testing.T) {
+	repository := &projectSeedRepositoryFake{}
+	manifestDigest := applicationTestDigest('b')
+	trackedDigest := applicationTestDigest('c')
+	verifier := &recordingUploadVerifier{sizes: map[string]int64{
+		manifestDigest: application.ProjectSeedTransportMaximumRawBytes/2 + 1,
+		trackedDigest:  application.ProjectSeedTransportMaximumRawBytes/2 + 1,
+	}}
+	service := application.NewRegisterProjectSeedService(repository, verifier, &projectSeedIDs{value: "seed-1"}, time.Now)
+	_, err := service.RegisterProjectSeed(t.Context(), application.RegisterProjectSeedInput{
+		OwnerUserID: "user-1", IdempotencyKey: "registration-key-1", RepositoryURL: "https://github.com/example/project.git",
+		BaseRevision: "abc123", Digest: applicationTestDigest('a'), ManifestDigest: manifestDigest, TrackedPatchDigest: trackedDigest,
+	})
+	if !errors.Is(err, application.ErrProjectSeedTransportLimit) || repository.calls != 0 {
+		t.Fatalf("oversize registration = calls:%d error:%v", repository.calls, err)
+	}
+}
+
 type projectSeedRepositoryFake struct {
 	seed           domain.ProjectSeed
 	idempotencyKey string

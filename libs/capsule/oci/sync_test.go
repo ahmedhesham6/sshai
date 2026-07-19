@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -108,6 +109,9 @@ func TestClientRejectsS3BlobDigestMismatch(t *testing.T) {
 	_, err = client.Pull(t.Context(), capsuleValue.Digest, destination, nil)
 	if err == nil {
 		t.Fatal("Pull() error = nil, want digest mismatch")
+	}
+	if !errors.Is(err, oci.ErrContentInvalid) {
+		t.Fatalf("Pull() error = %v, want immutable content classification", err)
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "digest") || !strings.Contains(err.Error(), capsuleValue.Layers[0].Digest) {
 		t.Fatalf("Pull() error = %v, want expected digest mismatch", err)

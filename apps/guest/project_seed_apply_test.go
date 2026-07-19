@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -182,6 +183,21 @@ func TestProjectSeedApplicationRejectsANonArrayManifest(t *testing.T) {
 		Manifest:      seedArtifact([]byte("null")),
 	}); err == nil {
 		t.Fatal("non-array Project Seed manifest was accepted")
+	}
+}
+
+func TestProjectSeedApplicationClassifiesMalformedBundleAsImmutableInput(t *testing.T) {
+	remote, base := seedRepository(t)
+	application, err := guest.NewProjectSeedApplication(guest.ProjectSeedApplicationInput{
+		RepositoryURL: repositoryURL(remote), BaseRevision: base,
+		GitBundle: seedArtifact([]byte("not a Git bundle")), Manifest: seedArtifact([]byte("[]")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = application.Apply(t.Context(), filepath.Join(t.TempDir(), "workspace"))
+	if !errors.Is(err, guest.ErrProjectSeedContentInvalid) {
+		t.Fatalf("malformed bundle error = %T %v, want ErrProjectSeedContentInvalid", err, err)
 	}
 }
 

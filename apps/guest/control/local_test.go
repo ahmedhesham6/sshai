@@ -9,25 +9,44 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ahmedhesham6/sshai/apps/guest"
 	capsuleoci "github.com/ahmedhesham6/sshai/libs/capsule/oci"
 )
 
-func TestValidateAgentExecutablesRequiresPinnedExecutableFiles(t *testing.T) {
+func TestValidateAgentExecutablesRequiresExactPinnedVersions(t *testing.T) {
 	root := t.TempDir()
 	executable := filepath.Join(root, "claude")
 	nonExecutable := filepath.Join(root, "codex")
-	if err := os.WriteFile(executable, []byte("agent"), 0o700); err != nil {
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nprintf 'claude 1.2.3 (Claude Code)\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(nonExecutable, []byte("agent"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateAgentExecutables([]string{executable}); err != nil {
+	requirement := AgentRequirement{Name: "claude", Executable: executable, ExpectedVersion: "1.2.3"}
+	if err := validateAgentExecutables(t.Context(), []AgentRequirement{requirement}); err != nil {
 		t.Fatalf("validate executable agent: %v", err)
 	}
+	wrongVersion := requirement
+	wrongVersion.ExpectedVersion = "1.2.4"
+	if err := validateAgentExecutables(t.Context(), []AgentRequirement{wrongVersion}); err == nil {
+		t.Fatal("validateAgentExecutables() accepted a different agent version")
+	}
 	for _, path := range []string{nonExecutable, filepath.Join(root, "missing")} {
-		if err := validateAgentExecutables([]string{path}); err == nil {
+		candidate := requirement
+		candidate.Executable = path
+		if err := validateAgentExecutables(t.Context(), []AgentRequirement{candidate}); err == nil {
 			t.Fatalf("validateAgentExecutables(%q) error = nil", path)
+		}
+	}
+}
+
+func TestImmutableGuestInputsAreClassifiedPermanent(t *testing.T) {
+	for _, err := range []error{guest.ErrProjectSeedContentInvalid, guest.ErrCapsuleContentInvalid} {
+		classified := classifyImmutableGuestInput(err)
+		var operation interface{ Transient() bool }
+		if !errors.As(classified, &operation) || operation.Transient() {
+			t.Fatalf("classification = %T %v, want permanent", classified, classified)
 		}
 	}
 }

@@ -32,9 +32,9 @@ import (
 )
 
 const (
-	maximumRequestDuration  = 10 * time.Minute
-	gracefulStopDuration    = 11 * time.Minute
-	defaultAgentExecutables = "/usr/local/bin/claude,/usr/local/bin/codex,/usr/local/bin/opencode"
+	maximumRequestDuration      = 10 * time.Minute
+	gracefulStopDuration        = 11 * time.Minute
+	defaultAgentVersionManifest = "/etc/sshai/agent-versions"
 )
 
 func main() {
@@ -93,6 +93,10 @@ func run(ctx context.Context) error {
 		}
 	}
 
+	agentRequirements, err := readAgentRequirements(config.agentVersionFile)
+	if err != nil {
+		return fmt.Errorf("read pinned agent versions: %w", err)
+	}
 	operations, err := guestcontrol.NewLocalOperations(guestcontrol.LocalOperationsConfig{
 		Target: config.target, Readiness: reporter,
 		WorkspaceRoot: config.workspaceRoot, HomeRoot: config.homeRoot, CacheRoot: config.cacheRoot,
@@ -104,7 +108,7 @@ func run(ctx context.Context) error {
 		},
 		SSHKeys:              optionalSSHKeySource(config.authorizedKeysFile),
 		ManagedConfiguration: optionalManagedConfigurationSource(config.managedConfigurationFile),
-		AgentExecutables:     splitList(config.agentExecutables),
+		AgentRequirements:    agentRequirements,
 		Activity:             observer,
 		Shutdown: func(context.Context) error {
 			syscall.Sync()
@@ -182,7 +186,7 @@ type config struct {
 	claudeExecutables        string
 	protectedExecutables     string
 	selectedContainers       string
-	agentExecutables         string
+	agentVersionFile         string
 }
 
 func loadConfig() (config, error) {
@@ -222,7 +226,7 @@ func loadConfig() (config, error) {
 		activitySampleFile: os.Getenv("GUEST_ACTIVITY_SAMPLE_FILE"),
 		codexExecutables:   os.Getenv("GUEST_CODEX_EXECUTABLES"), claudeExecutables: os.Getenv("GUEST_CLAUDE_EXECUTABLES"),
 		protectedExecutables: os.Getenv("GUEST_PROTECTED_EXECUTABLES"), selectedContainers: os.Getenv("GUEST_SELECTED_CONTAINERS"),
-		agentExecutables: valueOrDefault("GUEST_AGENT_EXECUTABLES", defaultAgentExecutables),
+		agentVersionFile: valueOrDefault("GUEST_AGENT_VERSION_FILE", defaultAgentVersionManifest),
 	}
 	if value.listenAddress == "" {
 		value.listenAddress = net.JoinHostPort(value.target.PrivateIPv4, "9443")
@@ -614,6 +618,35 @@ func readOneLine(path string) (string, error) {
 		return "", errors.New("value must be one non-empty line")
 	}
 	return value, nil
+}
+
+func readAgentRequirements(path string) ([]guestcontrol.AgentRequirement, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+		return nil, errors.New("agent version manifest must be a non-writable regular file")
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	requirements := make([]guestcontrol.AgentRequirement, 0, len(lines))
+	for index, line := range lines {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("agent version manifest line %d must contain name, executable, and version", index+1)
+		}
+		requirements = append(requirements, guestcontrol.AgentRequirement{
+			Name: fields[0], Executable: fields[1], ExpectedVersion: fields[2],
+		})
+	}
+	if len(requirements) == 0 {
+		return nil, errors.New("agent version manifest is empty")
+	}
+	return requirements, nil
 }
 
 func chownTree(root string, uid, gid int) error {

@@ -44,6 +44,17 @@ func TestCapsuleMaterializationGrantSourceMintsEveryExactPullCapability(t *testi
 	}
 }
 
+func TestCapsuleMaterializationGrantSourceClassifiesImmutableMetadataPermanent(t *testing.T) {
+	state := workflows.EnvironmentCapsuleState{CapsuleLock: domain.CapsuleLockSnapshot{ResolvedComponents: map[string]domain.ResolvedComponent{
+		"config:editor": {ID: "config:editor", CapsuleDigest: "not-a-digest"},
+	}}}
+	_, err := (capsuleMaterializationGrantSource{provider: newMemoryGrantProvider()}).MaterializationReadGrants(t.Context(), "user-1", state)
+	var classified interface{ Transient() bool }
+	if !errors.As(err, &classified) || classified.Transient() {
+		t.Fatalf("MaterializationReadGrants() error = %T %v, want permanent immutable-content classification", err, err)
+	}
+}
+
 func TestConfiguredGuestTransportMapsWorkflowSeamsToControlRequests(t *testing.T) {
 	targetRequest := workflows.RuntimeGuestReadinessRequest{
 		OwnerUserID: "user-1", EnvironmentID: "environment-1", RuntimeID: "runtime-1",

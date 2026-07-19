@@ -103,6 +103,21 @@ func TestPrivateListenAddressRejectsPublicAndWildcardBindings(t *testing.T) {
 	}
 }
 
+func TestReadAgentRequirementsLoadsPackerVersionManifest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-versions")
+	content := "claude\t/usr/local/bin/claude\t1.2.3\ncodex\t/usr/local/bin/codex\t4.5.6\nopencode\t/usr/local/bin/opencode\t7.8.9\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	requirements, err := readAgentRequirements(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requirements) != 3 || requirements[0].Name != "claude" || requirements[1].ExpectedVersion != "4.5.6" || requirements[2].Executable != "/usr/local/bin/opencode" {
+		t.Fatalf("agent requirements = %#v", requirements)
+	}
+}
+
 type reloadRecorder struct{ calls *[]string }
 
 func (recorder reloadRecorder) Reload(context.Context) error {

@@ -71,6 +71,7 @@ func (adapter *memoryRuntimeAdapter) EnsureRuntimeDataVolumeAttachment(_ context
 		return provider.Runtime{}, err
 	}
 	adapter.dataAttached = true
+	adapter.runtime.SystemVolumeProviderID = "memory-system-volume-1"
 	return adapter.runtime, nil
 }
 
@@ -128,6 +129,6 @@ func validRuntimeSpec(spec provider.RuntimeSpec) bool {
 
 func observedRuntime(spec provider.RuntimeSpec, providerID string, state provider.RuntimeState) provider.Runtime {
 	return provider.Runtime{
-		RuntimeSpec: spec, ProviderID: providerID, State: state,
+		RuntimeSpec: spec, Provider: "memory", ProviderID: providerID, State: state,
 	}
 }

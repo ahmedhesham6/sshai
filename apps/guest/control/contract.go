@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/guest"
+	"github.com/ahmedhesham6/sshai/libs/application"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 )
@@ -20,7 +21,7 @@ const (
 	materializationPath        = "/v1/materialization/apply"
 	toolchainValidationPath    = "/v1/toolchain/validate"
 	activitySnapshotPath       = "/v1/activity-snapshot"
-	defaultMaximumRequestBytes = 1 << 30
+	defaultMaximumRequestBytes = application.ProjectSeedTransportMaximumRequestBytes
 )
 
 // Target binds every control request to the Environment and current Runtime

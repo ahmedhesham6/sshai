@@ -23,6 +23,9 @@ func (source capsuleMaterializationGrantSource) MaterializationReadGrants(ctx co
 	digests := materializationCapsuleDigests(state)
 	keys, err := capsuleoci.CapsuleReadKeys(ctx, ownerUserID, digests, source.provider)
 	if err != nil {
+		if errors.Is(err, capsuleoci.ErrContentInvalid) {
+			return nil, permanentGuestTransportError{err: err}
+		}
 		return nil, err
 	}
 	result := make(map[string]guestcontrol.ReadGrant, len(keys))

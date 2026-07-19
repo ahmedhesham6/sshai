@@ -31,6 +31,17 @@ sudo env NPM_CONFIG_PREFIX=/usr/local npm install --global --ignore-scripts=fals
   "opencode-ai@${OPENCODE_VERSION}"
 sudo npm config --global set update-notifier false
 
+# Record the exact pins in a root-owned manifest consumed by the guest's
+# runtime validation. The validator still executes each binary with --version;
+# this file is the expected side of that comparison.
+sudo install -d -o root -g root -m 0755 /etc/sshai
+printf '%s\t%s\t%s\n' \
+  claude /usr/local/bin/claude "$CLAUDE_CODE_VERSION" \
+  codex /usr/local/bin/codex "$CODEX_VERSION" \
+  opencode /usr/local/bin/opencode "$OPENCODE_VERSION" \
+  | sudo tee /etc/sshai/agent-versions >/dev/null
+sudo chmod 0644 /etc/sshai/agent-versions
+
 # Claude Code and OpenCode support explicit updater disable switches. Codex's
 # system npm package does not self-update; the immutable AMI owns its version.
 sudo tee /etc/profile.d/sshai-agent-updates.sh >/dev/null <<'EOF'

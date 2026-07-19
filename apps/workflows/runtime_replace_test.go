@@ -58,6 +58,39 @@ func TestRuntimeReplaceRestoresSSHHostIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeReplaceValidatesToolchainBeforeReady(t *testing.T) {
+	harness := newRuntimeReplaceHarness(false)
+	runRuntimeReplace(t, harness, domain.OperationRuntimeReplace)
+	if harness.guest.toolchainCalls != 1 {
+		t.Fatalf("toolchain validation calls = %d, want 1", harness.guest.toolchainCalls)
+	}
+}
+
+func TestRuntimeReplaceGuestReadinessDeadlineFinalizesRuntimeError(t *testing.T) {
+	harness := newRuntimeReplaceHarness(false)
+	harness.guest.readinessErr = runtimeTransientError{error: errors.New("guest unavailable")}
+	dependencies := harness.dependencies()
+	dependencies.GuestPollInterval = time.Millisecond
+	dependencies.GuestPollTimeout = 2 * time.Second
+	environment := testfixtures.StartRestate(t, RuntimeReplaceDefinition(dependencies))
+	input := runtimeDispatch(domain.OperationRuntimeReplace, "")
+	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := ingress.WorkflowHandle[RuntimeReplaceOutput](environment.Ingress(), RuntimeReplaceService, input.OperationID).Attach(ctx)
+	if err == nil || harness.actions.failureCode != GuestNotReady {
+		t.Fatalf("readiness deadline error = %v, failure code = %q", err, harness.actions.failureCode)
+	}
+	if current := harness.actions.current; current.Status != domain.RuntimeError {
+		t.Fatalf("replacement Runtime after readiness deadline = %#v, want error", current)
+	}
+	if harness.guest.readyCalls < 1 || harness.actions.completeCalls != 0 || harness.actions.failureCalls != 1 {
+		t.Fatalf("deadline calls = readiness:%d complete:%d failure:%d", harness.guest.readyCalls, harness.actions.completeCalls, harness.actions.failureCalls)
+	}
+}
+
 func TestRuntimeReplaceFailuresFinalizeWithoutDeletingDataOrHistory(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -105,7 +138,7 @@ func TestRuntimeStartOutdatedImageIsFulfilledByOneReplacementOperation(t *testin
 		Provider: harness.provider, Attachments: harness.provider, Actions: harness.actions,
 		ReplacementActions: harness.actions, DataVolumes: harness.volume, Credits: &runtimeCreditsFake{expectedOwnerID: "user-1", credits: 10},
 		Images: harness.images, Usage: harness.usage, Guest: harness.guest, HostIdentity: harness.guest,
-		SSHKeys: harness.guest, Managed: harness.guest, AutoStop: harness.auto, IDs: harness.ids,
+		SSHKeys: harness.guest, Managed: harness.guest, Toolchain: harness.guest, AutoStop: harness.auto, IDs: harness.ids,
 		Now: harness.now, ProviderPollInterval: time.Millisecond, ProviderPollTimeout: 10 * time.Second,
 	}
 	environment := testfixtures.StartRestate(t, RuntimeStartDefinition(dependencies))
@@ -212,8 +245,9 @@ func (h *runtimeReplaceHarness) dependencies() RuntimeReplaceDependencies {
 	return RuntimeReplaceDependencies{
 		Provider: h.provider, Attachments: h.provider, Actions: h.actions, DataVolumes: h.volume,
 		Images: h.images, Usage: h.usage, Guest: h.guest, HostIdentity: h.guest, SSHKeys: h.guest,
-		Managed: h.guest, AutoStop: h.auto, IDs: h.ids, Now: h.now,
+		Managed: h.guest, Toolchain: h.guest, AutoStop: h.auto, IDs: h.ids, Now: h.now,
 		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: 10 * time.Second,
+		GuestPollInterval: time.Millisecond, GuestPollTimeout: 10 * time.Second,
 	}
 }
 

@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/guest"
@@ -30,17 +32,25 @@ type SSHHostIdentityActivator interface {
 	ActivateAndVerify(context.Context, Target, string) error
 }
 
+// AgentRequirement binds one selected agent executable to the exact version
+// pinned into the platform-owned system image.
+type AgentRequirement struct {
+	Name            string
+	Executable      string
+	ExpectedVersion string
+}
+
 type LocalOperationsConfig struct {
-	Target           Target
-	Readiness        *guest.ReadinessReporter
-	WorkspaceRoot    string
-	HomeRoot         string
-	CacheRoot        string
-	PlatformRoot     string
-	SSHDRoot         string
-	DevUID           int
-	DevGID           int
-	AgentExecutables []string
+	Target            Target
+	Readiness         *guest.ReadinessReporter
+	WorkspaceRoot     string
+	HomeRoot          string
+	CacheRoot         string
+	PlatformRoot      string
+	SSHDRoot          string
+	DevUID            int
+	DevGID            int
+	AgentRequirements []AgentRequirement
 
 	HostIdentityGenerator guest.SSHHostIdentityGenerator
 	HostIdentityActivator SSHHostIdentityActivator
@@ -77,15 +87,26 @@ func NewLocalOperations(config LocalOperationsConfig) (*LocalOperations, error) 
 			return nil, fmt.Errorf("construct local guest operations: %s root is required", name)
 		}
 	}
-	if len(config.AgentExecutables) == 0 {
-		return nil, errors.New("construct local guest operations: selected agent executables are required")
+	if len(config.AgentRequirements) == 0 {
+		return nil, errors.New("construct local guest operations: selected agent requirements are required")
 	}
-	for _, executable := range config.AgentExecutables {
-		if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
-			return nil, errors.New("construct local guest operations: selected agent executable paths must be absolute and clean")
+	seenNames := make(map[string]struct{}, len(config.AgentRequirements))
+	seenExecutables := make(map[string]struct{}, len(config.AgentRequirements))
+	for _, requirement := range config.AgentRequirements {
+		if strings.TrimSpace(requirement.Name) == "" || strings.TrimSpace(requirement.ExpectedVersion) == "" ||
+			!filepath.IsAbs(requirement.Executable) || filepath.Clean(requirement.Executable) != requirement.Executable {
+			return nil, errors.New("construct local guest operations: selected agent name, exact version, and absolute clean executable are required")
 		}
+		if _, duplicate := seenNames[requirement.Name]; duplicate {
+			return nil, errors.New("construct local guest operations: selected agent names must be unique")
+		}
+		if _, duplicate := seenExecutables[requirement.Executable]; duplicate {
+			return nil, errors.New("construct local guest operations: selected agent executables must be unique")
+		}
+		seenNames[requirement.Name] = struct{}{}
+		seenExecutables[requirement.Executable] = struct{}{}
 	}
-	config.AgentExecutables = append([]string(nil), config.AgentExecutables...)
+	config.AgentRequirements = append([]AgentRequirement(nil), config.AgentRequirements...)
 	return &LocalOperations{config: config}, nil
 }
 
@@ -112,10 +133,7 @@ func (operations *LocalOperations) ApplyProjectSeed(ctx context.Context, request
 		return permanentOperationError(fmt.Errorf("prepare Project Seed: %w", err))
 	}
 	if err := application.Apply(ctx, operations.config.WorkspaceRoot); err != nil {
-		if errors.Is(err, guest.ErrProjectSeedWorkspaceDiverged) {
-			return permanentOperationError(err)
-		}
-		return err
+		return classifyImmutableGuestInput(err)
 	}
 	if err := chownUserTree(operations.config.WorkspaceRoot, operations.config.DevUID, operations.config.DevGID); err != nil {
 		return fmt.Errorf("set Project Seed ownership: %w", err)
@@ -226,7 +244,7 @@ func (operations *LocalOperations) ApplyMaterialization(ctx context.Context, req
 		if errors.Is(err, guest.ErrProfileMaterializationBlocked) {
 			return results, permanentOperationError(err)
 		}
-		return nil, err
+		return nil, classifyImmutableGuestInput(err)
 	}
 	if err := operations.chownUserRoots(); err != nil {
 		return nil, fmt.Errorf("set Materialization ownership: %w", err)
@@ -237,24 +255,37 @@ func (operations *LocalOperations) ApplyMaterialization(ctx context.Context, req
 	return results, nil
 }
 
-func (operations *LocalOperations) ValidateToolchain(_ context.Context, target Target) error {
+func classifyImmutableGuestInput(err error) error {
+	if errors.Is(err, guest.ErrProjectSeedWorkspaceDiverged) || errors.Is(err, guest.ErrProjectSeedContentInvalid) || errors.Is(err, guest.ErrCapsuleContentInvalid) {
+		return permanentOperationError(err)
+	}
+	return err
+}
+
+func (operations *LocalOperations) ValidateToolchain(ctx context.Context, target Target) error {
 	if err := operations.validateTarget(target); err != nil {
 		return err
 	}
-	if err := validateAgentExecutables(operations.config.AgentExecutables); err != nil {
+	if err := validateAgentExecutables(ctx, operations.config.AgentRequirements); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return permanentOperationError(fmt.Errorf("validate selected agent toolchain: %w", err))
 	}
+	// Project toolchain requirements are not represented by the Project domain
+	// yet. S9 must extend this boundary once that aggregate exposes them.
 	return nil
 }
 
-func validateAgentExecutables(paths []string) error {
-	if len(paths) == 0 {
-		return errors.New("at least one selected agent executable is required")
+func validateAgentExecutables(ctx context.Context, requirements []AgentRequirement) error {
+	if len(requirements) == 0 {
+		return errors.New("at least one selected agent requirement is required")
 	}
-	seen := make(map[string]struct{}, len(paths))
-	for _, executable := range paths {
-		if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
-			return fmt.Errorf("agent executable path %q is not absolute and clean", executable)
+	seen := make(map[string]struct{}, len(requirements))
+	for _, requirement := range requirements {
+		executable := requirement.Executable
+		if strings.TrimSpace(requirement.Name) == "" || strings.TrimSpace(requirement.ExpectedVersion) == "" || !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
+			return fmt.Errorf("agent requirement %q is incomplete", requirement.Name)
 		}
 		if _, duplicate := seen[executable]; duplicate {
 			return fmt.Errorf("agent executable path %q is duplicated", executable)
@@ -267,8 +298,39 @@ func validateAgentExecutables(paths []string) error {
 		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 			return fmt.Errorf("agent executable %q is not an executable file", executable)
 		}
+		versionContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+		output, commandErr := exec.CommandContext(versionContext, executable, "--version").CombinedOutput()
+		cancel()
+		if commandErr != nil {
+			return fmt.Errorf("read %s agent version: %w", requirement.Name, commandErr)
+		}
+		if !containsExactVersion(string(output), requirement.ExpectedVersion) {
+			return fmt.Errorf("%s agent version differs from pinned version %q", requirement.Name, requirement.ExpectedVersion)
+		}
 	}
 	return nil
+}
+
+func containsExactVersion(output, expected string) bool {
+	for offset := 0; offset <= len(output)-len(expected); {
+		index := strings.Index(output[offset:], expected)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		leftBoundary := index == 0 || !isVersionCharacter(output[index-1])
+		right := index + len(expected)
+		rightBoundary := right == len(output) || !isVersionCharacter(output[right])
+		if leftBoundary && rightBoundary {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func isVersionCharacter(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' || value == '.' || value == '+' || value == '-'
 }
 
 type readGrantProvider struct {

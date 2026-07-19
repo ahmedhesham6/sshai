@@ -13,9 +13,9 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
-
-const maximumProjectSeedObjectBytes = 1 << 30
 
 type projectSeedMetadataSource interface {
 	LoadEnvironmentProjectSeed(context.Context, string, string, string) (domain.ProjectSeedSnapshot, error)
@@ -44,6 +44,7 @@ func (source storedProjectSeedSource) LoadProjectSeedApplication(ctx context.Con
 	if snapshot.OwnerUserID != ownerUserID || snapshot.ID != projectSeedID {
 		return guest.ProjectSeedApplicationInput{}, permanentGuestTransportError{err: errors.New("load Project Seed application: persisted identity diverged")}
 	}
+	var aggregateSize int64
 	read := func(kind domain.UploadKind, digest string) (guest.ProjectSeedArtifact, error) {
 		if digest == "" {
 			return guest.ProjectSeedArtifact{}, nil
@@ -52,6 +53,10 @@ func (source storedProjectSeedSource) LoadProjectSeedApplication(ctx context.Con
 		if readErr != nil {
 			return guest.ProjectSeedArtifact{}, readErr
 		}
+		if int64(len(content)) > application.ProjectSeedTransportMaximumRawBytes-aggregateSize {
+			return guest.ProjectSeedArtifact{}, permanentGuestTransportError{err: fmt.Errorf("load Project Seed: aggregate content exceeds %d bytes", application.ProjectSeedTransportMaximumRawBytes)}
+		}
+		aggregateSize += int64(len(content))
 		return guest.ProjectSeedArtifact{SHA256: digest, Content: content}, nil
 	}
 	manifest, err := read(domain.UploadSeedManifest, snapshot.ManifestDigest)
@@ -92,20 +97,44 @@ func (source s3ProjectSeedObjectSource) ReadProjectSeedObject(ctx context.Contex
 	key := application.FinalizedUploadObjectKey(ownerUserID, kind, digest)
 	response, err := source.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(source.bucket), Key: aws.String(key)})
 	if err != nil {
-		return nil, fmt.Errorf("read Project Seed object %s: %w", kind, err)
+		wrapped := fmt.Errorf("read Project Seed object %s: %w", kind, err)
+		if isMissingProjectSeedObject(err) {
+			return nil, permanentGuestTransportError{err: wrapped}
+		}
+		return nil, transientGuestTransportError{err: wrapped}
 	}
-	content, err := io.ReadAll(io.LimitReader(response.Body, maximumProjectSeedObjectBytes+1))
+	if response == nil || response.Body == nil {
+		return nil, permanentGuestTransportError{err: fmt.Errorf("read Project Seed object %s: object response has no body", kind)}
+	}
+	content, err := io.ReadAll(io.LimitReader(response.Body, application.ProjectSeedTransportMaximumRawBytes+1))
 	closeErr := response.Body.Close()
 	if err != nil {
-		return nil, fmt.Errorf("read Project Seed object %s body: %w", kind, err)
+		return nil, transientGuestTransportError{err: fmt.Errorf("read Project Seed object %s body: %w", kind, err)}
 	}
-	if len(content) > maximumProjectSeedObjectBytes {
+	if int64(len(content)) > application.ProjectSeedTransportMaximumRawBytes {
 		return nil, permanentGuestTransportError{err: fmt.Errorf("read Project Seed object %s: object exceeds maximum size", kind)}
 	}
 	if closeErr != nil {
-		return nil, fmt.Errorf("close Project Seed object %s: %w", kind, closeErr)
+		return nil, transientGuestTransportError{err: fmt.Errorf("close Project Seed object %s: %w", kind, closeErr)}
 	}
 	return content, nil
+}
+
+func isMissingProjectSeedObject(err error) bool {
+	var noSuchKey *s3types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+	var apiError smithy.APIError
+	if !errors.As(err, &apiError) {
+		return false
+	}
+	switch apiError.ErrorCode() {
+	case "NoSuchKey", "NoSuchVersion", "NotFound":
+		return true
+	default:
+		return false
+	}
 }
 
 type permanentGuestTransportError struct{ err error }
@@ -113,3 +142,9 @@ type permanentGuestTransportError struct{ err error }
 func (err permanentGuestTransportError) Error() string { return err.err.Error() }
 func (err permanentGuestTransportError) Unwrap() error { return err.err }
 func (permanentGuestTransportError) Transient() bool   { return false }
+
+type transientGuestTransportError struct{ err error }
+
+func (err transientGuestTransportError) Error() string { return err.err.Error() }
+func (err transientGuestTransportError) Unwrap() error { return err.err }
+func (transientGuestTransportError) Transient() bool   { return true }

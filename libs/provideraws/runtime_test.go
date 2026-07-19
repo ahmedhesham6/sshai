@@ -16,10 +16,12 @@ import (
 )
 
 type recordingEC2 struct {
-	runInput    *ec2.RunInstancesInput
-	attachInput *ec2.AttachVolumeInput
-	runErr      error
-	attachErr   error
+	runInput                  *ec2.RunInstancesInput
+	attachInput               *ec2.AttachVolumeInput
+	runErr                    error
+	attachErr                 error
+	omitSystemVolumeMapping   bool
+	systemVolumeDescribeCalls int
 }
 
 type divergentRuntimeEC2 struct {
@@ -110,6 +112,7 @@ func (client *recordingEC2) CreateVolume(context.Context, *ec2.CreateVolumeInput
 
 func (client *recordingEC2) DescribeVolumes(_ context.Context, input *ec2.DescribeVolumesInput, _ ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
 	if len(input.Filters) != 0 {
+		client.systemVolumeDescribeCalls++
 		request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
 		tags := append(ownershipTagsForTest("environment-1", "operation-2", systemVolumeResource), runtimeTags(request.RuntimeSpec)...)
 		return &ec2.DescribeVolumesOutput{Volumes: []types.Volume{{
@@ -129,9 +132,37 @@ func (client *recordingEC2) DescribeInstances(context.Context, *ec2.DescribeInst
 		instance := ownedInstanceForTest("i-runtime", "runtime-1")
 		instance.State.Name = types.InstanceStateNamePending
 		instance.PrivateIpAddress = nil
+		if client.omitSystemVolumeMapping {
+			instance.BlockDeviceMappings = nil
+		}
 		return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{instance}}}}, nil
 	}
 	return &ec2.DescribeInstancesOutput{}, nil
+}
+
+func TestEnsureRuntimeReplayReturnsAllocationIdentityWithoutResolvingSystemVolume(t *testing.T) {
+	client := &recordingEC2{runInput: &ec2.RunInstancesInput{}, omitSystemVolumeMapping: true}
+	adapter, err := newProvider(client, Config{
+		Region: "us-east-1", Environment: "development", SizeGiB: 100,
+		Runtime: RuntimeConfig{
+			AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"},
+			SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	observed, err := adapter.EnsureRuntime(t.Context(), runtimeRequest("runtime-1", 1, "image-v1", "vol-data"))
+	if err != nil {
+		t.Fatalf("EnsureRuntime() replay: %v", err)
+	}
+	if observed.Provider != "aws" || observed.ProviderID != "i-runtime" || observed.SystemVolumeProviderID != "" {
+		t.Fatalf("allocation replay identity = %#v", observed)
+	}
+	if client.systemVolumeDescribeCalls != 0 {
+		t.Fatalf("allocation replay described system volume %d times", client.systemVolumeDescribeCalls)
+	}
 }
 
 func (client *recordingEC2) RunInstances(_ context.Context, input *ec2.RunInstancesInput, _ ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error) {

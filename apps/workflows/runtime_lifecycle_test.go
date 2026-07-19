@@ -620,7 +620,7 @@ func newRuntimeWorkflowHarness(ready bool) *runtimeWorkflowHarness {
 func (h *runtimeWorkflowHarness) startDependencies() RuntimeStartDependencies {
 	return RuntimeStartDependencies{
 		Provider: h.provider, Actions: h.actions, DataVolumes: h.volume, Credits: h.credits, Images: h.images,
-		Usage: h.usage, Guest: h.guest, SSHKeys: h.guest, Managed: h.guest, AutoStop: h.auto,
+		Usage: h.usage, Guest: h.guest, SSHKeys: h.guest, Managed: h.guest, Toolchain: h.guest, AutoStop: h.auto,
 		IDs: h.ids, Now: h.now,
 		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
 	}
@@ -960,7 +960,10 @@ type runtimeGuestFake struct {
 	sshCalls, snapshotCalls   int
 	managedCalls              int
 	hostIdentityCalls         int
+	toolchainCalls            int
 	readiness                 RuntimeGuestReadiness
+	readinessErr              error
+	toolchainErr              error
 	snapshotErr               error
 	snapshotLag               time.Duration
 	snapshots                 []*domain.AutoStopActivitySnapshot
@@ -972,7 +975,15 @@ func (fake *runtimeGuestFake) WaitForRuntimeReady(_ context.Context, request Run
 		return RuntimeGuestReadiness{}, errors.New("unexpected guest owner")
 	}
 	fake.readyCalls++
-	return fake.readiness, nil
+	return fake.readiness, fake.readinessErr
+}
+
+func (fake *runtimeGuestFake) ValidateEnvironmentToolchain(_ context.Context, request EnvironmentCreateGuestRequest) error {
+	if request.OwnerUserID != fake.expectedOwnerID {
+		return errors.New("unexpected toolchain owner")
+	}
+	fake.toolchainCalls++
+	return fake.toolchainErr
 }
 func (fake *runtimeGuestFake) ReconcileRuntimeManagedConfiguration(_ context.Context, request RuntimeGuestReadinessRequest) error {
 	if request.OwnerUserID != fake.expectedOwnerID {

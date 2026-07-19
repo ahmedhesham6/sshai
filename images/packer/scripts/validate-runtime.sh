@@ -23,6 +23,9 @@ export OPENCODE_DISABLE_AUTOUPDATE=1
 claude --version | grep -F "$CLAUDE_CODE_VERSION"
 codex --version | grep -F "$CODEX_VERSION"
 opencode --version | grep -F "$OPENCODE_VERSION"
+grep -Fx $'claude\t/usr/local/bin/claude\t'"$CLAUDE_CODE_VERSION" /etc/sshai/agent-versions
+grep -Fx $'codex\t/usr/local/bin/codex\t'"$CODEX_VERSION" /etc/sshai/agent-versions
+grep -Fx $'opencode\t/usr/local/bin/opencode\t'"$OPENCODE_VERSION" /etc/sshai/agent-versions
 
 sshd_config=$(sudo sshd -T)
 grep -qx 'permitrootlogin no' <<<"$sshd_config"

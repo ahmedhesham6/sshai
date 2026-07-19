@@ -25,11 +25,14 @@ type RuntimeStartDependencies struct {
 	ReplacementActions   RuntimeReplaceActions
 	Attachments          provider.RuntimeDataVolumeAttachmentObserver
 	HostIdentity         RuntimeSSHHostIdentityReconciler
+	Toolchain            EnvironmentToolchainValidator
 	AutoStop             RuntimeAutoStopController
 	IDs                  IDGenerator
 	Now                  func() time.Time
 	ProviderPollInterval time.Duration
 	ProviderPollTimeout  time.Duration
+	GuestPollInterval    time.Duration
+	GuestPollTimeout     time.Duration
 }
 
 type RuntimeStartOutput struct {
@@ -140,8 +143,10 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 			Provider: dependencies.Provider, Attachments: dependencies.Attachments, Actions: dependencies.ReplacementActions,
 			DataVolumes: dependencies.DataVolumes, Usage: dependencies.Usage, Guest: dependencies.Guest,
 			HostIdentity: dependencies.HostIdentity, SSHKeys: dependencies.SSHKeys, Managed: dependencies.Managed,
-			AutoStop: dependencies.AutoStop, IDs: dependencies.IDs, Now: dependencies.Now,
+			Toolchain: dependencies.Toolchain,
+			AutoStop:  dependencies.AutoStop, IDs: dependencies.IDs, Now: dependencies.Now,
 			ProviderPollInterval: dependencies.ProviderPollInterval, ProviderPollTimeout: dependencies.ProviderPollTimeout,
+			GuestPollInterval: dependencies.GuestPollInterval, GuestPollTimeout: dependencies.GuestPollTimeout,
 		}, input, state, promotedImage)
 		if replaceErr != nil {
 			return RuntimeStartOutput{}, replaceErr

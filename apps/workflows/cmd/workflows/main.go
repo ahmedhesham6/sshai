@@ -123,7 +123,7 @@ func run(ctx context.Context) error {
 	runtimeStart := workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{
 		Provider: runtimeProvider, Attachments: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Credits: store,
 		Images: promotedImageSource{image: config.imageVersion}, Usage: store, Guest: guest, SSHKeys: guest,
-		Managed: guest, ReplacementActions: runtimeActions, HostIdentity: guest,
+		Managed: guest, ReplacementActions: runtimeActions, HostIdentity: guest, Toolchain: guest,
 		AutoStop: workflowClient, IDs: idGenerator{}, Now: time.Now,
 	})
 	runtimeStop := workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{
@@ -133,7 +133,7 @@ func run(ctx context.Context) error {
 	runtimeReplace := workflows.RuntimeReplaceDefinition(workflows.RuntimeReplaceDependencies{
 		Provider: runtimeProvider, Attachments: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes,
 		Images: promotedImageSource{image: config.imageVersion}, Usage: store, Guest: guest,
-		HostIdentity: guest, SSHKeys: guest, Managed: guest, AutoStop: workflowClient,
+		HostIdentity: guest, SSHKeys: guest, Managed: guest, Toolchain: guest, AutoStop: workflowClient,
 		IDs: idGenerator{}, Now: time.Now,
 	})
 

@@ -40,12 +40,9 @@ func (adapter *Provider) EnsureRuntime(ctx context.Context, request provider.Ens
 			return provider.Runtime{}, err
 		}
 		observation, err := runtimeObservation(request.RuntimeSpec, instance)
+		observation.SystemVolumeProviderID = ""
 		if err != nil || observation.State == provider.RuntimeStateTerminated {
 			return observation, err
-		}
-		observation, err = adapter.withSystemVolumeIdentity(ctx, observation)
-		if err != nil {
-			return provider.Runtime{}, err
 		}
 		if err := adapter.validateSoleActiveRuntime(ctx, request.EnvironmentID, observation.ProviderID); err != nil {
 			return provider.Runtime{}, err
@@ -76,7 +73,9 @@ func (adapter *Provider) EnsureRuntime(ctx context.Context, request provider.Ens
 	if len(output.Instances) != 1 {
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "provider returned an invalid Runtime allocation", nil)
 	}
-	return runtimeObservation(request.RuntimeSpec, output.Instances[0])
+	observation, err := runtimeObservation(request.RuntimeSpec, output.Instances[0])
+	observation.SystemVolumeProviderID = ""
+	return observation, err
 }
 
 // EnsureRuntimeDataVolumeAttachment idempotently attaches the persistent Data

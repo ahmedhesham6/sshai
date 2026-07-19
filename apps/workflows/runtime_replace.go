@@ -22,11 +22,14 @@ type RuntimeReplaceDependencies struct {
 	HostIdentity         RuntimeSSHHostIdentityReconciler
 	SSHKeys              RuntimeSSHKeyReconciler
 	Managed              RuntimeManagedConfigurationReconciler
+	Toolchain            EnvironmentToolchainValidator
 	AutoStop             RuntimeAutoStopController
 	IDs                  IDGenerator
 	Now                  func() time.Time
 	ProviderPollInterval time.Duration
 	ProviderPollTimeout  time.Duration
+	GuestPollInterval    time.Duration
+	GuestPollTimeout     time.Duration
 }
 
 type RuntimeReplaceOutput struct {
@@ -78,8 +81,8 @@ func (workflow *runtimeReplaceWorkflow) Run(ctx restate.WorkflowContext, input d
 }
 
 func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies RuntimeReplaceDependencies, input domain.RuntimeOperationDispatch, state RuntimeOperationState, image string) (RuntimeReplaceOutput, error) {
-	if dependencies.Actions == nil || dependencies.HostIdentity == nil || dependencies.Managed == nil {
-		return RuntimeReplaceOutput{}, restate.TerminalErrorf("replacement actions, SSH host identity, and managed configuration reconcilers are required")
+	if dependencies.Actions == nil || dependencies.HostIdentity == nil || dependencies.Managed == nil || dependencies.Toolchain == nil {
+		return RuntimeReplaceOutput{}, restate.TerminalErrorf("replacement actions, SSH host identity, managed configuration, and toolchain reconcilers are required")
 	}
 	if dependencies.Attachments == nil {
 		return RuntimeReplaceOutput{}, restate.TerminalErrorf("Runtime data-volume attachment observer is required")
@@ -357,10 +360,7 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 	// Steps 7-8: the current boot must prove the durable data mount before host
 	// identity, keys, managed configuration, readiness, and proxy re-admission.
 	guestRequest := RuntimeGuestReadinessRequest{OwnerUserID: input.OwnerUserID, EnvironmentID: input.EnvironmentID, RuntimeID: replacement.ID, ProviderID: request.ProviderID, PrivateIPv4: running.Runtime.PrivateIPv4}
-	ready, err := restate.Run(ctx, func(runCtx restate.RunContext) (RuntimeGuestReadiness, error) {
-		value, readyErr := dependencies.Guest.WaitForRuntimeReady(runCtx, guestRequest)
-		return value, classifyDurableError(readyErr)
-	}, restate.WithName("wait-for-replacement-guest-readiness"))
+	ready, err := waitForRuntimeGuestReadiness(ctx, dependencies.Guest, guestRequest, dependencies.GuestPollInterval, dependencies.GuestPollTimeout, dependencies.Now)
 	if err != nil {
 		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, GuestNotReady, err.Error())
 	}
@@ -386,6 +386,13 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 		if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error { return classifyDurableError(reconciliation.run(runCtx)) }, restate.WithName(reconciliation.name)); err != nil {
 			return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, RuntimeReplaceFailed, err.Error())
 		}
+	}
+	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
+		return classifyDurableError(dependencies.Toolchain.ValidateEnvironmentToolchain(runCtx, EnvironmentCreateGuestRequest{
+			OperationID: input.OperationID, RuntimeGuestReadinessRequest: guestRequest,
+		}))
+	}, restate.WithName("validate-replacement-toolchain")); err != nil {
+		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, "PROFILE_INCOMPATIBLE", err.Error())
 	}
 	next, _ = domain.RestoreRuntime(replacement)
 	readyObservedAt, err := durableWorkflowTime(ctx, "record-replacement-ready-observed-at", dependencies.Now)
