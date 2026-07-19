@@ -44,6 +44,11 @@ type cli struct {
 	newLoginFlow     func(string) (loginFlow, error)
 	newRefreshClient func(string) (tokenRefresher, error)
 	newAttempt       func() (string, error)
+	git              gitRunner
+	runSSHClient     sshClientRunner
+	wait             func(context.Context, time.Duration) error
+	stopPollInterval time.Duration
+	stopWaitTimeout  time.Duration
 }
 
 func newCLI() cli {
@@ -74,13 +79,18 @@ func newCLI() cli {
 		newRefreshClient: func(clientID string) (tokenRefresher, error) {
 			return auth.NewRefreshClient(clientID)
 		},
-		newAttempt: newCLIAttempt,
+		newAttempt:       newCLIAttempt,
+		git:              runGit,
+		runSSHClient:     runOpenSSH,
+		wait:             waitForContext,
+		stopPollInterval: time.Second,
+		stopWaitTimeout:  60 * time.Second,
 	}
 }
 
 func (application cli) run(ctx context.Context, arguments []string) error {
 	if len(arguments) == 0 {
-		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh|ssh-proxy>")
+		return application.runBare(ctx)
 	}
 	switch arguments[0] {
 	case "login":
@@ -98,9 +108,20 @@ func (application cli) run(ctx context.Context, arguments []string) error {
 		if err != nil {
 			return fmt.Errorf("resolve user config directory: %w", err)
 		}
-		return runLogin(ctx, flow, configDirectory, application.output)
+		if err := runLogin(ctx, flow, configDirectory, application.output); err != nil {
+			return err
+		}
+		return newLocalStateStore(configDirectory).EnsureConfig(ctx)
 	case "plan":
 		return application.runPlan(ctx, arguments[1:])
+	case "status":
+		return application.runStatus(ctx, arguments[1:])
+	case "stop":
+		return application.runStop(ctx, arguments[1:])
+	case "logout":
+		return application.runLogout(ctx, arguments[1:])
+	case "doctor":
+		return application.runDoctor(ctx, arguments[1:])
 	case "inspect":
 		return application.runInspect(ctx, arguments[1:])
 	case "capsule":
@@ -110,7 +131,7 @@ func (application cli) run(ctx context.Context, arguments []string) error {
 	case "ssh-proxy":
 		return application.runSSHProxy(ctx, arguments[1:])
 	default:
-		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh|ssh-proxy>")
+		return fmt.Errorf("usage: devm [inspect|plan|status|stop|doctor|logout|capsule|login|ssh|ssh-proxy]")
 	}
 }
 

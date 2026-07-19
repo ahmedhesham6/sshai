@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -14,7 +15,13 @@ import (
 type tokenFileLock struct{ file *os.File }
 
 func acquireTokenFileLock(ctx context.Context, directory *anchoredDirectory) (*tokenFileLock, error) {
-	const name = "tokens.lock"
+	return acquirePrivateFileLock(ctx, directory, "tokens.lock")
+}
+
+func acquirePrivateFileLock(ctx context.Context, directory *anchoredDirectory, name string) (*tokenFileLock, error) {
+	if name == "" || filepath.Base(name) != name || name == "." {
+		return nil, errors.New("lock file name is invalid")
+	}
 	file, err := directory.root.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err

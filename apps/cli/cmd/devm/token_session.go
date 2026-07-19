@@ -110,6 +110,28 @@ func (session *tokenSession) Delete(ctx context.Context) error {
 	return syncAnchoredDirectory(authDirectory)
 }
 
+func (session *tokenSession) Stored() (bool, error) {
+	if session == nil {
+		return false, errors.New("inspect token session: session is not initialized")
+	}
+	authDirectory, err := openPrivateAuthDirectory(session.configDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect token session: %w", err)
+	}
+	defer authDirectory.Close()
+	info, err := authDirectory.root.Lstat("tokens.json")
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return false, errors.New("inspect token session: credentials are not a private regular file")
+	}
+	return true, nil
+}
+
 func persistCredentials(configDirectory string, credentials loginCredentials) error {
 	state, err := openOwnedDirectory(configDirectory)
 	if err != nil {
