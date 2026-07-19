@@ -17,10 +17,10 @@ import (
 
 const (
 	CreditsPolicyBlocked        = "CREDITS_POLICY_BLOCKED"
-	ReplaceRequired             = "REPLACE_REQUIRED"
 	GuestNotReady               = "GUEST_NOT_READY"
 	RuntimeStartFailed          = "RUNTIME_START_FAILED"
 	RuntimeStopFailed           = "RUNTIME_STOP_FAILED"
+	RuntimeReplaceFailed        = "RUNTIME_REPLACE_FAILED"
 	RuntimeReplaceService       = "RuntimeReplace"
 	defaultProviderPollInterval = 5 * time.Second
 	defaultProviderPollTimeout  = 10 * time.Minute
@@ -54,6 +54,12 @@ type RuntimeStopActions interface {
 	RecordRuntimeStopReason(context.Context, string, domain.RuntimeStopReason) error
 	RecordRuntimeStopSnapshot(context.Context, string, AutoStopObservation) error
 	RecordRuntimeStopAudit(context.Context, string, domain.RuntimeStopAuditEvidence) error
+}
+
+type RuntimeReplaceActions interface {
+	RuntimeLifecycleActions
+	PersistRuntimeReplacement(context.Context, string, string, int64, domain.RuntimeSnapshot, domain.RuntimeReservation) (domain.RuntimeSnapshot, error)
+	PersistReplacementRuntimeTransition(context.Context, string, int64, domain.RuntimeSnapshot) error
 }
 
 type RuntimeDataVolumeRequest struct {
@@ -102,6 +108,10 @@ type RuntimeGuestReadinessSource interface {
 
 type RuntimeSSHKeyReconciler interface {
 	ReconcileRuntimeSSHKeys(context.Context, RuntimeGuestReadinessRequest) error
+}
+
+type RuntimeSSHHostIdentityReconciler interface {
+	RestoreRuntimeSSHHostIdentity(context.Context, RuntimeGuestReadinessRequest) error
 }
 
 type RuntimeManagedConfigurationReconciler interface {

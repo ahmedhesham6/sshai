@@ -36,6 +36,7 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 		autoStop:          workflows.AutoStopDefinition(nil, nil),
 		runtimeStart:      workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{}),
 		runtimeStop:       workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{}),
+		runtimeReplace:    workflows.RuntimeReplaceDefinition(workflows.RuntimeReplaceDependencies{}),
 	})
 	names := make([]string, len(services))
 	for index, service := range services {
@@ -43,7 +44,7 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 	}
 	want := []string{
 		workflows.BillingDeliveryService, workflows.EnvironmentCreateService, workflows.ProfileResolveService,
-		workflows.AutoStopService, workflows.RuntimeStartService, workflows.RuntimeStopService,
+		workflows.AutoStopService, workflows.RuntimeStartService, workflows.RuntimeStopService, workflows.RuntimeReplaceService,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("bound services = %v, want %v", names, want)

@@ -19,6 +19,7 @@ const (
 )
 
 var _ provider.RuntimeProvider = (*Provider)(nil)
+var _ provider.RuntimeDataVolumeAttachmentObserver = (*Provider)(nil)
 
 func (adapter *Provider) EnsureRuntime(ctx context.Context, request provider.EnsureRuntimeRequest) (provider.Runtime, error) {
 	instanceType, err := adapter.validateEnsureRuntimeRequest(request)
@@ -182,6 +183,38 @@ func (adapter *Provider) ObserveRuntime(ctx context.Context, request provider.Ru
 		return provider.Runtime{}, err
 	}
 	return runtimeObservation(request.RuntimeSpec, instances[0])
+}
+
+func (adapter *Provider) ObserveRuntimeDataVolumeAttachment(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.RuntimeDataVolumeAttachment, error) {
+	if _, err := adapter.validateRuntimeSpec(request.RuntimeSpec); err != nil {
+		return provider.RuntimeDataVolumeAttachment{}, err
+	}
+	if strings.TrimSpace(request.ProviderID) == "" {
+		return provider.RuntimeDataVolumeAttachment{}, provider.NewError(provider.ErrorCodeInvalidRequest, "provider Runtime identity is required", nil)
+	}
+	volume, err := adapter.dataVolume(ctx, request.RuntimeSpec)
+	if err != nil {
+		return provider.RuntimeDataVolumeAttachment{}, err
+	}
+	observation := provider.RuntimeDataVolumeAttachment{DataVolumeProviderID: request.DataVolumeProviderID}
+	switch len(volume.Attachments) {
+	case 0:
+		return observation, nil
+	case 1:
+		attachment := volume.Attachments[0]
+		if aws.ToString(attachment.InstanceId) != request.ProviderID {
+			return provider.RuntimeDataVolumeAttachment{}, provider.NewError(provider.ErrorCodePlacementConflict, "Data Volume is attached to another Runtime", nil)
+		}
+		if aws.ToBool(attachment.DeleteOnTermination) {
+			return provider.RuntimeDataVolumeAttachment{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Data Volume attachment is not persistent", nil)
+		}
+		observation.RuntimeProviderID = request.ProviderID
+		observation.Attached = true
+		observation.ReadWrite = true
+		return observation, nil
+	default:
+		return provider.RuntimeDataVolumeAttachment{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Data Volume has multiple attachments", nil)
+	}
 }
 
 func (adapter *Provider) ensureDataVolumeAttachment(ctx context.Context, volumeID string, instance types.Instance, volume types.Volume) error {
@@ -359,7 +392,11 @@ func runtimeTags(spec provider.RuntimeSpec) []types.Tag {
 func runtimeObservation(spec provider.RuntimeSpec, instance types.Instance) (provider.Runtime, error) {
 	state := provider.RuntimeState("")
 	if instance.State != nil {
-		state = provider.RuntimeState(instance.State.Name)
+		if instance.State.Name == types.InstanceStateNameShuttingDown {
+			state = provider.RuntimeStateStopping
+		} else {
+			state = provider.RuntimeState(instance.State.Name)
+		}
 	}
 	switch state {
 	case provider.RuntimeStatePending, provider.RuntimeStateRunning, provider.RuntimeStateStopping, provider.RuntimeStateStopped, provider.RuntimeStateTerminated:

@@ -106,3 +106,17 @@ type RuntimeProvider interface {
 	RetireRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)
 	ObserveRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)
 }
+
+type RuntimeDataVolumeAttachment struct {
+	DataVolumeProviderID string
+	RuntimeProviderID    string
+	Attached             bool
+	ReadWrite            bool
+}
+
+// RuntimeDataVolumeAttachmentObserver is kept separate from RuntimeProvider
+// so lifecycle adapters can expose the replacement safety observation without
+// widening providers that do not manage persistent attachments.
+type RuntimeDataVolumeAttachmentObserver interface {
+	ObserveRuntimeDataVolumeAttachment(context.Context, RuntimeLifecycleRequest) (RuntimeDataVolumeAttachment, error)
+}

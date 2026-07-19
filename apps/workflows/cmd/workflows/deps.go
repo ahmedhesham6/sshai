@@ -231,6 +231,14 @@ func (actions *runtimeWorkflowActions) PersistRuntimeTransition(ctx context.Cont
 	return actions.store.PersistRuntimeWorkflowTransition(ctx, operationID, expectedVersion, next)
 }
 
+func (actions *runtimeWorkflowActions) PersistRuntimeReplacement(ctx context.Context, operationID, ownerUserID string, expectedVersion int64, retired domain.RuntimeSnapshot, reservation domain.RuntimeReservation) (domain.RuntimeSnapshot, error) {
+	return actions.store.PersistRuntimeReplacement(ctx, operationID, ownerUserID, expectedVersion, retired, reservation)
+}
+
+func (actions *runtimeWorkflowActions) PersistReplacementRuntimeTransition(ctx context.Context, operationID string, expectedVersion int64, next domain.RuntimeSnapshot) error {
+	return actions.store.PersistReplacementRuntimeTransition(ctx, operationID, expectedVersion, next)
+}
+
 func (actions *runtimeWorkflowActions) CompleteRuntimeOperation(ctx context.Context, operationID string, at time.Time) error {
 	return actions.store.CompleteRuntimeWorkflowOperation(ctx, operationID, at)
 }
@@ -320,6 +328,10 @@ func (unavailableGuestTransport) ReconcileRuntimeSSHKeys(context.Context, workfl
 	return unavailableGuestTransportError{operation: "SSH Key reconciliation"}
 }
 
+func (unavailableGuestTransport) RestoreRuntimeSSHHostIdentity(context.Context, workflows.RuntimeGuestReadinessRequest) error {
+	return unavailableGuestTransportError{operation: "SSH host identity restoration"}
+}
+
 func (unavailableGuestTransport) ReconcileRuntimeManagedConfiguration(context.Context, workflows.RuntimeGuestReadinessRequest) error {
 	return unavailableGuestTransportError{operation: "managed configuration reconciliation"}
 }
@@ -356,11 +368,13 @@ func (dispatcher runtimeStopDispatcher) DispatchRuntimeStop(ctx context.Context,
 var (
 	_ workflows.RuntimeStartActions                   = (*runtimeWorkflowActions)(nil)
 	_ workflows.RuntimeStopActions                    = (*runtimeWorkflowActions)(nil)
+	_ workflows.RuntimeReplaceActions                 = (*runtimeWorkflowActions)(nil)
 	_ workflows.AutoStopSnapshotSource                = autoStopSnapshotSource{}
 	_ workflows.RuntimeDataVolumeVerifier             = runtimeDataVolumeVerifier{}
 	_ workflows.PromotedImageSource                   = promotedImageSource{}
 	_ workflows.RuntimeGuestReadinessSource           = unavailableGuestTransport{}
 	_ workflows.RuntimeSSHKeyReconciler               = unavailableGuestTransport{}
+	_ workflows.RuntimeSSHHostIdentityReconciler      = unavailableGuestTransport{}
 	_ workflows.RuntimeManagedConfigurationReconciler = unavailableGuestTransport{}
 	_ workflows.RuntimeGuestShutdownPreparer          = unavailableGuestTransport{}
 	_ workflows.RuntimeStopDispatcher                 = runtimeStopDispatcher{}

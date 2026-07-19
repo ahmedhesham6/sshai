@@ -201,6 +201,20 @@ func TestRuntimeLifecycleReturnsPreTerminatedObservation(t *testing.T) {
 	}
 }
 
+func TestRuntimeObservationTreatsEC2ShuttingDownAsRetirementInProgress(t *testing.T) {
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	instance := ownedInstanceForTest("i-runtime", "runtime-1")
+	instance.State.Name = types.InstanceStateNameShuttingDown
+	instance.PrivateIpAddress = nil
+	observed, err := runtimeObservation(request.RuntimeSpec, instance)
+	if err != nil {
+		t.Fatalf("runtimeObservation(shutting-down): %v", err)
+	}
+	if observed.State != provider.RuntimeStateStopping {
+		t.Fatalf("shutting-down observation state = %q, want %q", observed.State, provider.RuntimeStateStopping)
+	}
+}
+
 func TestRuntimeProviderConformance(t *testing.T) {
 	providertest.RunRuntimeLifecycle(t, func(t *testing.T) providertest.RuntimeHarness {
 		adapter, ec2Client := startAdapter(t)
@@ -243,6 +257,10 @@ func TestRuntimeReplacementRetiresOldBeforeReattachingPersistentData(t *testing.
 		t.Fatal("EnsureRuntime() attached replacement before retiring old Runtime")
 	}
 	lifecycle := provider.RuntimeLifecycleRequest{RuntimeSpec: oldRequest.RuntimeSpec, ProviderID: old.ProviderID}
+	attached, err := adapter.ObserveRuntimeDataVolumeAttachment(t.Context(), lifecycle)
+	if err != nil || !attached.Attached || !attached.ReadWrite || attached.RuntimeProviderID != old.ProviderID {
+		t.Fatalf("old Runtime Data Volume attachment = %#v, %v", attached, err)
+	}
 	if _, err := adapter.StartRuntime(t.Context(), lifecycle); err != nil {
 		t.Fatalf("StartRuntime(): %v", err)
 	}
@@ -251,6 +269,10 @@ func TestRuntimeReplacementRetiresOldBeforeReattachingPersistentData(t *testing.
 	}
 	if _, err := adapter.RetireRuntime(t.Context(), lifecycle); err != nil {
 		t.Fatalf("RetireRuntime(): %v", err)
+	}
+	detached, err := adapter.ObserveRuntimeDataVolumeAttachment(t.Context(), lifecycle)
+	if err != nil || detached.Attached || detached.DataVolumeProviderID != volume.ProviderID {
+		t.Fatalf("retired Runtime Data Volume attachment = %#v, %v", detached, err)
 	}
 	replacement, err := adapter.EnsureRuntime(t.Context(), newRequest)
 	if err != nil {
