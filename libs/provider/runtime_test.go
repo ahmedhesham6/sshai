@@ -60,10 +60,17 @@ func (adapter *memoryRuntimeAdapter) EnsureRuntime(_ context.Context, request pr
 	}
 	if adapter.runtime.ProviderID == "" {
 		adapter.runtime = observedRuntime(request.RuntimeSpec, "memory-runtime-1", provider.RuntimeStatePending)
-		adapter.dataAttached = true
 	} else if adapter.runtime.RuntimeSpec != request.RuntimeSpec {
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Runtime spec diverged", nil)
 	}
+	return adapter.runtime, nil
+}
+
+func (adapter *memoryRuntimeAdapter) EnsureRuntimeDataVolumeAttachment(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	if err := adapter.validate(request); err != nil {
+		return provider.Runtime{}, err
+	}
+	adapter.dataAttached = true
 	return adapter.runtime, nil
 }
 

@@ -102,6 +102,14 @@ func (*creationRepositoryFake) ReserveInitialRuntime(context.Context, string, do
 	return domain.Runtime{}, nil
 }
 
+func (*creationRepositoryFake) PersistEnvironmentCreateRuntimeTransition(context.Context, string, int64, domain.RuntimeSnapshot) error {
+	return nil
+}
+
+func (*creationRepositoryFake) FinishEnvironmentCreateOperation(context.Context, string, domain.OperationStatus, string, string, time.Time) error {
+	return nil
+}
+
 func (*creationRepositoryFake) CompleteEnvironmentCreation(context.Context, string, time.Time) (domain.EnvironmentCreation, error) {
 	return domain.EnvironmentCreation{}, nil
 }
