@@ -88,24 +88,28 @@ func buildHandler(ctx context.Context, config config, verifier sshproxy.BearerVe
 		DialTimeout:   config.dialTimeout, IdleTimeout: config.idleTimeout,
 		StartTimeout: config.startTimeout, SettleTimeout: config.settleTimeout, PollInterval: config.pollInterval,
 		ControlTimeout: config.controlTimeout, BufferBytes: config.bufferBytes,
+		MaxWaitingConnections:               config.maxWaitingConnections,
+		MaxWaitingConnectionsPerEnvironment: config.maxWaitingConnectionsPerEnvironment,
 	})
 }
 
 type config struct {
-	databaseURL     string
-	controlPlaneURL string
-	region          string
-	listenAddress   string
-	workOSClientID  string
-	workOSIssuer    string
-	workOSJWKSURL   string
-	dialTimeout     time.Duration
-	idleTimeout     time.Duration
-	startTimeout    time.Duration
-	settleTimeout   time.Duration
-	pollInterval    time.Duration
-	controlTimeout  time.Duration
-	bufferBytes     int
+	databaseURL                         string
+	controlPlaneURL                     string
+	region                              string
+	listenAddress                       string
+	workOSClientID                      string
+	workOSIssuer                        string
+	workOSJWKSURL                       string
+	dialTimeout                         time.Duration
+	idleTimeout                         time.Duration
+	startTimeout                        time.Duration
+	settleTimeout                       time.Duration
+	pollInterval                        time.Duration
+	controlTimeout                      time.Duration
+	bufferBytes                         int
+	maxWaitingConnections               int
+	maxWaitingConnectionsPerEnvironment int
 }
 
 func loadConfig() (config, error) {
@@ -140,6 +144,12 @@ func loadConfig() (config, error) {
 		return result, err
 	}
 	if result.bufferBytes, err = intOrDefault("BRIDGE_BUFFER_BYTES", 32*1024); err != nil {
+		return result, err
+	}
+	if result.maxWaitingConnections, err = intOrDefault("MAX_WAITING_CONNECTIONS", 64); err != nil {
+		return result, err
+	}
+	if result.maxWaitingConnectionsPerEnvironment, err = intOrDefault("MAX_WAITING_CONNECTIONS_PER_ENVIRONMENT", 4); err != nil {
 		return result, err
 	}
 	return result, nil

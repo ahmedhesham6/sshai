@@ -75,7 +75,7 @@ Environment detail includes the pinned `ProfileVersionID`, `LockID`, pending Cap
 
 - `POST /v1/environments/{environmentId}/connection-intents`
 
-A Connection Intent authorizes exactly one short-lived WSS admission attempt and returns the regional WSS endpoint, stable logical host name, and nullable Runtime/start Operation state. The CLI presents its ID in `X-Connection-Intent-ID`; the regional proxy atomically consumes it before upgrade after matching its owner and Environment to the verified bearer and route path. Missing, expired, or already-used Intents are refused. Expiry is an admission deadline: it does not interrupt an attempt that was already consumed and admitted. The Intent is not an SSH credential, and the bearer remains mandatory.
+A Connection Intent authorizes exactly one short-lived WSS admission attempt and returns the regional WSS endpoint, stable logical host name, and nullable Runtime/start Operation state. The CLI presents its ID in `X-Connection-Intent-ID`; the regional proxy validates it read-only before upgrade, then atomically consumes it immediately after a successful upgrade after matching its owner and Environment to the verified bearer and route path. Missing, expired, or already-used Intents are refused. Expiry is an admission deadline: it does not interrupt an attempt that was already consumed and admitted. The Intent is not an SSH credential, and the bearer remains mandatory.
 
 Updating the Auto-stop Policy is an asynchronous Environment Operation because it must durably cancel or replace pending Restate timers.
 

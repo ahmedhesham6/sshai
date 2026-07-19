@@ -7,6 +7,7 @@ import (
 
 	sshproxy "github.com/ahmedhesham6/sshai/apps/ssh-proxy"
 	"github.com/ahmedhesham6/sshai/libs/auth"
+	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -32,6 +33,36 @@ func TestPostgresRouteStoreRequiresCurrentBootReadyRow(t *testing.T) {
 			}
 			if test.wantRoute != "" && (route.RuntimeID != "runtime-1" || route.BootID != "boot-1") {
 				t.Fatalf("route identity = %#v", route)
+			}
+		})
+	}
+}
+
+func TestPostgresRouteStoreMapsEveryDomainRuntimeStatus(t *testing.T) {
+	for _, status := range domain.RuntimeStatuses() {
+		status := status
+		t.Run(string(status), func(t *testing.T) {
+			store := postgresRouteStore{
+				queries: queryerStub{row: rowStub{values: []any{"runtime-1", string(status), "10.0.0.4", "boot-1", int64(9)}}},
+				region:  "eu-central-1",
+			}
+			route, err := store.ResolveSSH(context.Background(), auth.Subject{WorkOSUserID: "user-1"}, "env-1")
+			switch status {
+			case domain.RuntimeReady:
+				if err != nil || route.PrivateAddress != "10.0.0.4:22" {
+					t.Fatalf("ready mapping = route:%#v error:%v", route, err)
+				}
+			case domain.RuntimeError:
+				if !errors.Is(err, sshproxy.ErrRuntimeStartFailed) {
+					t.Fatalf("error mapping = %v", err)
+				}
+			case domain.RuntimeAbsent, domain.RuntimeProvisioning, domain.RuntimeStarting,
+				domain.RuntimeStopping, domain.RuntimeStopped, domain.RuntimeReplacing:
+				if !errors.Is(err, sshproxy.ErrRuntimeNotReady) {
+					t.Fatalf("not-ready mapping = %v", err)
+				}
+			default:
+				t.Fatalf("domain Runtime status %q has no proxy mapping", status)
 			}
 		})
 	}

@@ -48,13 +48,16 @@ func TestCreateConnectionIntentHTTP(t *testing.T) {
 			if test.activeOperation != nil {
 				operations.operations[*test.activeOperation] = db.OperationDetail{Operation: queuedConnectionOperation(*test.activeOperation, "environment-1", domain.OperationRuntimeStart, "active-start-key")}
 			}
-			repository := &connectionRuntimeRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}}
+			repository := &runtimeCommandHTTPRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}}
 			dispatcher := &runtimeCommandHTTPDispatcherFake{}
-			runtimeCommands := application.NewRuntimeCommandService(repository, dispatcher, connectionBalanceFake{credits: test.credits}, &idsFake{values: []string{"operation-1"}}, fixedNow)
+			runtimeCommands := application.NewRuntimeCommandService(repository, dispatcher, runtimeCommandBalanceHTTPFake{credits: test.credits}, &idsFake{values: []string{"operation-1"}}, fixedNow)
 			intentIDs := &idsFake{values: []string{"intent-1"}}
 			handler := connectionIntentHandler(reads, operations, runtimeCommands, test.proxyURLs, intentIDs, 0, 1)
 
 			response := serveConnectionIntentRequest(handler, test.environmentID, "runtime-request-0001")
+			if reads.getCalls != 1 {
+				t.Fatalf("owned Environment reads = %d, want one loaded detail", reads.getCalls)
+			}
 
 			if response.Code != test.wantStatus {
 				t.Fatalf("status = %d, want %d; body:%s", response.Code, test.wantStatus, response.Body.String())
@@ -96,9 +99,9 @@ func TestCreateConnectionIntentReplaysStartOperation(t *testing.T) {
 	detail := connectionEnvironmentDetail(t, domain.RuntimeStopped)
 	reads := &environmentReaderFake{expectedOwnerID: "user-1", environments: map[string]db.EnvironmentDetail{"environment-1": detail}}
 	operations := newConnectionOperationReader()
-	repository := &connectionRuntimeRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}, reads: reads, operationReads: operations}
+	repository := &runtimeCommandHTTPRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}, reads: reads, operationReads: operations}
 	dispatcher := &runtimeCommandHTTPDispatcherFake{}
-	runtimeCommands := application.NewRuntimeCommandService(repository, dispatcher, connectionBalanceFake{credits: 1}, &idsFake{values: []string{"operation-1", "operation-unused"}}, fixedNow)
+	runtimeCommands := application.NewRuntimeCommandService(repository, dispatcher, runtimeCommandBalanceHTTPFake{credits: 1}, &idsFake{values: []string{"operation-1", "operation-unused"}}, fixedNow)
 	intentIDs := &idsFake{values: []string{"intent-1", "intent-unused"}}
 	handler := connectionIntentHandler(reads, operations, runtimeCommands, testRegionalProxyURLs(), intentIDs, time.Minute, 2)
 
@@ -135,8 +138,8 @@ func TestCreateConnectionIntentGateScenarios(t *testing.T) {
 		detail := connectionEnvironmentDetail(t, domain.RuntimeStopped)
 		reads := &environmentReaderFake{expectedOwnerID: "user-1", environments: map[string]db.EnvironmentDetail{"environment-1": detail}}
 		operations := newConnectionOperationReader()
-		runtimeRepository := &connectionRuntimeRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}, reads: reads, operationReads: operations}
-		runtimeCommands := application.NewRuntimeCommandService(runtimeRepository, &runtimeCommandHTTPDispatcherFake{}, connectionBalanceFake{credits: 1}, &idsFake{values: []string{"operation-1"}}, fixedNow)
+		runtimeRepository := &runtimeCommandHTTPRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}, reads: reads, operationReads: operations}
+		runtimeCommands := application.NewRuntimeCommandService(runtimeRepository, &runtimeCommandHTTPDispatcherFake{}, runtimeCommandBalanceHTTPFake{credits: 1}, &idsFake{values: []string{"operation-1"}}, fixedNow)
 		intentIDs := &idsFake{values: []string{"intent-1", "intent-unused"}}
 		handler := connectionIntentHandler(reads, operations, runtimeCommands, testRegionalProxyURLs(), intentIDs, time.Minute, 2)
 
@@ -191,8 +194,8 @@ func TestCreateConnectionIntentGateScenarios(t *testing.T) {
 		detail := connectionEnvironmentDetail(t, domain.RuntimeStopped)
 		reads := &environmentReaderFake{expectedOwnerID: "user-1", environments: map[string]db.EnvironmentDetail{"environment-1": detail}}
 		operations := newConnectionOperationReader()
-		runtimeRepository := &connectionRuntimeRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}, reads: reads, operationReads: operations, publishActiveOnConflict: true}
-		runtimeCommands := application.NewRuntimeCommandService(runtimeRepository, &runtimeCommandHTTPDispatcherFake{}, connectionBalanceFake{credits: 1}, &idsFake{values: []string{"operation-1", "operation-unused"}}, fixedNow)
+		runtimeRepository := &runtimeCommandHTTPRepositoryFake{expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, operations: map[string]domain.Operation{}, reads: reads, operationReads: operations, publishActiveOnConflict: true}
+		runtimeCommands := application.NewRuntimeCommandService(runtimeRepository, &runtimeCommandHTTPDispatcherFake{}, runtimeCommandBalanceHTTPFake{credits: 1}, &idsFake{values: []string{"operation-1", "operation-unused"}}, fixedNow)
 		handler := connectionIntentHandler(reads, operations, runtimeCommands, testRegionalProxyURLs(), &idsFake{values: []string{"intent-1", "intent-2"}}, time.Minute, 2)
 
 		first := decodeConnectionIntent(t, serveConnectionIntentRequest(handler, "environment-1", "connection-key-0001"))
@@ -224,69 +227,6 @@ func TestRegionalProxyURLsAreValidatedAtHandlerConstruction(t *testing.T) {
 			_ = controlplane.NewHandler(controlplane.Config{RegionalProxyURLs: map[string]string{"us-east-1": test.url}})
 		})
 	}
-}
-
-type connectionRuntimeRepositoryFake struct {
-	expectedOwnerID         string
-	environment             domain.Environment
-	runtime                 domain.Runtime
-	operation               domain.Operation
-	replayCalls             int
-	reserveCalls            int
-	operations              map[string]domain.Operation
-	reads                   *environmentReaderFake
-	operationReads          *operationReaderFake
-	publishActiveOnConflict bool
-}
-
-func (fake *connectionRuntimeRepositoryFake) ReplayRuntimeOperation(_ context.Context, candidate domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error) {
-	fake.replayCalls++
-	if err := requireOwner("ReplayRuntimeOperation", candidate.Snapshot().RequestedByUserID, fake.expectedOwnerID); err != nil {
-		return domain.EnvironmentRuntimeOperation{}, false, err
-	}
-	operation, present := fake.operations[candidate.Snapshot().IdempotencyKey]
-	if !present {
-		return domain.EnvironmentRuntimeOperation{}, false, nil
-	}
-	command, err := domain.RestoreEnvironmentRuntimeOperation(fake.environment, fake.runtime, operation)
-	return command, true, err
-}
-
-func (fake *connectionRuntimeRepositoryFake) ReserveRuntimeOperation(_ context.Context, operation domain.Operation) (domain.EnvironmentRuntimeOperation, error) {
-	fake.reserveCalls++
-	if err := requireOwner("ReserveRuntimeOperation", operation.Snapshot().RequestedByUserID, fake.expectedOwnerID); err != nil {
-		return domain.EnvironmentRuntimeOperation{}, err
-	}
-	if fake.operation.Snapshot().ID != "" && fake.operation.Snapshot().Status != domain.OperationSucceeded {
-		if fake.reads != nil {
-			detail := fake.reads.environments[operation.Snapshot().EnvironmentID]
-			operationID := fake.operation.Snapshot().ID
-			detail.ActiveOperationID = &operationID
-			fake.reads.environments[operation.Snapshot().EnvironmentID] = detail
-		}
-		return domain.EnvironmentRuntimeOperation{}, db.ErrOperationConflict
-	}
-	fake.operation = operation
-	fake.operations[operation.Snapshot().IdempotencyKey] = operation
-	if fake.reads != nil && !fake.publishActiveOnConflict {
-		detail := fake.reads.environments[operation.Snapshot().EnvironmentID]
-		operationID := operation.Snapshot().ID
-		detail.ActiveOperationID = &operationID
-		fake.reads.environments[operation.Snapshot().EnvironmentID] = detail
-	}
-	if fake.operationReads != nil {
-		fake.operationReads.operations[operation.Snapshot().ID] = db.OperationDetail{Operation: operation}
-	}
-	return domain.NewEnvironmentRuntimeOperation(fake.environment, fake.runtime, operation)
-}
-
-type connectionBalanceFake struct{ credits int64 }
-
-func (fake connectionBalanceFake) CreditBalance(_ context.Context, ownerID string) (db.CreditBalanceProjection, error) {
-	if err := requireOwner("CreditBalance", ownerID, "user-1"); err != nil {
-		return db.CreditBalanceProjection{}, err
-	}
-	return db.CreditBalanceProjection{UserID: ownerID, Credits: fake.credits}, nil
 }
 
 func connectionIntentHandler(reads controlplane.EnvironmentReader, operationReads controlplane.OperationReader, runtimeCommands *application.RuntimeCommandService, proxyURLs map[string]string, intentIDs application.IDGenerator, ttl time.Duration, requests int) http.Handler {

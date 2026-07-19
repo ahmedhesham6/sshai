@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrConnectionIntentNotFound = errors.New("Connection Intent not found")
-	ErrConnectionIntentExpired  = errors.New("Connection Intent expired")
-	ErrConnectionIntentUsed     = errors.New("Connection Intent already used")
+	ErrConnectionIntentNotFound  = errors.New("Connection Intent not found")
+	ErrConnectionIntentExpired   = errors.New("Connection Intent expired")
+	ErrConnectionIntentUsed      = errors.New("Connection Intent already used")
+	ErrConnectionIntentInvariant = errors.New("Connection Intent persistence invariant violated")
 )
 
 // ConnectionIntentRecord is the persisted response identity for one
@@ -44,7 +45,7 @@ func (store *Store) ConsumeConnectionIntent(ctx context.Context, workOSUserID, i
 	var expiresAt, usedAt pgtype.Timestamptz
 	err := store.pool.QueryRow(ctx, `
 		UPDATE connection_intent_idempotency intent
-		SET used_at = $4
+		SET used_at = GREATEST(intent.created_at, $4)
 		FROM users owner
 		WHERE intent.owner_user_id = owner.id
 		  AND owner.workos_user_id = $1
@@ -68,20 +69,42 @@ func (store *Store) ConsumeConnectionIntent(ctx context.Context, workOSUserID, i
 		return record, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return ConnectionIntentRecord{}, fmt.Errorf("consume Connection Intent: %w", err)
+		return ConnectionIntentRecord{}, classifyConnectionIntentConsumeError(err)
 	}
-	if err := store.pool.QueryRow(ctx, `
-		SELECT intent.expires_at, intent.used_at
+	if _, validationErr := store.ValidateConnectionIntent(ctx, workOSUserID, intentID, environmentID, observedAt); validationErr != nil {
+		return ConnectionIntentRecord{}, validationErr
+	}
+	return ConnectionIntentRecord{}, ErrConnectionIntentInvariant
+}
+
+// ValidateConnectionIntent performs the owner, Environment, expiry, and use
+// checks without spending the Intent. It is used only to reject bad WebSocket
+// handshakes before upgrade; ConsumeConnectionIntent remains authoritative.
+func (store *Store) ValidateConnectionIntent(ctx context.Context, workOSUserID, intentID, environmentID string, observedAt time.Time) (ConnectionIntentRecord, error) {
+	if !canonicalConnectionIntentIdentity(workOSUserID) || !canonicalConnectionIntentIdentity(intentID) ||
+		!canonicalConnectionIntentIdentity(environmentID) || observedAt.IsZero() {
+		return ConnectionIntentRecord{}, errors.New("validate Connection Intent: canonical identities and observation time are required")
+	}
+	var record ConnectionIntentRecord
+	var expiresAt, usedAt pgtype.Timestamptz
+	err := store.pool.QueryRow(ctx, `
+		SELECT intent.owner_user_id, intent.idempotency_key, intent.environment_id,
+		       intent.operation_id, intent.intent_id, intent.expires_at, intent.used_at
 		FROM connection_intent_idempotency intent
 		JOIN users owner ON owner.id = intent.owner_user_id
 		WHERE owner.workos_user_id = $1
 		  AND intent.intent_id = $2
 		  AND intent.environment_id = $3`,
 		workOSUserID, intentID, environmentID,
-	).Scan(&expiresAt, &usedAt); errors.Is(err, pgx.ErrNoRows) {
+	).Scan(
+		&record.OwnerUserID, &record.IdempotencyKey, &record.EnvironmentID,
+		&record.OperationID, &record.IntentID, &expiresAt, &usedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ConnectionIntentRecord{}, ErrConnectionIntentNotFound
-	} else if err != nil {
-		return ConnectionIntentRecord{}, fmt.Errorf("consume Connection Intent: inspect refusal: %w", err)
+	}
+	if err != nil {
+		return ConnectionIntentRecord{}, fmt.Errorf("validate Connection Intent: %w", err)
 	}
 	if usedAt.Valid {
 		return ConnectionIntentRecord{}, ErrConnectionIntentUsed
@@ -89,7 +112,16 @@ func (store *Store) ConsumeConnectionIntent(ctx context.Context, workOSUserID, i
 	if !expiresAt.Valid || !expiresAt.Time.After(observedAt) {
 		return ConnectionIntentRecord{}, ErrConnectionIntentExpired
 	}
-	return ConnectionIntentRecord{}, errors.New("consume Connection Intent: atomic update was not applied")
+	record.ExpiresAt = expiresAt.Time
+	return record, nil
+}
+
+func classifyConnectionIntentConsumeError(err error) error {
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) && postgresError.Code == "23514" {
+		return fmt.Errorf("%w: %v", ErrConnectionIntentInvariant, err)
+	}
+	return fmt.Errorf("consume Connection Intent: %w", err)
 }
 
 // CreateOrReplayConnectionIntent serializes a Connection Intent against every
@@ -139,17 +171,11 @@ func (store *Store) replayConnectionIntent(ctx context.Context, ownerID, idempot
 		return ConnectionIntentRecord{}, false, fmt.Errorf("create Connection Intent: begin replay transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
-		return ConnectionIntentRecord{}, false, fmt.Errorf("create Connection Intent: lock replay idempotency key: %w", err)
-	}
-	existing, present, err := loadConnectionIntentForUpdate(ctx, tx, ownerID, idempotencyKey)
+	existing, replay, _, err := lockLoadValidateConnectionIntentReplay(ctx, tx, ownerID, idempotencyKey, environmentID, observedAt)
 	if err != nil {
 		return ConnectionIntentRecord{}, false, err
 	}
-	if present && existing.ExpiresAt.After(observedAt) {
-		if existing.EnvironmentID != environmentID {
-			return ConnectionIntentRecord{}, false, ErrIdempotencyConflict
-		}
+	if replay {
 		if err := tx.Commit(ctx); err != nil {
 			return ConnectionIntentRecord{}, false, fmt.Errorf("create Connection Intent: commit replay: %w", err)
 		}
@@ -176,17 +202,11 @@ func (store *Store) persistPreparedConnectionIntent(
 		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: begin persist transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
-		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: lock persist idempotency key: %w", err)
-	}
-	existing, present, err := loadConnectionIntentForUpdate(ctx, tx, ownerID, idempotencyKey)
+	existing, replay, present, err := lockLoadValidateConnectionIntentReplay(ctx, tx, ownerID, idempotencyKey, environmentID, observedAt)
 	if err != nil {
 		return ConnectionIntentRecord{}, err
 	}
-	if present && existing.ExpiresAt.After(observedAt) {
-		if existing.EnvironmentID != environmentID {
-			return ConnectionIntentRecord{}, ErrIdempotencyConflict
-		}
+	if replay {
 		if err := tx.Commit(ctx); err != nil {
 			return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: commit concurrent replay: %w", err)
 		}
@@ -229,6 +249,25 @@ func (store *Store) persistPreparedConnectionIntent(
 		return ConnectionIntentRecord{}, fmt.Errorf("create Connection Intent: commit: %w", err)
 	}
 	return record, nil
+}
+
+func lockLoadValidateConnectionIntentReplay(
+	ctx context.Context,
+	tx pgx.Tx,
+	ownerID, idempotencyKey, environmentID string,
+	observedAt time.Time,
+) (ConnectionIntentRecord, bool, bool, error) {
+	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
+		return ConnectionIntentRecord{}, false, false, fmt.Errorf("create Connection Intent: lock idempotency key: %w", err)
+	}
+	existing, present, err := loadConnectionIntentForUpdate(ctx, tx, ownerID, idempotencyKey)
+	if err != nil || !present || !existing.ExpiresAt.After(observedAt) {
+		return existing, false, present, err
+	}
+	if existing.EnvironmentID != environmentID {
+		return ConnectionIntentRecord{}, false, present, ErrIdempotencyConflict
+	}
+	return existing, true, present, nil
 }
 
 type connectionIntentInsertRaceError struct{ cause error }
@@ -275,43 +314,66 @@ func loadConnectionIntentForUpdate(ctx context.Context, tx pgx.Tx, ownerID, idem
 }
 
 func lockConnectionIntentEnvironment(ctx context.Context, tx pgx.Tx, ownerID, environmentID string, preparedOperationID *string) (*string, error) {
-	var runtimeStatus *string
+	var preparedRuntimeID string
+	if preparedOperationID != nil {
+		err := tx.QueryRow(ctx, `
+			SELECT target.runtime_id
+			FROM operations operation
+			JOIN runtime_operation_targets target ON target.operation_id = operation.id
+			WHERE operation.id = $1
+			  AND operation.requested_by_user_id = $2
+			  AND operation.environment_id = $3
+			  AND operation.type = 'runtime.start'
+			  AND operation.status IN ('queued', 'running')
+			FOR UPDATE OF operation`, *preparedOperationID, ownerID, environmentID).Scan(&preparedRuntimeID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrOperationConflict
+		}
+		if err != nil {
+			return nil, fmt.Errorf("create Connection Intent: verify prepared start Operation: %w", err)
+		}
+	}
+	var currentRuntimeID *string
 	var activeOperationID, activeOperationType *string
 	err := tx.QueryRow(ctx, `
-		SELECT runtime.status, active.id, active.type
+		SELECT environment.current_runtime_id, active.id, active.type
 		FROM environments environment
-		LEFT JOIN runtimes runtime ON runtime.id = environment.current_runtime_id
 		LEFT JOIN operations active
 		  ON active.environment_id = environment.id AND active.status IN ('queued', 'running')
 		WHERE environment.id = $1 AND environment.owner_user_id = $2
-		FOR UPDATE OF environment`, environmentID, ownerID).Scan(&runtimeStatus, &activeOperationID, &activeOperationType)
+		FOR UPDATE OF environment`, environmentID, ownerID).Scan(&currentRuntimeID, &activeOperationID, &activeOperationType)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrReferenceNotOwned
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create Connection Intent: lock owned Environment: %w", err)
 	}
+	var runtimeStatus *string
+	if currentRuntimeID != nil {
+		var status string
+		if err := tx.QueryRow(ctx, `
+			SELECT status
+			FROM runtimes
+			WHERE id = $1 AND environment_id = $2
+			FOR UPDATE`, *currentRuntimeID, environmentID).Scan(&status); err != nil {
+			return nil, fmt.Errorf("create Connection Intent: lock current Runtime: %w", err)
+		}
+		runtimeStatus = &status
+	}
+	if preparedOperationID != nil && (currentRuntimeID == nil || preparedRuntimeID != *currentRuntimeID) {
+		return nil, ErrOperationConflict
+	}
 	if activeOperationID != nil {
-		if activeOperationType == nil || domain.OperationType(*activeOperationType) != domain.OperationRuntimeStart {
+		if preparedOperationID == nil || activeOperationType == nil || domain.OperationType(*activeOperationType) != domain.OperationRuntimeStart {
+			return nil, ErrOperationConflict
+		}
+		if preparedOperationID != nil && *activeOperationID != *preparedOperationID {
 			return nil, ErrOperationConflict
 		}
 		return activeOperationID, nil
 	}
 	if runtimeStatus == nil || domain.RuntimeStatus(*runtimeStatus) != domain.RuntimeReady && preparedOperationID == nil {
 		return nil, domain.ErrRuntimeCommandState
-	}
-	if preparedOperationID != nil {
-		var validStart bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1
-			FROM operations
-			WHERE id = $1 AND requested_by_user_id = $2 AND environment_id = $3 AND type = 'runtime.start'
-		)`, *preparedOperationID, ownerID, environmentID).Scan(&validStart); err != nil {
-			return nil, fmt.Errorf("create Connection Intent: verify prepared start Operation: %w", err)
-		}
-		if !validStart {
-			return nil, errors.New("create Connection Intent: prepared start Operation does not belong to the Environment owner")
-		}
 	}
 	return preparedOperationID, nil
 }

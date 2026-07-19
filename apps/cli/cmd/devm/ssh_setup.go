@@ -270,77 +270,78 @@ func createExclusiveSSHFile(directory *anchoredDirectory, name string, content [
 }
 
 func listSetupEnvironments(ctx context.Context, api *contracts.ClientWithResponses, token string) ([]contracts.Environment, error) {
-	var environments []contracts.Environment
-	var cursor *contracts.Cursor
-	seen := make(map[string]struct{})
 	pageSize := contracts.PageSize(setupPageSize)
-	for range maximumSetupPages {
-		requestContext, cancel := context.WithTimeout(ctx, proxyRequestTimeout)
+	return paginateSetup(ctx, "list Environments for SSH setup", func(requestContext context.Context, cursor *contracts.Cursor) (setupPage[contracts.Environment], error) {
 		response, err := api.ListEnvironmentsWithResponse(requestContext, &contracts.ListEnvironmentsParams{
 			Cursor: cursor, PageSize: &pageSize,
 		}, bearerRequestEditor(token))
-		cancel()
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, context.Cause(ctx)
-			}
-			return nil, errors.New("list Environments for SSH setup: control plane is unavailable")
+			return setupPage[contracts.Environment]{}, err
 		}
-		if response.StatusCode() != http.StatusOK || response.JSON200 == nil {
-			return nil, fmt.Errorf("list Environments for SSH setup: control plane returned HTTP %d", response.StatusCode())
+		page := setupPage[contracts.Environment]{status: response.StatusCode()}
+		if response.JSON200 != nil {
+			page.items, page.next, page.valid = response.JSON200.Items, response.JSON200.NextCursor, true
 		}
-		environments = append(environments, response.JSON200.Items...)
-		if response.JSON200.NextCursor == nil {
-			return environments, nil
-		}
-		next := *response.JSON200.NextCursor
-		if next == "" {
-			return nil, errors.New("list Environments for SSH setup: control plane returned an invalid cursor")
-		}
-		if _, duplicate := seen[next]; duplicate {
-			return nil, errors.New("list Environments for SSH setup: control plane repeated a cursor")
-		}
-		seen[next] = struct{}{}
-		cursor = &next
-	}
-	return nil, errors.New("list Environments for SSH setup: pagination limit exceeded")
+		return page, nil
+	})
 }
 
 func listSetupSSHKeys(ctx context.Context, api *contracts.ClientWithResponses, token string) ([]contracts.SSHKey, error) {
-	var keys []contracts.SSHKey
-	var cursor *contracts.Cursor
-	seen := make(map[string]struct{})
 	pageSize := contracts.PageSize(setupPageSize)
-	for range maximumSetupPages {
-		requestContext, cancel := context.WithTimeout(ctx, proxyRequestTimeout)
+	return paginateSetup(ctx, "list SSH keys", func(requestContext context.Context, cursor *contracts.Cursor) (setupPage[contracts.SSHKey], error) {
 		response, err := api.ListSSHKeysWithResponse(requestContext, &contracts.ListSSHKeysParams{
 			Cursor: cursor, PageSize: &pageSize,
 		}, bearerRequestEditor(token))
+		if err != nil {
+			return setupPage[contracts.SSHKey]{}, err
+		}
+		page := setupPage[contracts.SSHKey]{status: response.StatusCode()}
+		if response.JSON200 != nil {
+			page.items, page.next, page.valid = response.JSON200.Items, response.JSON200.NextCursor, true
+		}
+		return page, nil
+	})
+}
+
+type setupPage[T any] struct {
+	items  []T
+	next   *string
+	status int
+	valid  bool
+}
+
+func paginateSetup[T any](ctx context.Context, action string, fetch func(context.Context, *contracts.Cursor) (setupPage[T], error)) ([]T, error) {
+	var items []T
+	var cursor *contracts.Cursor
+	seen := make(map[string]struct{})
+	for range maximumSetupPages {
+		requestContext, cancel := context.WithTimeout(ctx, proxyRequestTimeout)
+		page, err := fetch(requestContext, cursor)
 		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, context.Cause(ctx)
 			}
-			return nil, errors.New("list SSH keys: control plane is unavailable")
+			return nil, errors.New(action + ": control plane is unavailable")
 		}
-		if response.StatusCode() != http.StatusOK || response.JSON200 == nil {
-			return nil, fmt.Errorf("list SSH keys: control plane returned HTTP %d", response.StatusCode())
+		if page.status != http.StatusOK || !page.valid {
+			return nil, fmt.Errorf("%s: control plane returned HTTP %d", action, page.status)
 		}
-		keys = append(keys, response.JSON200.Items...)
-		if response.JSON200.NextCursor == nil {
-			return keys, nil
+		items = append(items, page.items...)
+		if page.next == nil {
+			return items, nil
 		}
-		next := *response.JSON200.NextCursor
+		next := *page.next
 		if next == "" {
-			return nil, errors.New("list SSH keys: control plane returned an invalid cursor")
+			return nil, errors.New(action + ": control plane returned an invalid cursor")
 		}
 		if _, duplicate := seen[next]; duplicate {
-			return nil, errors.New("list SSH keys: control plane repeated a cursor")
+			return nil, errors.New(action + ": control plane repeated a cursor")
 		}
 		seen[next] = struct{}{}
-		cursor = &next
+		cursor = (*contracts.Cursor)(&next)
 	}
-	return nil, errors.New("list SSH keys: pagination limit exceeded")
+	return nil, errors.New(action + ": pagination limit exceeded")
 }
 
 func ensureSSHKeyRegistered(ctx context.Context, api *contracts.ClientWithResponses, token string, selected localSSHKey, registered []contracts.SSHKey) (bool, error) {
