@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
+	"strings"
 	"time"
 )
 
@@ -29,6 +31,7 @@ const (
 type ExternalSample struct {
 	ObservedAt           time.Time
 	GuestSequence        int64
+	UserUID              int
 	ActiveSSHConnections []ActiveSSHConnectionSample
 	Processes            []ProcessSample
 	Containers           []ContainerSample
@@ -39,10 +42,13 @@ type ActiveSSHConnectionSample struct {
 }
 
 type ProcessSample struct {
-	PID        int
-	ParentPID  int
-	Executable string
-	State      ProcessState
+	PID         int
+	ParentPID   int
+	OwnerUID    int
+	Executable  string
+	State       ProcessState
+	CgroupPath  string
+	ContainerID string
 }
 
 type ContainerSample struct {
@@ -141,8 +147,8 @@ func (observer *Observer) Observe(ctx context.Context) (ActivitySnapshot, error)
 	if err != nil {
 		return ActivitySnapshot{}, fmt.Errorf("sample Runtime activity: %w", err)
 	}
-	if sample.ObservedAt.IsZero() || sample.GuestSequence <= 0 {
-		return ActivitySnapshot{}, errors.New("activity sample timestamp and positive guest sequence are required")
+	if sample.ObservedAt.IsZero() || sample.GuestSequence <= 0 || sample.UserUID <= 0 {
+		return ActivitySnapshot{}, errors.New("activity sample timestamp, positive guest sequence, and positive user UID are required")
 	}
 
 	connections, err := uniqueConnections(sample.ActiveSSHConnections)
@@ -157,16 +163,28 @@ func (observer *Observer) Observe(ctx context.Context) (ActivitySnapshot, error)
 	if err != nil {
 		return ActivitySnapshot{}, err
 	}
+	selectedContainerIDs := runningSelectedContainerIDs(containers, observer.selected)
+	userSessionProcesses, escapedUserProcesses := countCgroupScopes(processes, sample.UserUID)
 
 	return ActivitySnapshot{
 		runtimeID:          observer.runtimeID,
 		observedAt:         sample.ObservedAt.Round(0).UTC(),
 		guestSequence:      sample.GuestSequence,
 		sshConnections:     len(connections),
-		codexProcesses:     countAgentRoots(processes, observer.codex),
-		claudeProcesses:    countAgentRoots(processes, observer.claude),
-		protectedProcesses: countProcesses(processes, observer.protected),
+		codexProcesses:     countAgentRoots(processes, sample.UserUID, observer.codex),
+		claudeProcesses:    countAgentRoots(processes, sample.UserUID, observer.claude),
+		protectedProcesses: countProtectedProcesses(processes, sample.UserUID, observer.protected),
 		selectedContainers: countContainers(containers, observer.selected),
+		unknownUserProcesses: countUnknownUserProcesses(
+			processes,
+			sample.UserUID,
+			observer.codex,
+			observer.claude,
+			observer.protected,
+			selectedContainerIDs,
+		),
+		userSessionProcesses: userSessionProcesses,
+		escapedUserProcesses: escapedUserProcesses,
 	}, nil
 }
 
@@ -184,11 +202,14 @@ func uniqueConnections(samples []ActiveSSHConnectionSample) (map[string]struct{}
 func uniqueProcesses(samples []ProcessSample) (map[int]ProcessSample, error) {
 	processes := make(map[int]ProcessSample, len(samples))
 	for _, process := range samples {
-		if process.PID <= 0 || process.ParentPID < 0 || process.Executable == "" {
-			return nil, errors.New("process sample requires a positive PID, parent PID, and executable identity")
+		if process.PID <= 0 || process.ParentPID < 0 || process.OwnerUID < 0 || process.Executable == "" {
+			return nil, errors.New("process sample requires a positive PID, parent PID, owner UID, and executable identity")
 		}
 		if process.State != ProcessRunning && process.State != ProcessWaiting {
 			return nil, fmt.Errorf("process %d has invalid live state %q", process.PID, process.State)
+		}
+		if process.CgroupPath == "" || !strings.HasPrefix(process.CgroupPath, "/") || path.Clean(process.CgroupPath) != process.CgroupPath {
+			return nil, fmt.Errorf("process %d has invalid cgroup v2 path %q", process.PID, process.CgroupPath)
 		}
 		if existing, duplicate := processes[process.PID]; duplicate && existing != process {
 			return nil, fmt.Errorf("conflicting activity samples for process %d", process.PID)
@@ -243,10 +264,10 @@ func uniqueContainers(samples []ContainerSample) (map[string]ContainerSample, er
 	return containers, nil
 }
 
-func countAgentRoots(processes map[int]ProcessSample, allowlist map[string]struct{}) int {
+func countAgentRoots(processes map[int]ProcessSample, userUID int, allowlist map[string]struct{}) int {
 	count := 0
 	for _, process := range processes {
-		if !liveAllowedProcess(process, allowlist) || hasAllowedAncestor(process, processes, allowlist) {
+		if !liveTrackedAllowedProcess(process, userUID, allowlist) || hasTrackedAllowedAncestor(process, processes, userUID, allowlist) {
 			continue
 		}
 		count++
@@ -254,19 +275,19 @@ func countAgentRoots(processes map[int]ProcessSample, allowlist map[string]struc
 	return count
 }
 
-func hasAllowedAncestor(process ProcessSample, processes map[int]ProcessSample, allowlist map[string]struct{}) bool {
+func hasTrackedAllowedAncestor(process ProcessSample, processes map[int]ProcessSample, userUID int, allowlist map[string]struct{}) bool {
 	for parent, ok := processes[process.ParentPID]; ok; parent, ok = processes[parent.ParentPID] {
-		if liveAllowedProcess(parent, allowlist) {
+		if liveTrackedAllowedProcess(parent, userUID, allowlist) {
 			return true
 		}
 	}
 	return false
 }
 
-func countProcesses(processes map[int]ProcessSample, allowlist map[string]struct{}) int {
+func countProtectedProcesses(processes map[int]ProcessSample, userUID int, allowlist map[string]struct{}) int {
 	count := 0
 	for _, process := range processes {
-		if liveAllowedProcess(process, allowlist) {
+		if liveAllowedProcess(process, allowlist) && (process.OwnerUID != userUID || inUserSessionCgroup(process, userUID)) {
 			count++
 		}
 	}
@@ -276,6 +297,101 @@ func countProcesses(processes map[int]ProcessSample, allowlist map[string]struct
 func liveAllowedProcess(process ProcessSample, allowlist map[string]struct{}) bool {
 	_, allowed := allowlist[process.Executable]
 	return allowed && (process.State == ProcessRunning || process.State == ProcessWaiting)
+}
+
+func liveTrackedAllowedProcess(process ProcessSample, userUID int, allowlist map[string]struct{}) bool {
+	return inUserSessionCgroup(process, userUID) && liveAllowedProcess(process, allowlist)
+}
+
+func countUnknownUserProcesses(
+	processes map[int]ProcessSample,
+	userUID int,
+	codex map[string]struct{},
+	claude map[string]struct{},
+	protected map[string]struct{},
+	selectedContainerIDs map[string]struct{},
+) int {
+	count := 0
+	for _, process := range processes {
+		if isBaselineProcess(process, userUID) {
+			continue
+		}
+		if !inUserSessionCgroup(process, userUID) {
+			count++
+			continue
+		}
+		if _, selected := selectedContainerIDs[process.ContainerID]; process.ContainerID != "" && selected {
+			continue
+		}
+		if belongsToAgentTree(process, processes, userUID, codex) || belongsToAgentTree(process, processes, userUID, claude) {
+			continue
+		}
+		if liveAllowedProcess(process, protected) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func isBaselineProcess(process ProcessSample, userUID int) bool {
+	if !inUserSessionCgroup(process, userUID) {
+		return process.OwnerUID != userUID
+	}
+
+	// Cgroup membership attributes processes in the user session subtree to the
+	// user regardless of owner UID. The user manager is the sole baseline
+	// exception there, and only at its exact systemd identity and init scope.
+	// Misclassifying an unknown process as baseline could auto-stop a busy
+	// Runtime, so executable-only or cgroup-prefix exceptions are intentionally
+	// forbidden here.
+	userManagerCgroup := fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service/init.scope", userUID, userUID)
+	if process.CgroupPath != userManagerCgroup {
+		return false
+	}
+	return process.Executable == "/usr/lib/systemd/systemd" || process.Executable == "/lib/systemd/systemd"
+}
+
+func belongsToAgentTree(process ProcessSample, processes map[int]ProcessSample, userUID int, allowlist map[string]struct{}) bool {
+	for current, ok := process, true; ok; current, ok = processes[current.ParentPID] {
+		if liveTrackedAllowedProcess(current, userUID, allowlist) {
+			return inCgroupSubtree(process.CgroupPath, current.CgroupPath)
+		}
+	}
+	return false
+}
+
+func inCgroupSubtree(processPath, rootPath string) bool {
+	return processPath == rootPath || strings.HasPrefix(processPath, rootPath+"/")
+}
+
+func countCgroupScopes(processes map[int]ProcessSample, userUID int) (userSession int, escaped int) {
+	for _, process := range processes {
+		if isBaselineProcess(process, userUID) {
+			continue
+		}
+		if inUserSessionCgroup(process, userUID) {
+			userSession++
+		} else {
+			escaped++
+		}
+	}
+	return userSession, escaped
+}
+
+func inUserSessionCgroup(process ProcessSample, userUID int) bool {
+	userSlice := fmt.Sprintf("/user.slice/user-%d.slice", userUID)
+	return process.CgroupPath == userSlice || strings.HasPrefix(process.CgroupPath, userSlice+"/")
+}
+
+func runningSelectedContainerIDs(samples map[string]ContainerSample, allowlist map[string]struct{}) map[string]struct{} {
+	selected := make(map[string]struct{})
+	for _, sample := range samples {
+		if _, allowed := allowlist[sample.Selection]; allowed && sample.State == ContainerRunning {
+			selected[sample.ID] = struct{}{}
+		}
+	}
+	return selected
 }
 
 func countContainers(samples map[string]ContainerSample, allowlist map[string]struct{}) int {
@@ -289,14 +405,17 @@ func countContainers(samples map[string]ContainerSample, allowlist map[string]st
 }
 
 type ActivitySnapshot struct {
-	runtimeID          string
-	observedAt         time.Time
-	guestSequence      int64
-	sshConnections     int
-	codexProcesses     int
-	claudeProcesses    int
-	protectedProcesses int
-	selectedContainers int
+	runtimeID            string
+	observedAt           time.Time
+	guestSequence        int64
+	sshConnections       int
+	codexProcesses       int
+	claudeProcesses      int
+	protectedProcesses   int
+	selectedContainers   int
+	unknownUserProcesses int
+	userSessionProcesses int
+	escapedUserProcesses int
 }
 
 func (snapshot ActivitySnapshot) RuntimeID() string { return snapshot.runtimeID }
@@ -314,3 +433,13 @@ func (snapshot ActivitySnapshot) ClaudeProcesses() int { return snapshot.claudeP
 func (snapshot ActivitySnapshot) ProtectedProcesses() int { return snapshot.protectedProcesses }
 
 func (snapshot ActivitySnapshot) SelectedContainers() int { return snapshot.selectedContainers }
+
+func (snapshot ActivitySnapshot) UnknownUserProcesses() int { return snapshot.unknownUserProcesses }
+
+// UserSessionProcesses is the number of non-baseline user-owned processes
+// inside the cgroup-v2 subtree /user.slice/user-<uid>.slice.
+func (snapshot ActivitySnapshot) UserSessionProcesses() int { return snapshot.userSessionProcesses }
+
+// EscapedUserProcesses is the number of non-baseline user-owned processes
+// outside the user's cgroup-v2 subtree. These processes are also unknown activity.
+func (snapshot ActivitySnapshot) EscapedUserProcesses() int { return snapshot.escapedUserProcesses }
