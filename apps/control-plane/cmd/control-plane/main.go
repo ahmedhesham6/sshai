@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -135,7 +136,8 @@ func run(ctx context.Context) error {
 		CreateEnvironment: createEnvironment, RuntimeCommands: runtimeCommands, AutoStopPolicies: autoStopPolicies,
 		RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
 		Verifier: verifier, Users: store, CapsulePresigner: capsulePresigner, CapsuleOwnership: controlplane.NewS3CapsuleOwnership(capsuleClient, config.capsuleBucket), CapsuleBucket: config.capsuleBucket, CapsuleAccessTTL: 15 * time.Minute,
-		UserIDs: ids, RequestIDs: ids, DefaultRegion: config.defaultRegion, Now: time.Now,
+		UserIDs: ids, RequestIDs: ids, ConnectionIntentIDs: ids, ConnectionIntents: store, DefaultRegion: config.defaultRegion, Now: time.Now,
+		RegionalProxyURLs: config.regionalProxyURLs, ConnectionIntentTTL: config.connectionIntentTTL,
 		EnvironmentReads: store, OperationReads: store, ProfileReads: store, BillingReads: store,
 	})
 	server := &http.Server{Addr: config.listenAddress, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
@@ -154,6 +156,7 @@ func run(ctx context.Context) error {
 type retentionPruner interface {
 	PruneActivitySnapshots(context.Context, time.Time) (int64, error)
 	PruneProviderResources(context.Context, time.Time) (int64, error)
+	PruneConnectionIntents(context.Context, time.Time) (int64, error)
 }
 
 func runRetentionPruning(ctx context.Context, pruner retentionPruner, interval, snapshotRetention, providerResourceRetention time.Duration, now func() time.Time) {
@@ -175,6 +178,11 @@ func runRetentionPruning(ctx context.Context, pruner retentionPruner, interval, 
 		} else if pruned > 0 {
 			slog.Info("pruned expired Provider Resources", "count", pruned)
 		}
+		if pruned, err := pruner.PruneConnectionIntents(ctx, observedAt); err != nil {
+			slog.Error("Connection Intent pruning failed", "error", err)
+		} else if pruned > 0 {
+			slog.Info("pruned expired Connection Intents", "count", pruned)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -195,23 +203,43 @@ type config struct {
 	uploadBucket            string
 	capsuleBucket           string
 	s3EndpointURL           string
+	regionalProxyURLs       map[string]string
+	connectionIntentTTL     time.Duration
 }
 
 func loadConfig() (config, error) {
 	clientID := os.Getenv("WORKOS_CLIENT_ID")
+	defaultRegion := valueOrDefault("DEFAULT_REGION", "eu-central-1")
+	regionalProxyURLs := map[string]string{}
+	if value := os.Getenv("REGIONAL_PROXY_URLS"); value != "" {
+		if err := json.Unmarshal([]byte(value), &regionalProxyURLs); err != nil {
+			return config{}, fmt.Errorf("parse REGIONAL_PROXY_URLS: %w", err)
+		}
+	}
+	if err := controlplane.ValidateRegionalProxyURLs(regionalProxyURLs); err != nil {
+		return config{}, fmt.Errorf("validate REGIONAL_PROXY_URLS: %w", err)
+	}
+	if _, present := regionalProxyURLs[defaultRegion]; !present {
+		return config{}, fmt.Errorf("REGIONAL_PROXY_URLS must contain enabled DEFAULT_REGION %q", defaultRegion)
+	}
+	connectionIntentTTL, err := time.ParseDuration(valueOrDefault("CONNECTION_INTENT_TTL", "60s"))
+	if err != nil || connectionIntentTTL <= 0 {
+		return config{}, errors.New("CONNECTION_INTENT_TTL must be a positive duration")
+	}
 	config := config{
 		databaseURL: os.Getenv("DATABASE_URL"), workOSClientID: clientID,
 		workOSIssuer:            valueOrDefault("WORKOS_ISSUER", "https://api.workos.com/"),
 		workOSJWKSURL:           valueOrDefault("WORKOS_JWKS_URL", "https://api.workos.com/sso/jwks/"+clientID),
 		restateIngressURL:       valueOrDefault("RESTATE_INGRESS_URL", "http://localhost:8080"),
-		defaultRegion:           valueOrDefault("DEFAULT_REGION", "eu-central-1"),
+		defaultRegion:           defaultRegion,
 		defaultAvailabilityZone: valueOrDefault("DEFAULT_AVAILABILITY_ZONE", "eu-central-1a"),
 		listenAddress:           valueOrDefault("LISTEN_ADDR", ":8081"),
 		uploadBucket:            os.Getenv("UPLOAD_BUCKET"), capsuleBucket: os.Getenv("CAPSULE_BUCKET"),
-		s3EndpointURL: os.Getenv("AWS_ENDPOINT_URL_S3"),
+		s3EndpointURL:     os.Getenv("AWS_ENDPOINT_URL_S3"),
+		regionalProxyURLs: regionalProxyURLs, connectionIntentTTL: connectionIntentTTL,
 	}
-	if config.databaseURL == "" || config.workOSClientID == "" || config.uploadBucket == "" || config.capsuleBucket == "" {
-		return config, errors.New("DATABASE_URL, WORKOS_CLIENT_ID, UPLOAD_BUCKET, and CAPSULE_BUCKET are required")
+	if config.databaseURL == "" || config.workOSClientID == "" || config.uploadBucket == "" || config.capsuleBucket == "" || os.Getenv("REGIONAL_PROXY_URLS") == "" {
+		return config, errors.New("DATABASE_URL, WORKOS_CLIENT_ID, UPLOAD_BUCKET, CAPSULE_BUCKET, and REGIONAL_PROXY_URLS are required")
 	}
 	return config, nil
 }

@@ -18,3 +18,19 @@ func lockOperationIdempotencyKey(ctx context.Context, tx pgx.Tx, ownerID, idempo
 	}
 	return nil
 }
+
+func rejectActiveConnectionIntentIdempotencyKey(ctx context.Context, tx pgx.Tx, ownerID, idempotencyKey string) error {
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1
+		FROM connection_intent_idempotency
+		WHERE owner_user_id = $1 AND idempotency_key = $2
+		  AND expires_at > statement_timestamp()
+	)`, ownerID, idempotencyKey).Scan(&active); err != nil {
+		return fmt.Errorf("inspect Connection Intent idempotency key: %w", err)
+	}
+	if active {
+		return ErrIdempotencyConflict
+	}
+	return nil
+}
