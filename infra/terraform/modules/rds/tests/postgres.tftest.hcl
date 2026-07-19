@@ -8,6 +8,7 @@ variables {
     control_plane = "sg-00000000000000001"
     workflows     = "sg-00000000000000002"
   }
+  multi_az = false
   tags = {
     managed-by = "terraform"
     project    = "sshai"
@@ -38,7 +39,7 @@ run "creates_private_recoverable_postgres" {
   }
 
   assert {
-    condition     = length(aws_db_subnet_group.postgres.subnet_ids) == 2 && !aws_db_instance.postgres.multi_az
+    condition     = length(aws_db_subnet_group.postgres.subnet_ids) == 2 && aws_db_instance.postgres.multi_az == var.multi_az
     error_message = "Private alpha uses a Single-AZ instance with a two-zone subnet baseline."
   }
 
