@@ -42,7 +42,7 @@ func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domai
 		if err != nil {
 			return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: read target: %w", err)
 		}
-		command, err := loadRuntimeOperation(ctx, queries, restored, &targetID)
+		command, err := loadRuntimeOperation(ctx, queries, restored, &targetID, true)
 		if err != nil {
 			return domain.EnvironmentRuntimeOperation{}, err
 		}
@@ -55,7 +55,7 @@ func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domai
 		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: read idempotency key: %w", err)
 	}
 
-	command, err := loadRuntimeOperation(ctx, queries, candidate, nil)
+	command, err := loadRuntimeOperation(ctx, queries, candidate, nil, false)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.EnvironmentRuntimeOperation{}, ErrReferenceNotOwned
 	}
@@ -90,7 +90,7 @@ func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domai
 	return command, nil
 }
 
-func loadRuntimeOperation(ctx context.Context, queries *dbsql.Queries, operation domain.Operation, targetRuntimeID *string) (domain.EnvironmentRuntimeOperation, error) {
+func loadRuntimeOperation(ctx context.Context, queries *dbsql.Queries, operation domain.Operation, targetRuntimeID *string, replay bool) (domain.EnvironmentRuntimeOperation, error) {
 	snapshot := operation.Snapshot()
 	row, err := queries.GetOwnedRuntimeStateForUpdate(ctx, dbsql.GetOwnedRuntimeStateForUpdateParams{
 		EnvironmentID: snapshot.EnvironmentID, OwnerUserID: snapshot.RequestedByUserID, RuntimeID: targetRuntimeID,
@@ -124,6 +124,9 @@ func loadRuntimeOperation(ctx context.Context, queries *dbsql.Queries, operation
 	})
 	if err != nil {
 		return domain.EnvironmentRuntimeOperation{}, err
+	}
+	if replay {
+		return domain.RestoreEnvironmentRuntimeOperation(environment, runtime, operation)
 	}
 	return domain.NewEnvironmentRuntimeOperation(environment, runtime, operation)
 }
