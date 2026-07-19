@@ -38,7 +38,7 @@ func runLogin(ctx context.Context, flow loginFlow, configDirectory string, outpu
 	if credentials.accessToken == "" || credentials.refreshToken == "" {
 		return errors.New("login: WorkOS returned incomplete credentials")
 	}
-	if err := persistCredentials(configDirectory, credentials); err != nil {
+	if err := persistCredentialsContext(ctx, configDirectory, credentials); err != nil {
 		return fmt.Errorf("login: %w", err)
 	}
 	return nil

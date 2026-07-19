@@ -34,50 +34,51 @@ func newTokenSession(configDirectory string, refresher tokenRefresher, now func(
 }
 
 func (session *tokenSession) FreshAccessToken(ctx context.Context) (string, error) {
+	token, _, _, err := session.freshAccessToken(ctx)
+	return token, err
+}
+
+func (session *tokenSession) freshAccessToken(ctx context.Context) (string, time.Time, bool, error) {
 	if session == nil || session.refresher == nil || session.now == nil {
-		return "", errors.New("load token session: session is not initialized")
+		return "", time.Time{}, false, errors.New("load token session: session is not initialized")
 	}
 	authDirectory, err := openPrivateAuthDirectory(session.configDirectory)
 	if err != nil {
-		return "", fmt.Errorf("load token session: %w", err)
+		return "", time.Time{}, false, fmt.Errorf("load token session: %w", err)
 	}
 	defer authDirectory.Close()
-	credentials, expiresAt, err := loadTokenCredentials(authDirectory)
-	if err != nil {
-		return "", fmt.Errorf("load token session: %w", err)
-	}
-	if expiresAt.After(session.now().Add(accessTokenRefreshSkew)) {
-		return credentials.accessToken, nil
-	}
 	lock, err := acquireTokenFileLock(ctx, authDirectory)
 	if err != nil {
-		return "", fmt.Errorf("lock token session: %w", err)
+		return "", time.Time{}, false, fmt.Errorf("lock token session: %w", err)
 	}
 	defer lock.Close()
-	credentials, expiresAt, err = loadTokenCredentials(authDirectory)
+	credentials, expiresAt, err := loadTokenCredentials(authDirectory)
 	if err != nil {
-		return "", fmt.Errorf("reload token session: %w", err)
+		return "", time.Time{}, false, fmt.Errorf("load token session: %w", err)
 	}
 	if expiresAt.After(session.now().Add(accessTokenRefreshSkew)) {
-		return credentials.accessToken, nil
+		return credentials.accessToken, expiresAt, false, nil
 	}
 	refreshCredential, err := auth.NewRefreshCredential(credentials.refreshToken)
 	if err != nil {
-		return "", errors.New("refresh token session: stored refresh credential is invalid")
+		return "", time.Time{}, false, errors.New("refresh token session: stored refresh credential is invalid")
 	}
 	rotatedPair, err := session.refresher.Refresh(ctx, refreshCredential)
 	if err != nil {
-		return "", fmt.Errorf("refresh token session: %w", err)
+		return "", time.Time{}, false, fmt.Errorf("refresh token session: %w", err)
 	}
 	rotated := loginCredentials{accessToken: rotatedPair.AccessToken(), refreshToken: rotatedPair.RefreshToken()}
 	rotatedExpiry, err := accessTokenExpiry(rotated.accessToken)
 	if err != nil || rotated.refreshToken == "" || !rotatedExpiry.After(session.now().Add(accessTokenRefreshSkew)) {
-		return "", errors.New("refresh token session: rotated credentials are invalid")
+		return "", time.Time{}, false, errors.New("refresh token session: rotated credentials are invalid")
+	}
+	if !lock.StillCurrent() {
+		return "", time.Time{}, false, errors.New("refresh token session: lock file changed before mutation")
 	}
 	if err := writeTokenCredentials(authDirectory, rotated); err != nil {
-		return "", fmt.Errorf("persist rotated token session: %w", err)
+		return "", time.Time{}, false, fmt.Errorf("persist rotated token session: %w", err)
 	}
-	return rotated.accessToken, nil
+	return rotated.accessToken, rotatedExpiry, true, nil
 }
 
 func (session *tokenSession) Delete(ctx context.Context) error {
@@ -104,13 +105,42 @@ func (session *tokenSession) Delete(ctx context.Context) error {
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 		return errors.New("delete token session: credentials are not a private regular file")
 	}
+	if !lock.StillCurrent() {
+		return errors.New("delete token session: lock file changed before mutation")
+	}
 	if err := authDirectory.root.Remove("tokens.json"); err != nil {
 		return fmt.Errorf("delete token session: remove credentials: %w", err)
 	}
 	return syncAnchoredDirectory(authDirectory)
 }
 
+func (session *tokenSession) Stored() (bool, error) {
+	if session == nil {
+		return false, errors.New("inspect token session: session is not initialized")
+	}
+	authDirectory, err := openPrivateAuthDirectory(session.configDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect token session: %w", err)
+	}
+	defer authDirectory.Close()
+	info, err := authDirectory.root.Lstat("tokens.json")
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return false, errors.New("inspect token session: credentials are not a private regular file")
+	}
+	return true, nil
+}
+
 func persistCredentials(configDirectory string, credentials loginCredentials) error {
+	return persistCredentialsContext(context.Background(), configDirectory, credentials)
+}
+
+func persistCredentialsContext(ctx context.Context, configDirectory string, credentials loginCredentials) error {
 	state, err := openOwnedDirectory(configDirectory)
 	if err != nil {
 		return fmt.Errorf("open private local state: %w", err)
@@ -121,6 +151,14 @@ func persistCredentials(configDirectory string, credentials loginCredentials) er
 		return fmt.Errorf("open private auth state: %w", err)
 	}
 	defer authDirectory.Close()
+	lock, err := acquireTokenFileLock(ctx, authDirectory)
+	if err != nil {
+		return fmt.Errorf("lock token session: %w", err)
+	}
+	defer lock.Close()
+	if !lock.StillCurrent() {
+		return errors.New("persist token session: lock file changed before mutation")
+	}
 	return writeTokenCredentials(authDirectory, credentials)
 }
 

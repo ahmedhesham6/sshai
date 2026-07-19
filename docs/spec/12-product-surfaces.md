@@ -39,6 +39,15 @@ devm logout
 
 From a repository, `devm` resolves an existing Environment by canonical Project Binding. If none exists, it starts creation. Multiple Environments for the same repository are out of scope for the first CLI unless a later explicit selector is added.
 
+The canonical identity uses the origin fetch URL when present. Host names are
+case-folded; default ports are removed; query, fragment, trailing slash, and a
+terminal `.git` are ignored; and HTTP(S) credentials are stripped. SSH user
+names are identity-bearing: SCP `user@host:path` and
+`ssh://user@host:22/path` are equivalent, while two users at the same host are
+different identities. All network schemes otherwise converge on the same
+`git://authority/path` form. A repository without an origin uses its
+symlink-resolved absolute Git root.
+
 ### Plan presentation
 
 Every plan groups actions into:
@@ -67,8 +76,12 @@ The CLI maps internal workflow steps to product language and remains resumable a
   profiles/
     <profile-id>.toml   local authoring/head metadata
   projects/
-    <project-id>.toml   repository-to-Environment link
+    <project-id>.toml   repository identity, Project Seed, and Environment link
 ```
+
+`config.toml` contains only user-wide defaults and Profile/SSH-key selections.
+Repository-specific values, including `project_seed_id`, live only in the
+corresponding Project Binding under `projects/`.
 
 ## Web application
 

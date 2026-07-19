@@ -83,7 +83,6 @@ func TestProfileHTTPRejectsInvalidCapsulePublicationContract(t *testing.T) {
 	for _, scenario := range []struct {
 		name, body string
 	}{
-		{name: "empty capsuleRefs", body: `{"expectedHeadVersionId":null,"capsuleRefs":[]}`},
 		{name: "bad freshnessPolicy", body: `{"expectedHeadVersionId":null,"capsuleRefs":[{"ref":"owner/user-1/capsule@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","freshnessPolicy":"archive"}]}`},
 		{name: "malformed ref", body: `{"expectedHeadVersionId":null,"capsuleRefs":[{"ref":"not a registry reference","freshnessPolicy":"track"}]}`},
 	} {

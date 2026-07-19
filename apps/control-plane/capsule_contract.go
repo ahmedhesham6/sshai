@@ -65,9 +65,6 @@ func (ownership *S3CapsuleOwnership) OwnsObject(ctx context.Context, ownerID str
 // ValidatePublishProfileVersionRequest validates the domain-specific parts of
 // the generated Profile Version publication request.
 func ValidatePublishProfileVersionRequest(body contracts.PublishProfileVersionJSONRequestBody) error {
-	if len(body.CapsuleRefs) == 0 {
-		return fmt.Errorf("capsuleRefs must contain at least one Capsule Ref")
-	}
 	for index, capsuleRef := range body.CapsuleRefs {
 		if !capsuleRef.FreshnessPolicy.Valid() {
 			return fmt.Errorf("capsuleRefs[%d].freshnessPolicy is unsupported", index)

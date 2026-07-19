@@ -305,6 +305,8 @@ func (server *server) writeCreateError(response http.ResponseWriter, request *ht
 		writeError(response, request, http.StatusUnprocessableEntity, "REGION_UNAVAILABLE", "The selected region is unavailable.")
 	case errors.Is(err, db.ErrIdempotencyConflict):
 		writeError(response, request, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "The idempotency key was already used with different input.")
+	case errors.Is(err, db.ErrEnvironmentNameConflict):
+		writeError(response, request, http.StatusConflict, "ENVIRONMENT_NAME_CONFLICT", "An active Environment already uses this name.")
 	case errors.Is(err, db.ErrReferenceNotOwned):
 		writeError(response, request, http.StatusNotFound, "REFERENCE_NOT_FOUND", "A referenced resource was not found.")
 	default:

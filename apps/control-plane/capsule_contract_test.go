@@ -6,12 +6,12 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/contracts"
 )
 
-func TestValidatePublishProfileVersionRequestRejectsEmptyCapsuleRefs(t *testing.T) {
+func TestValidatePublishProfileVersionRequestAcceptsEmptyCapsuleRefs(t *testing.T) {
 	body := validPublishProfileVersionRequest()
 	body.CapsuleRefs = nil
 
-	if err := ValidatePublishProfileVersionRequest(body); err == nil {
-		t.Fatal("ValidatePublishProfileVersionRequest() accepted an empty capsuleRefs list")
+	if err := ValidatePublishProfileVersionRequest(body); err != nil {
+		t.Fatalf("ValidatePublishProfileVersionRequest() rejected an empty capsuleRefs list: %v", err)
 	}
 }
 
