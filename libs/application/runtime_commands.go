@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -41,7 +42,21 @@ func (service *RuntimeCommandService) StartRuntime(ctx context.Context, input Ru
 }
 
 func (service *RuntimeCommandService) StopRuntime(ctx context.Context, input RuntimeCommandInput) (domain.EnvironmentRuntimeOperation, error) {
-	return service.commandRuntime(ctx, input, domain.OperationRuntimeStop, []byte(`{"reason":"manual"}`))
+	return service.StopRuntimeWithReason(ctx, input, domain.RuntimeStopManual, nil)
+}
+
+func (service *RuntimeCommandService) StopRuntimeWithReason(ctx context.Context, input RuntimeCommandInput, reason domain.RuntimeStopReason, audit *domain.RuntimeStopAuditEvidence) (domain.EnvironmentRuntimeOperation, error) {
+	if !reason.Valid() || reason == domain.RuntimeStopAutoStop && audit == nil || reason != domain.RuntimeStopAutoStop && audit != nil {
+		return domain.EnvironmentRuntimeOperation{}, ErrInvalidRuntimeCommand
+	}
+	canonicalInput, err := json.Marshal(struct {
+		Reason domain.RuntimeStopReason         `json:"reason"`
+		Audit  *domain.RuntimeStopAuditEvidence `json:"audit,omitempty"`
+	}{Reason: reason, Audit: domain.CloneRuntimeStopAuditEvidence(audit)})
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, err
+	}
+	return service.commandRuntime(ctx, input, domain.OperationRuntimeStop, canonicalInput)
 }
 
 func (service *RuntimeCommandService) ReplaceRuntime(ctx context.Context, input RuntimeCommandInput) (domain.EnvironmentRuntimeOperation, error) {

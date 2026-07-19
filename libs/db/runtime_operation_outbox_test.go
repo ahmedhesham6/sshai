@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -25,7 +26,7 @@ func TestStoreReadsOnlyPendingRuntimeOperationWithPersistedTarget(t *testing.T) 
 		t.Fatalf("read pending Runtime Operation: %v", err)
 	}
 	if !pending || dispatch.OperationID != "operation-1" || dispatch.OperationType != domain.OperationRuntimeStart ||
-		dispatch.EnvironmentID != "environment-1" || dispatch.RuntimeID != "runtime-1" {
+		dispatch.EnvironmentID != "environment-1" || dispatch.RuntimeID != "runtime-1" || dispatch.OwnerUserID != "user-1" || dispatch.StopReason != "" {
 		t.Fatalf("pending Runtime Operation = %#v pending:%t", dispatch, pending)
 	}
 
@@ -84,7 +85,23 @@ func TestStoreListsPendingRuntimeOperationsInDeterministicBatches(t *testing.T) 
 		WHERE id = $1`, "operation-1", createdAt.Add(90*time.Minute)); err != nil {
 		t.Fatalf("complete first Runtime Operation projection: %v", err)
 	}
-	second := runtimeOperationCandidate(t, "operation-2", "environment-1", domain.OperationRuntimeStop, "request-2", []byte(`{"reason":"manual"}`), createdAt.Add(2*time.Hour))
+	graceStartedAt := createdAt.Add(100 * time.Minute)
+	audit := domain.RuntimeStopAuditEvidence{
+		Policy:           domain.AutoStopPolicySnapshot{ID: "policy-1", EnvironmentID: "environment-1", Mode: domain.AutoStopWhenFullyIdle, GracePeriodSeconds: 300},
+		PolicyGeneration: 2, GraceStartedAt: graceStartedAt, GraceExpiredAt: graceStartedAt.Add(5 * time.Minute), GracePeriodSeconds: 300,
+		QualifyingSnapshots: []domain.AutoStopActivitySnapshot{
+			{RuntimeID: "runtime-1", Sequence: 4, ObservedAt: graceStartedAt},
+			{RuntimeID: "runtime-1", Sequence: 5, ObservedAt: graceStartedAt.Add(5 * time.Minute)},
+		},
+	}
+	stopInput, err := json.Marshal(struct {
+		Reason domain.RuntimeStopReason        `json:"reason"`
+		Audit  domain.RuntimeStopAuditEvidence `json:"audit"`
+	}{Reason: domain.RuntimeStopAutoStop, Audit: audit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := runtimeOperationCandidate(t, "operation-2", "environment-1", domain.OperationRuntimeStop, "request-2", stopInput, createdAt.Add(2*time.Hour))
 	if _, err := store.ReserveRuntimeOperation(ctx, second); err != nil {
 		t.Fatalf("reserve second Runtime Operation: %v", err)
 	}
@@ -107,7 +124,9 @@ func TestStoreListsPendingRuntimeOperationsInDeterministicBatches(t *testing.T) 
 		t.Fatalf("read remaining pending Runtime Operations: %v", err)
 	}
 	if len(dispatches) != 1 || dispatches[0].OperationID != "operation-2" ||
-		dispatches[0].OperationType != domain.OperationRuntimeStop || dispatches[0].RuntimeID != "runtime-1" {
+		dispatches[0].OperationType != domain.OperationRuntimeStop || dispatches[0].RuntimeID != "runtime-1" ||
+		dispatches[0].OwnerUserID != "user-1" || dispatches[0].StopReason != domain.RuntimeStopAutoStop ||
+		dispatches[0].StopAudit == nil || dispatches[0].StopAudit.PolicyGeneration != 2 || len(dispatches[0].StopAudit.QualifyingSnapshots) != 2 {
 		t.Fatalf("remaining pending Runtime Operations = %#v", dispatches)
 	}
 	if _, err := store.PendingRuntimeOperations(ctx, 0); err == nil {
