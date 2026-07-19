@@ -23,7 +23,7 @@ import (
 
 const (
 	dedicatedSSHKeyName = "id_devm"
-	setupPageSize       = 50
+	setupPageSize       = 10
 	maximumSetupPages   = 1000
 )
 
@@ -48,7 +48,7 @@ func (command sshSetupCommand) run(ctx context.Context, identityOverride string)
 		return errors.New("authenticate SSH setup: access token is unavailable")
 	}
 	client := cloneProxyHTTPClient(command.httpClient)
-	api, err := contracts.NewClientWithResponses(command.controlPlaneURL, contracts.WithHTTPClient(boundedDoer{client: client}))
+	api, err := contracts.NewClientWithResponses(command.controlPlaneURL, contracts.WithHTTPClient(client))
 	if err != nil {
 		return errors.New("configure SSH setup: control plane URL is invalid")
 	}
@@ -159,6 +159,12 @@ func chooseLocalSSHKey(keys []localSSHKey, identityOverride string) (localSSHKey
 }
 
 func generateDedicatedSSHKey(sshDirectory string) (localSSHKey, error) {
+	return generateDedicatedSSHKeyWithCreator(sshDirectory, createExclusiveSSHFile)
+}
+
+type exclusiveSSHFileCreator func(*anchoredDirectory, string, []byte, os.FileMode) error
+
+func generateDedicatedSSHKeyWithCreator(sshDirectory string, createFile exclusiveSSHFileCreator) (localSSHKey, error) {
 	directory, err := openOwnedDirectory(sshDirectory)
 	if err != nil {
 		return localSSHKey{}, err
@@ -185,16 +191,37 @@ func generateDedicatedSSHKey(sshDirectory string) (localSSHKey, error) {
 		return localSSHKey{}, err
 	}
 	publicKey := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPublic)))
-	if err := createExclusiveSSHFile(directory, dedicatedSSHKeyName, privateContent, 0o600); err != nil {
+	if err := createFile(directory, dedicatedSSHKeyName, privateContent, 0o600); err != nil {
 		return localSSHKey{}, err
 	}
-	if err := createExclusiveSSHFile(directory, dedicatedSSHKeyName+".pub", []byte(publicKey+" devm\n"), 0o644); err != nil {
-		return localSSHKey{}, err
+	privateInfo, err := directory.root.Lstat(dedicatedSSHKeyName)
+	if err != nil || !privateInfo.Mode().IsRegular() {
+		return localSSHKey{}, errors.New("generated private SSH key changed before its public half was written")
+	}
+	if err := createFile(directory, dedicatedSSHKeyName+".pub", []byte(publicKey+" devm\n"), 0o644); err != nil {
+		return localSSHKey{}, errors.Join(err, removeSSHFileIfSame(directory, dedicatedSSHKeyName, privateInfo))
 	}
 	return localSSHKey{
 		Label: dedicatedSSHKeyName, PrivateKeyPath: filepath.Join(sshDirectory, dedicatedSSHKeyName),
 		PublicKey: publicKey, Fingerprint: ssh.FingerprintSHA256(sshPublic), LastUsed: time.Now(),
 	}, nil
+}
+
+func removeSSHFileIfSame(directory *anchoredDirectory, name string, expected os.FileInfo) error {
+	current, err := directory.root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() || !os.SameFile(expected, current) {
+		return errors.New("generated private SSH key changed before rollback")
+	}
+	if err := directory.root.Remove(name); err != nil {
+		return err
+	}
+	return syncAnchoredDirectory(directory)
 }
 
 func createExclusiveSSHFile(directory *anchoredDirectory, name string, content []byte, mode os.FileMode) error {
@@ -230,10 +257,16 @@ func createExclusiveSSHFile(directory *anchoredDirectory, name string, content [
 	}
 	handle, err := directory.root.Open(".")
 	if err != nil {
+		cleanup()
 		return err
 	}
-	defer handle.Close()
-	return handle.Sync()
+	syncErr := handle.Sync()
+	closeErr := handle.Close()
+	if syncErr != nil || closeErr != nil {
+		cleanup()
+		return errors.Join(syncErr, closeErr)
+	}
+	return nil
 }
 
 func listSetupEnvironments(ctx context.Context, api *contracts.ClientWithResponses, token string) ([]contracts.Environment, error) {

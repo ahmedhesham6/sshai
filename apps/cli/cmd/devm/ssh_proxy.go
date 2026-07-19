@@ -100,7 +100,7 @@ func (command sshProxyCommand) run(ctx context.Context, environmentID string) er
 	}
 	defer connection.CloseNow()
 	connection.SetReadLimit(proxyReadLimitBytes)
-	if err := consumeSSHControlFrames(ctx, connection, command.stderr(), accessToken); err != nil {
+	if err := consumeSSHControlFrames(ctx, connection, command.stderr()); err != nil {
 		return err
 	}
 	stream := websocket.NetConn(ctx, connection, websocket.MessageBinary)
@@ -115,7 +115,7 @@ func (command sshProxyCommand) stderr() io.Writer {
 	return command.errorOutput
 }
 
-func consumeSSHControlFrames(ctx context.Context, socket *websocket.Conn, stderr io.Writer, bearer string) error {
+func consumeSSHControlFrames(ctx context.Context, socket *websocket.Conn, stderr io.Writer) error {
 	for {
 		messageType, content, err := socket.Read(ctx)
 		if err != nil {
@@ -131,17 +131,16 @@ func consumeSSHControlFrames(ctx context.Context, socket *websocket.Conn, stderr
 		if err := json.Unmarshal(content, &frame); err != nil {
 			return errors.New("prepare SSH connection: regional proxy sent an invalid control frame")
 		}
+		if frame.Type == "" {
+			return errors.New("prepare SSH connection: protocol violation: control frame type is missing")
+		}
 		switch frame.Type {
 		case connection.ControlProgress:
-			step := safeControlText(frame.Step, bearer)
-			message := safeControlText(frame.Message, bearer)
-			if step == "" && message == "" {
-				continue
-			}
-			if step != "" && message != "" {
-				_, err = fmt.Fprintf(stderr, "devm: %s: %s\n", step, message)
+			step, known := sshControlStepText(frame.Step)
+			if known {
+				_, err = fmt.Fprintf(stderr, "devm: %s: %s\n", step.identifier, step.progress)
 			} else {
-				_, err = fmt.Fprintf(stderr, "devm: %s%s\n", step, message)
+				_, err = fmt.Fprintln(stderr, "devm: Preparing SSH connection")
 			}
 			if err != nil {
 				return errors.New("prepare SSH connection: write progress to stderr")
@@ -149,15 +148,11 @@ func consumeSSHControlFrames(ctx context.Context, socket *websocket.Conn, stderr
 		case connection.ControlReady:
 			return nil
 		case connection.ControlFailed:
-			step := safeControlText(frame.Step, bearer)
-			message := safeControlText(frame.Message, bearer)
-			if step == "" {
-				step = "unknown-step"
+			step, known := sshControlStepText(frame.Step)
+			if known {
+				return fmt.Errorf("SSH connection failed during %s: %s; persistent Environment state remains intact", step.identifier, step.failure)
 			}
-			if message == "" {
-				message = "the regional proxy could not prepare the Runtime"
-			}
-			return fmt.Errorf("SSH connection failed during %s: %s; persistent Environment state remains intact", step, message)
+			return errors.New("SSH connection failed while preparing the Runtime: the regional proxy could not prepare the Runtime; persistent Environment state remains intact")
 		default:
 			// Unknown control types are ignored so newer proxies can add
 			// advisory frames without breaking older CLIs.
@@ -166,23 +161,23 @@ func consumeSSHControlFrames(ctx context.Context, socket *websocket.Conn, stderr
 	}
 }
 
-func safeControlText(value, bearer string) string {
-	const maximumRunes = 512
-	value = strings.Map(func(character rune) rune {
-		if character < 0x20 || character == 0x7f {
-			return ' '
-		}
-		return character
-	}, value)
-	value = strings.TrimSpace(value)
-	if bearer != "" {
-		value = strings.ReplaceAll(value, bearer, "[redacted]")
+type sshControlStep struct {
+	identifier string
+	progress   string
+	failure    string
+}
+
+func sshControlStepText(value string) (sshControlStep, bool) {
+	switch value {
+	case "starting-runtime":
+		return sshControlStep{identifier: "starting-runtime", progress: "Starting Runtime", failure: "the Runtime could not be started"}, true
+	case "waiting-for-guest":
+		return sshControlStep{identifier: "waiting-for-guest", progress: "Waiting for SSH readiness", failure: "SSH readiness could not be confirmed"}, true
+	case "resolving-route":
+		return sshControlStep{identifier: "resolving-route", progress: "Resolving the Runtime route", failure: "the Runtime route could not be resolved"}, true
+	default:
+		return sshControlStep{}, false
 	}
-	runes := []rune(value)
-	if len(runes) > maximumRunes {
-		value = string(runes[:maximumRunes]) + "…"
-	}
-	return value
 }
 
 func validateProxyCommand(command sshProxyCommand, environmentID string) error {

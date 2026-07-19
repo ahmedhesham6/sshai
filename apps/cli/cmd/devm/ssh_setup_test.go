@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -57,6 +61,29 @@ func TestGenerateDedicatedSSHKeyCreatesParseablePairWithoutClobbering(t *testing
 	}
 }
 
+func TestGenerateDedicatedSSHKeyRollsBackPrivateHalfWhenPublicWriteFails(t *testing.T) {
+	sshDirectory := filepath.Join(t.TempDir(), ".ssh")
+	creator := func(directory *anchoredDirectory, name string, content []byte, mode os.FileMode) error {
+		if strings.HasSuffix(name, ".pub") {
+			return syscall.ENOSPC
+		}
+		return createExclusiveSSHFile(directory, name, content, mode)
+	}
+	if _, err := generateDedicatedSSHKeyWithCreator(sshDirectory, creator); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("public-half failure = %v, want ENOSPC", err)
+	}
+	entries, err := os.ReadDir(sshDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("partial key residue = %v", entries)
+	}
+	if _, err := generateDedicatedSSHKey(sshDirectory); err != nil {
+		t.Fatalf("retry dedicated-key generation: %v", err)
+	}
+}
+
 func TestCLISSHSetupIsIdempotentUploadsPublicKeyAndRendersAllEnvironments(t *testing.T) {
 	root := t.TempDir()
 	configDirectory := filepath.Join(root, ".config", "devm")
@@ -96,7 +123,7 @@ func TestCLISSHSetupIsIdempotentUploadsPublicKeyAndRendersAllEnvironments(t *tes
 		response.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/v1/environments":
-			if request.Method != http.MethodGet || request.URL.Query().Get("pageSize") != "50" {
+			if request.Method != http.MethodGet || request.URL.Query().Get("pageSize") != "10" {
 				t.Errorf("Environment request = method:%s query:%s", request.Method, request.URL.RawQuery)
 			}
 			cursor := request.URL.Query().Get("cursor")
@@ -212,5 +239,74 @@ func TestCLISSHSetupIsIdempotentUploadsPublicKeyAndRendersAllEnvironments(t *tes
 		!strings.Contains(config, "Host zeta\n") || strings.Contains(config, "Host old\n") ||
 		strings.Count(config, "IdentityFile "+filepath.Join(sshDirectory, "id_work")) != 2 {
 		t.Fatalf("managed SSH config:\n%s", config)
+	}
+}
+
+func TestCLISSHSetupAcceptsFullEnvironmentPageAboveIntentResponseLimit(t *testing.T) {
+	root := t.TempDir()
+	configDirectory := filepath.Join(root, ".config", "devm")
+	sshDirectory := filepath.Join(root, ".ssh")
+	if err := os.MkdirAll(sshDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	publicKey, fingerprint := writeEd25519KeyPair(t, sshDirectory, "id_work", "")
+
+	environments := make([]contracts.Environment, setupPageSize)
+	for index := range environments {
+		capsules := make([]contracts.LockedCapsule, 35)
+		for capsuleIndex := range capsules {
+			capsules[capsuleIndex] = contracts.LockedCapsule{
+				Ref:    fmt.Sprintf("owner/user/capsule-%d@sha256:%s", capsuleIndex, strings.Repeat("c", 64)),
+				Digest: "sha256:" + strings.Repeat("c", 64),
+			}
+		}
+		environments[index] = contracts.Environment{
+			Id: "env_" + strconv.Itoa(index), Name: "Environment " + strconv.Itoa(index), Slug: "environment-" + strconv.Itoa(index),
+			Lifecycle: contracts.Active, Health: contracts.EnvironmentHealthHealthy, Region: "eu-central-1", RuntimePreset: "cpu2-mem8",
+			PinnedProfileVersionId: "profile-version-01", CapsuleLockId: "lock-01", CreatedAt: time.Now(),
+			AutoStopPolicy: contracts.AutoStopPolicy{Mode: contracts.AutoStopPolicyModeWhenFullyIdle, GracePeriodSeconds: 300},
+			CapsuleLock: &contracts.CapsuleLock{
+				Id: "lock-01", Digest: "sha256:" + strings.Repeat("a", 64), ProfileVersionId: "profile-version-01",
+				ProjectCapsuleDigest: "sha256:" + strings.Repeat("b", 64), Capsules: capsules,
+			},
+		}
+	}
+	pageBody, err := json.Marshal(contracts.EnvironmentPage{Items: environments})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pageBody) <= 64<<10 {
+		t.Fatalf("large regression page = %d bytes, want above 64 KiB", len(pageBody))
+	}
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v1/environments":
+			_, _ = response.Write(pageBody)
+		case "/v1/ssh-keys":
+			_ = json.NewEncoder(response).Encode(contracts.SSHKeyPage{Items: []contracts.SSHKey{{
+				Id: "key-01", Label: "id_work", Algorithm: contracts.SshEd25519,
+				Fingerprint: fingerprint, PublicKey: publicKey, CreatedAt: time.Now(),
+			}}})
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	command := sshSetupCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(), tokens: staticAccessTokenSource{token: "ACCESS_SECRET"},
+		configDirectory: configDirectory, sshDirectory: sshDirectory, output: io.Discard,
+	}
+	if err := command.run(context.Background(), ""); err != nil {
+		t.Fatalf("SSH setup with full large page: %v", err)
+	}
+	managed, err := os.ReadFile(filepath.Join(configDirectory, "ssh", "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(managed), "Host ") != setupPageSize {
+		t.Fatalf("managed Host blocks = %d, want %d", strings.Count(string(managed), "Host "), setupPageSize)
 	}
 }
