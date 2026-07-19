@@ -126,12 +126,14 @@ func (application cli) run(ctx context.Context, arguments []string) error {
 		return application.runInspect(ctx, arguments[1:])
 	case "capsule":
 		return application.runCapsule(ctx, arguments[1:])
+	case "profile":
+		return application.runProfile(ctx, arguments[1:])
 	case "ssh":
 		return application.runSSH(ctx, arguments[1:])
 	case "ssh-proxy":
 		return application.runSSHProxy(ctx, arguments[1:])
 	default:
-		return fmt.Errorf("usage: devm [inspect|plan|status|stop|doctor|logout|capsule|login|ssh|ssh-proxy]")
+		return fmt.Errorf("usage: devm [inspect|plan|status|stop|doctor|logout|capsule|profile|login|ssh|ssh-proxy]")
 	}
 }
 
