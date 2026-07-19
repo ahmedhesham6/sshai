@@ -19,6 +19,9 @@ type AutoStopCoordinationState struct {
 	TimerPending         bool
 	LastSnapshotSequence uint64
 	DispatchedGeneration uint64
+	SuppressedRuntimeID  string
+	GraceStartedAt       time.Time
+	GraceStartSnapshot   *domain.AutoStopActivitySnapshot
 }
 
 type AutoStopObservation struct {
@@ -26,6 +29,7 @@ type AutoStopObservation struct {
 	Policy           domain.AutoStopPolicySnapshot
 	PolicyGeneration uint64
 	FreshAfter       time.Time
+	ProcessedAt      time.Time
 	Snapshot         *domain.AutoStopActivitySnapshot
 	Conflicts        []domain.AutoStopConflict
 }
@@ -39,11 +43,10 @@ type AutoStopTimer struct {
 type RuntimeStopRequest struct {
 	EnvironmentID  string
 	RuntimeID      string
-	Reason         string
+	Reason         domain.RuntimeStopReason
 	IdempotencyKey string
+	AuditEvidence  *domain.RuntimeStopAuditEvidence
 }
-
-const RuntimeStopReasonAutoStop = "auto_stop"
 
 type AutoStopTransition struct {
 	State     AutoStopCoordinationState
@@ -61,6 +64,33 @@ type AutoStopExpiry struct {
 
 type AutoStopCoordinator struct{}
 
+func (AutoStopCoordinator) Suppress(state AutoStopCoordinationState, runtimeID string) (AutoStopTransition, error) {
+	if state.EnvironmentID == "" || runtimeID == "" {
+		return AutoStopTransition{}, errors.New("suppress Auto-stop: Environment and Runtime are required")
+	}
+	transition := AutoStopTransition{State: state, Cancelled: state.TimerPending}
+	if state.TimerPending {
+		transition.State.TimerGeneration++
+	}
+	transition.State.TimerPending = false
+	transition.State.GraceStartedAt = time.Time{}
+	transition.State.GraceStartSnapshot = nil
+	transition.State.SuppressedRuntimeID = runtimeID
+	return transition, nil
+}
+
+func (AutoStopCoordinator) Resume(state AutoStopCoordinationState, runtimeID string) (AutoStopTransition, error) {
+	if state.EnvironmentID == "" || runtimeID == "" {
+		return AutoStopTransition{}, errors.New("resume Auto-stop: Environment and Runtime are required")
+	}
+	transition := AutoStopTransition{State: state}
+	if state.SuppressedRuntimeID == runtimeID {
+		transition.State.SuppressedRuntimeID = ""
+		transition.State.DispatchedGeneration = 0
+	}
+	return transition, nil
+}
+
 func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation AutoStopObservation) (AutoStopTransition, error) {
 	transition := AutoStopTransition{State: state}
 	if coordinationChanged(state, observation) {
@@ -76,6 +106,21 @@ func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation 
 		transition.State.TimerPending = false
 		transition.State.LastSnapshotSequence = 0
 		transition.State.DispatchedGeneration = 0
+		transition.State.GraceStartedAt = time.Time{}
+		transition.State.GraceStartSnapshot = nil
+		if state.RuntimeID != observation.RuntimeID {
+			transition.State.SuppressedRuntimeID = ""
+		}
+	}
+	if transition.State.SuppressedRuntimeID == observation.RuntimeID {
+		if transition.State.TimerPending {
+			transition.Cancelled = true
+			transition.State.TimerGeneration++
+			transition.State.TimerPending = false
+			transition.State.GraceStartedAt = time.Time{}
+			transition.State.GraceStartSnapshot = nil
+		}
+		return transition, nil
 	}
 	decision, err := evaluateAutoStop(transition.State, observation)
 	if err != nil {
@@ -90,14 +135,24 @@ func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation 
 			transition.Cancelled = true
 			transition.State.TimerGeneration++
 			transition.State.TimerPending = false
+			transition.State.GraceStartedAt = time.Time{}
+			transition.State.GraceStartSnapshot = nil
 		}
 		return transition, nil
 	}
-	if transition.State.TimerPending || transition.State.DispatchedGeneration != 0 {
+	if transition.State.TimerPending || (transition.State.DispatchedGeneration != 0 && transition.State.DispatchedGeneration == transition.State.TimerGeneration) {
 		return transition, nil
 	}
 	transition.State.TimerGeneration++
 	transition.State.TimerPending = true
+	if observation.Snapshot != nil {
+		if observation.ProcessedAt.IsZero() {
+			return AutoStopTransition{}, errors.New("coordinate Auto-stop: processing time is required")
+		}
+		snapshot := *observation.Snapshot
+		transition.State.GraceStartedAt = observation.ProcessedAt
+		transition.State.GraceStartSnapshot = &snapshot
+	}
 	transition.Timer = &AutoStopTimer{
 		RuntimeID: observation.RuntimeID, Generation: transition.State.TimerGeneration,
 		Delay: time.Duration(observation.Policy.GracePeriodSeconds) * time.Second,
@@ -128,13 +183,27 @@ func (coordinator AutoStopCoordinator) Expire(state AutoStopCoordinationState, e
 	}
 	transition := AutoStopTransition{State: next, Decision: decision}
 	if !decision.Qualifies {
+		next.GraceStartedAt = time.Time{}
+		next.GraceStartSnapshot = nil
+		transition.State = next
 		return transition, nil
 	}
+	if state.GraceStartSnapshot == nil || expiry.Observation.Snapshot == nil || state.GraceStartedAt.IsZero() {
+		return AutoStopTransition{}, errors.New("coordinate Auto-stop: qualifying grace evidence is required")
+	}
+	graceStart := *state.GraceStartSnapshot
+	graceExpiry := *expiry.Observation.Snapshot
 	next.DispatchedGeneration = expiry.Generation
 	transition.State = next
 	transition.Stop = &RuntimeStopRequest{
-		EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID, Reason: RuntimeStopReasonAutoStop,
-		IdempotencyKey: fmt.Sprintf("runtime.stop:%s:%s:%s:%d", RuntimeStopReasonAutoStop, state.EnvironmentID, state.RuntimeID, expiry.Generation),
+		EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID, Reason: domain.RuntimeStopAutoStop,
+		IdempotencyKey: fmt.Sprintf("%sruntime.stop:%s:%s:%s:%d", domain.SystemIdempotencyKeyPrefix, domain.RuntimeStopAutoStop, state.EnvironmentID, state.RuntimeID, expiry.Generation),
+		AuditEvidence: &domain.RuntimeStopAuditEvidence{
+			Policy: expiry.Observation.Policy, PolicyGeneration: expiry.Observation.PolicyGeneration,
+			QualifyingSnapshots: []domain.AutoStopActivitySnapshot{graceStart, graceExpiry},
+			GraceStartedAt:      state.GraceStartedAt, GraceExpiredAt: graceExpiry.ObservedAt,
+			GracePeriodSeconds: state.PolicyGraceSeconds,
+		},
 	}
 	return transition, nil
 }

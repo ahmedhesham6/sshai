@@ -80,6 +80,8 @@ type BillingReader interface {
 
 type Config struct {
 	CreateEnvironment   *application.CreateEnvironmentService
+	RuntimeCommands     *application.RuntimeCommandService
+	AutoStopPolicies    *application.AutoStopPolicyService
 	RegisterProjectSeed *application.RegisterProjectSeedService
 	Profiles            *application.ProfileService
 	Uploads             *application.UploadIntentService
@@ -103,6 +105,8 @@ type Config struct {
 type server struct {
 	contracts.Unimplemented
 	createEnvironment   *application.CreateEnvironmentService
+	runtimeCommands     *application.RuntimeCommandService
+	autoStopPolicies    *application.AutoStopPolicyService
 	registerProjectSeed *application.RegisterProjectSeedService
 	profiles            *application.ProfileService
 	uploads             *application.UploadIntentService
@@ -121,6 +125,7 @@ type server struct {
 func NewHandler(config Config) http.Handler {
 	api := &server{
 		createEnvironment: config.CreateEnvironment, registerProjectSeed: config.RegisterProjectSeed,
+		runtimeCommands: config.RuntimeCommands, autoStopPolicies: config.AutoStopPolicies,
 		profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys,
 		capsulePresigner: config.CapsulePresigner, capsuleOwnership: config.CapsuleOwnership,
 		capsuleBucket: config.CapsuleBucket, capsuleAccessTTL: config.CapsuleAccessTTL,
@@ -131,6 +136,7 @@ func NewHandler(config Config) http.Handler {
 	router := chi.NewRouter()
 	router.Use(requestIDMiddleware(config.RequestIDs))
 	router.Use(authenticationMiddleware(config.Verifier, config.Users, config.UserIDs, config.DefaultRegion, config.Now))
+	router.Use(rejectReservedSystemIdempotencyKeys)
 	specification, err := contracts.GetSwagger()
 	if err != nil {
 		panic("load embedded OpenAPI contract: " + err.Error())
@@ -150,6 +156,16 @@ func NewHandler(config Config) http.Handler {
 		SilenceServersWarning: true,
 	}))
 	return contracts.HandlerFromMuxWithBaseURL(api, router, "/v1")
+}
+
+func rejectReservedSystemIdempotencyKeys(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.Header.Get("Idempotency-Key"), domain.SystemIdempotencyKeyPrefix) {
+			writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", "The idempotency key uses a reserved system namespace.")
+			return
+		}
+		next.ServeHTTP(response, request)
+	})
 }
 
 func (server *server) CreateProjectSeed(response http.ResponseWriter, request *http.Request, params contracts.CreateProjectSeedParams) {

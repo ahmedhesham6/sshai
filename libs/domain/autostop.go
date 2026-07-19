@@ -26,6 +26,11 @@ type AutoStopPolicy struct {
 	snapshot AutoStopPolicySnapshot
 }
 
+type AutoStopPolicyRefresh struct {
+	EnvironmentID string
+	Generation    uint64
+}
+
 func NewAutoStopPolicy(id, environmentID string, mode AutoStopMode, gracePeriodSeconds int) (AutoStopPolicy, error) {
 	if id == "" {
 		return AutoStopPolicy{}, errors.New("create Auto-stop Policy: ID is required")

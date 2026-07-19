@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -130,9 +131,17 @@ func TestEnvironmentRuntimeOperationEligibilityMatchesLifecycle(t *testing.T) {
 					t.Fatalf("Start Operation: %v", err)
 				}
 			}
-			_, err := domain.NewEnvironmentRuntimeOperation(environment, test.runtime, operation)
+			var err error
+			if test.running {
+				_, err = domain.RestoreEnvironmentRuntimeOperation(environment, test.runtime, operation)
+			} else {
+				_, err = domain.NewEnvironmentRuntimeOperation(environment, test.runtime, operation)
+			}
 			if (err == nil) != test.wantAllowed {
 				t.Fatalf("NewEnvironmentRuntimeOperation() error = %v, allowed = %t", err, test.wantAllowed)
+			}
+			if !test.wantAllowed && !errors.Is(err, domain.ErrRuntimeCommandState) {
+				t.Fatalf("NewEnvironmentRuntimeOperation() error = %v, want ErrRuntimeCommandState", err)
 			}
 		})
 	}
@@ -156,7 +165,7 @@ func TestEnvironmentAcceptsSucceededRuntimeOperationAsHistoricalReplay(t *testin
 		t.Fatalf("Succeed(): %v", err)
 	}
 
-	if _, err := domain.NewEnvironmentRuntimeOperation(environment, startingRuntime(t, createdAt), operation); err != nil {
+	if _, err := domain.RestoreEnvironmentRuntimeOperation(environment, startingRuntime(t, createdAt), operation); err != nil {
 		t.Fatalf("historical replay: %v", err)
 	}
 	environmentSnapshot := environment.Snapshot()
@@ -177,7 +186,7 @@ func TestEnvironmentAcceptsSucceededRuntimeOperationAsHistoricalReplay(t *testin
 		if err != nil {
 			t.Fatalf("RestoreOperation(%q): %v", status, err)
 		}
-		if _, err := domain.NewEnvironmentRuntimeOperation(replacedEnvironment, stoppedRuntime(t, createdAt), terminal); err != nil {
+		if _, err := domain.RestoreEnvironmentRuntimeOperation(replacedEnvironment, stoppedRuntime(t, createdAt), terminal); err != nil {
 			t.Fatalf("historical %q target replay after replacement: %v", status, err)
 		}
 	}

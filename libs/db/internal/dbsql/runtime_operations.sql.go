@@ -190,21 +190,28 @@ func (q *Queries) GetOwnedRuntimeStateForUpdate(ctx context.Context, arg GetOwne
 }
 
 const getPendingRuntimeOperation = `-- name: GetPendingRuntimeOperation :one
-SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id
+SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id,
+       operation.requested_by_user_id,
+       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason,
+       operation.input AS operation_input
 FROM workflow_outbox outbox
 JOIN runtime_operation_targets target
   ON target.operation_id = outbox.operation_id
  AND target.operation_type = outbox.kind
+JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.operation_id = $1
   AND outbox.started_at IS NULL
   AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace')
 `
 
 type GetPendingRuntimeOperationRow struct {
-	OperationID   string
-	OperationType string
-	EnvironmentID string
-	RuntimeID     string
+	OperationID       string
+	OperationType     string
+	EnvironmentID     string
+	RuntimeID         string
+	RequestedByUserID string
+	StopReason        string
+	OperationInput    []byte
 }
 
 func (q *Queries) GetPendingRuntimeOperation(ctx context.Context, operationID string) (GetPendingRuntimeOperationRow, error) {
@@ -215,6 +222,9 @@ func (q *Queries) GetPendingRuntimeOperation(ctx context.Context, operationID st
 		&i.OperationType,
 		&i.EnvironmentID,
 		&i.RuntimeID,
+		&i.RequestedByUserID,
+		&i.StopReason,
+		&i.OperationInput,
 	)
 	return i, err
 }
@@ -305,11 +315,15 @@ func (q *Queries) InsertRuntimeOperationTarget(ctx context.Context, arg InsertRu
 }
 
 const listPendingRuntimeOperations = `-- name: ListPendingRuntimeOperations :many
-SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id
+SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id,
+       operation.requested_by_user_id,
+       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason,
+       operation.input AS operation_input
 FROM workflow_outbox outbox
 JOIN runtime_operation_targets target
   ON target.operation_id = outbox.operation_id
  AND target.operation_type = outbox.kind
+JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.started_at IS NULL
   AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace')
 ORDER BY outbox.created_at, outbox.operation_id
@@ -317,10 +331,13 @@ LIMIT $1
 `
 
 type ListPendingRuntimeOperationsRow struct {
-	OperationID   string
-	OperationType string
-	EnvironmentID string
-	RuntimeID     string
+	OperationID       string
+	OperationType     string
+	EnvironmentID     string
+	RuntimeID         string
+	RequestedByUserID string
+	StopReason        string
+	OperationInput    []byte
 }
 
 func (q *Queries) ListPendingRuntimeOperations(ctx context.Context, limitCount int32) ([]ListPendingRuntimeOperationsRow, error) {
@@ -337,6 +354,9 @@ func (q *Queries) ListPendingRuntimeOperations(ctx context.Context, limitCount i
 			&i.OperationType,
 			&i.EnvironmentID,
 			&i.RuntimeID,
+			&i.RequestedByUserID,
+			&i.StopReason,
+			&i.OperationInput,
 		); err != nil {
 			return nil, err
 		}

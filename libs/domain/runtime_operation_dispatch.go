@@ -5,4 +5,7 @@ type RuntimeOperationDispatch struct {
 	OperationType OperationType
 	EnvironmentID string
 	RuntimeID     string
+	OwnerUserID   string
+	StopReason    RuntimeStopReason
+	StopAudit     *RuntimeStopAuditEvidence
 }

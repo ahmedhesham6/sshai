@@ -6,14 +6,17 @@ import (
 	"time"
 )
 
+const SystemIdempotencyKeyPrefix = "system:"
+
 type OperationType string
 
 const (
-	OperationEnvironmentCreate OperationType = "environment.create"
-	OperationRuntimeStart      OperationType = "runtime.start"
-	OperationRuntimeStop       OperationType = "runtime.stop"
-	OperationRuntimeReplace    OperationType = "runtime.replace"
-	OperationProfileResolve    OperationType = "profile.resolve"
+	OperationEnvironmentCreate         OperationType = "environment.create"
+	OperationEnvironmentUpdateAutoStop OperationType = "environment.update_auto_stop"
+	OperationRuntimeStart              OperationType = "runtime.start"
+	OperationRuntimeStop               OperationType = "runtime.stop"
+	OperationRuntimeReplace            OperationType = "runtime.replace"
+	OperationProfileResolve            OperationType = "profile.resolve"
 )
 
 type OperationStatus string
@@ -96,7 +99,7 @@ func RestoreOperation(snapshot OperationSnapshot) (Operation, error) {
 	if snapshot.Status.terminal() && snapshot.CompletedAt == nil {
 		return Operation{}, errors.New("restore Operation: terminal Operation requires completion time")
 	}
-	if snapshot.Status == OperationSucceeded && snapshot.RestateInvocationID == nil {
+	if snapshot.Status == OperationSucceeded && snapshot.RestateInvocationID == nil && snapshot.Type != OperationEnvironmentUpdateAutoStop {
 		return Operation{}, errors.New("restore Operation: succeeded Operation requires Restate invocation")
 	}
 	if !snapshot.Status.terminal() && snapshot.CompletedAt != nil {
@@ -193,6 +196,31 @@ func (operation Operation) Succeed(at time.Time) (Operation, error) {
 	}
 	if at.Before(operation.snapshot.CreatedAt) {
 		return Operation{}, errors.New("succeed Operation: completion time precedes creation time")
+	}
+
+	next := operation.Snapshot()
+	next.Status = OperationSucceeded
+	next.CompletedAt = &at
+	return Operation{snapshot: next}, nil
+}
+
+// SucceedSynchronously records the one synchronous command currently
+// supported by the control plane without fabricating workflow provenance.
+func (operation Operation) SucceedSynchronously(at time.Time) (Operation, error) {
+	if operation.snapshot.Status == OperationSucceeded && operation.snapshot.Type == OperationEnvironmentUpdateAutoStop && operation.snapshot.RestateInvocationID == nil {
+		return operation, nil
+	}
+	if operation.snapshot.Type != OperationEnvironmentUpdateAutoStop {
+		return Operation{}, fmt.Errorf("succeed Operation synchronously: type %q requires a workflow", operation.snapshot.Type)
+	}
+	if operation.snapshot.Status != OperationQueued {
+		return Operation{}, fmt.Errorf("succeed Operation synchronously: status is %q, want %q", operation.snapshot.Status, OperationQueued)
+	}
+	if operation.snapshot.RestateInvocationID != nil {
+		return Operation{}, errors.New("succeed Operation synchronously: Restate invocation must be absent")
+	}
+	if at.Before(operation.snapshot.CreatedAt) {
+		return Operation{}, errors.New("succeed Operation synchronously: completion time precedes creation time")
 	}
 
 	next := operation.Snapshot()

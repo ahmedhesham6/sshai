@@ -125,3 +125,44 @@ func TestOperationRejectsOutOfOrderTransitions(t *testing.T) {
 		t.Fatal("succeed Operation without Restate invocation error = nil")
 	}
 }
+
+func TestOperationSynchronousSuccessIsRestrictedToPolicyUpdates(t *testing.T) {
+	createdAt := time.Date(2026, time.July, 19, 13, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name          string
+		operationType domain.OperationType
+		wantError     bool
+	}{
+		{name: "Auto-stop Policy", operationType: domain.OperationEnvironmentUpdateAutoStop},
+		{name: "workflow command", operationType: domain.OperationRuntimeStart, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operation, err := domain.QueueOperation(domain.OperationRequest{
+				ID: "operation-1", EnvironmentID: "environment-1", Type: test.operationType,
+				RequestedByUserID: "user-1", IdempotencyKey: "request-key-0001", Input: []byte(`{}`), CreatedAt: createdAt,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed, err := operation.SucceedSynchronously(createdAt)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("SucceedSynchronously() error = nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := completed.Snapshot()
+			if snapshot.Status != domain.OperationSucceeded || snapshot.RestateInvocationID != nil || snapshot.CompletedAt == nil {
+				t.Fatalf("synchronous Operation = %#v", snapshot)
+			}
+			restored, err := domain.RestoreOperation(snapshot)
+			if err != nil || restored.Snapshot().RestateInvocationID != nil {
+				t.Fatalf("RestoreOperation() = %#v, %v", restored.Snapshot(), err)
+			}
+		})
+	}
+}

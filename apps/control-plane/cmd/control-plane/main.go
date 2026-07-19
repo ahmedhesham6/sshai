@@ -66,12 +66,30 @@ func run(ctx context.Context) error {
 	defer verifier.Close(context.Background())
 	workflowClient := workflows.NewClient(ingress.NewClient(config.restateIngressURL))
 	dispatcher := application.NewEnvironmentCreateDispatcher(store, workflowClient)
+	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)
+	autoStopPolicyRefreshDispatcher := application.NewAutoStopPolicyRefreshDispatcher(store, workflowClient)
 	recovery := application.NewWorkflowRecovery(dispatcher, 5*time.Second, 100, func(err error) {
 		slog.Error("workflow recovery failed", "error", err)
+	})
+	runtimeRecovery := application.NewRuntimeWorkflowRecovery(runtimeDispatcher, 5*time.Second, 100, func(err error) {
+		slog.Error("Runtime workflow recovery failed", "error", err)
+	})
+	autoStopPolicyRefreshRecovery := application.NewAutoStopPolicyRefreshRecovery(autoStopPolicyRefreshDispatcher, 5*time.Second, 100, func(err error) {
+		slog.Error("Auto-stop Policy refresh recovery failed", "error", err)
 	})
 	go func() {
 		if err := recovery.Run(ctx); err != nil {
 			slog.Error("workflow recovery stopped", "error", err)
+		}
+	}()
+	go func() {
+		if err := runtimeRecovery.Run(ctx); err != nil {
+			slog.Error("Runtime workflow recovery stopped", "error", err)
+		}
+	}()
+	go func() {
+		if err := autoStopPolicyRefreshRecovery.Run(ctx); err != nil {
+			slog.Error("Auto-stop Policy refresh recovery stopped", "error", err)
 		}
 	}()
 	ids := uuidGenerator{}
@@ -107,11 +125,14 @@ func run(ctx context.Context) error {
 		store, dispatcher, ids, time.Now,
 		map[string]string{config.defaultRegion: config.defaultAvailabilityZone},
 	)
+	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, ids, time.Now)
+	autoStopPolicies := application.NewAutoStopPolicyService(store, autoStopPolicyRefreshDispatcher, ids, time.Now)
 	registerProjectSeed := application.NewRegisterProjectSeedService(store, uploads, ids, time.Now)
 	profiles := application.NewProfileService(store, uploads, ids, time.Now)
 	sshKeys := application.NewSSHKeyService(store, ids, time.Now)
 	handler := controlplane.NewHandler(controlplane.Config{
-		CreateEnvironment: createEnvironment, RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
+		CreateEnvironment: createEnvironment, RuntimeCommands: runtimeCommands, AutoStopPolicies: autoStopPolicies,
+		RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
 		Verifier: verifier, Users: store, CapsulePresigner: capsulePresigner, CapsuleOwnership: controlplane.NewS3CapsuleOwnership(capsuleClient, config.capsuleBucket), CapsuleBucket: config.capsuleBucket, CapsuleAccessTTL: 15 * time.Minute,
 		UserIDs: ids, RequestIDs: ids, DefaultRegion: config.defaultRegion, Now: time.Now,
 		EnvironmentReads: store, OperationReads: store, ProfileReads: store, BillingReads: store,

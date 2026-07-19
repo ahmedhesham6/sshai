@@ -23,7 +23,7 @@ func TestBuildServicesWithBillingOnlyDependencies(t *testing.T) {
 	}
 }
 
-func TestBuildServicesWithFullDependenciesBindsAllThreeServices(t *testing.T) {
+func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.T) {
 	creationActions, err := workflows.NewEnvironmentCreationActions(&environmentCreationRepositoryFake{}, &pinnedProfileVersionResolverFake{})
 	if err != nil {
 		t.Fatalf("construct Environment creation actions: %v", err)
@@ -33,12 +33,18 @@ func TestBuildServicesWithFullDependenciesBindsAllThreeServices(t *testing.T) {
 		polarDeliverer: polarEventDelivererFake{}, polarStore: polarDeliveryStoreFake{}, now: time.Now,
 		environmentCreate: workflows.EnvironmentCreateDefinition(testfixtures.NewProvider(), creationActions, idGenerator{}, time.Now, "image-v1"),
 		profileResolve:    workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolverFake{}, idGenerator{}, time.Now),
+		autoStop:          workflows.AutoStopDefinition(nil, nil),
+		runtimeStart:      workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{}),
+		runtimeStop:       workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{}),
 	})
 	names := make([]string, len(services))
 	for index, service := range services {
 		names[index] = service.Name()
 	}
-	want := []string{workflows.BillingDeliveryService, workflows.EnvironmentCreateService, workflows.ProfileResolveService}
+	want := []string{
+		workflows.BillingDeliveryService, workflows.EnvironmentCreateService, workflows.ProfileResolveService,
+		workflows.AutoStopService, workflows.RuntimeStartService, workflows.RuntimeStopService,
+	}
 	if len(names) != len(want) {
 		t.Fatalf("bound services = %v, want %v", names, want)
 	}

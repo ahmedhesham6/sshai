@@ -2,20 +2,61 @@ package application_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/application"
+	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 )
+
+func TestRuntimeCommandServiceChecksCreditsOnlyForStart(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		credits   int64
+		wantError error
+	}{
+		{name: "positive balance permits start", credits: 1},
+		{name: "zero balance blocks start", credits: 0, wantError: application.ErrCreditsPolicyBlocked},
+		{name: "negative balance blocks start", credits: -1, wantError: application.ErrCreditsPolicyBlocked},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
+			repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime}
+			balance := &runtimeCommandBalanceFake{expectedOwnerID: "user-1", credits: test.credits}
+			service := application.NewRuntimeCommandService(repository, &runtimeCommandDispatcherFake{}, balance, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
+			_, err := service.StartRuntime(t.Context(), application.RuntimeCommandInput{
+				OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "request-1",
+			})
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("StartRuntime() error = %v, want %v", err, test.wantError)
+			}
+			if test.wantError != nil && repository.calls != 0 {
+				t.Fatalf("blocked start reserved %d Operations", repository.calls)
+			}
+		})
+	}
+
+	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
+	repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime}
+	service := application.NewRuntimeCommandService(repository, &runtimeCommandDispatcherFake{}, &runtimeCommandBalanceFake{err: errors.New("must not be called")}, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
+	if _, err := service.StopRuntime(t.Context(), application.RuntimeCommandInput{
+		OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "request-1",
+	}); err != nil {
+		t.Fatalf("StopRuntime() checked credits: %v", err)
+	}
+}
 
 func TestRuntimeCommandServiceReservesStartBeforeDispatch(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
 	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
 	repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime}
 	dispatcher := &runtimeCommandDispatcherFake{}
-	service := application.NewRuntimeCommandService(repository, dispatcher, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
+	service := application.NewRuntimeCommandService(repository, dispatcher, &runtimeCommandBalanceFake{expectedOwnerID: "user-1", credits: 1}, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
 
 	command, err := service.StartRuntime(t.Context(), application.RuntimeCommandInput{
 		OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "request-1",
@@ -36,6 +77,69 @@ func TestRuntimeCommandServiceReservesStartBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestRuntimeCommandServiceReplaysStartBeforeCreditAdmission(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
+	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
+	historical, err := domain.QueueOperation(domain.OperationRequest{
+		ID: "operation-historical", EnvironmentID: "environment-1", Type: domain.OperationRuntimeStart,
+		RequestedByUserID: "user-1", IdempotencyKey: "request-1", Input: []byte(`{}`), CreatedAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime, operation: historical, replay: true}
+	dispatcher := &runtimeCommandDispatcherFake{}
+	balance := &runtimeCommandBalanceFake{err: errors.New("current balance is below admission threshold")}
+	service := application.NewRuntimeCommandService(repository, dispatcher, balance, &idsFake{values: []string{"operation-unused"}}, func() time.Time { return now })
+
+	command, err := service.StartRuntime(t.Context(), application.RuntimeCommandInput{
+		OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatalf("StartRuntime() replay: %v", err)
+	}
+	if got := command.Operation().Snapshot().ID; got != "operation-historical" {
+		t.Fatalf("replayed Operation ID = %q", got)
+	}
+	if balance.calls != 0 || repository.reserveCalls != 0 || repository.replayCalls != 1 {
+		t.Fatalf("replay side effects = balance:%d replay:%d reserve:%d", balance.calls, repository.replayCalls, repository.reserveCalls)
+	}
+	if len(dispatcher.operationIDs) != 1 || dispatcher.operationIDs[0] != "operation-historical" {
+		t.Fatalf("replay dispatches = %#v", dispatcher.operationIDs)
+	}
+}
+
+func TestRuntimeCommandServicePersistsAutoStopAuditEvidence(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
+	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
+	repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime}
+	service := application.NewRuntimeCommandService(repository, &runtimeCommandDispatcherFake{}, nil, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
+	audit := &domain.RuntimeStopAuditEvidence{
+		Policy:           domain.AutoStopPolicySnapshot{ID: "policy-1", EnvironmentID: "environment-1", Mode: domain.AutoStopWhenFullyIdle, GracePeriodSeconds: 60},
+		PolicyGeneration: 2, GraceStartedAt: now.Add(-time.Minute), GraceExpiredAt: now, GracePeriodSeconds: 60,
+		QualifyingSnapshots: []domain.AutoStopActivitySnapshot{
+			{RuntimeID: "runtime-1", Sequence: 8, ObservedAt: now.Add(-time.Minute)},
+			{RuntimeID: "runtime-1", Sequence: 9, ObservedAt: now},
+		},
+	}
+	command, err := service.StopRuntimeWithReason(t.Context(), application.RuntimeCommandInput{
+		OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "auto-stop-1",
+	}, domain.RuntimeStopAutoStop, audit)
+	if err != nil {
+		t.Fatalf("StopRuntimeWithReason(): %v", err)
+	}
+	var persisted struct {
+		Reason domain.RuntimeStopReason         `json:"reason"`
+		Audit  *domain.RuntimeStopAuditEvidence `json:"audit"`
+	}
+	if err := json.Unmarshal(command.Operation().Snapshot().Input, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Reason != domain.RuntimeStopAutoStop || persisted.Audit == nil || persisted.Audit.PolicyGeneration != 2 || len(persisted.Audit.QualifyingSnapshots) != 2 {
+		t.Fatalf("persisted Auto-stop input = %#v", persisted)
+	}
+}
+
 func TestRuntimeCommandServiceRejectsInvalidInputBeforeSideEffects(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
 	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
@@ -47,7 +151,7 @@ func TestRuntimeCommandServiceRejectsInvalidInputBeforeSideEffects(t *testing.T)
 	for _, input := range tests {
 		repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime}
 		dispatcher := &runtimeCommandDispatcherFake{}
-		service := application.NewRuntimeCommandService(repository, dispatcher, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
+		service := application.NewRuntimeCommandService(repository, dispatcher, &runtimeCommandBalanceFake{expectedOwnerID: "user-1", credits: 1}, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
 		if _, err := service.StartRuntime(t.Context(), input); !errors.Is(err, application.ErrInvalidRuntimeCommand) || repository.calls != 0 || len(dispatcher.operationIDs) != 0 {
 			t.Fatalf("StartRuntime(%#v) = repository:%d dispatch:%d error:%v", input, repository.calls, len(dispatcher.operationIDs), err)
 		}
@@ -62,10 +166,11 @@ func TestRuntimeCommandServiceRejectsIncompleteDependenciesWithoutPanic(t *testi
 	ids := &idsFake{values: []string{"operation-1"}}
 	input := application.RuntimeCommandInput{OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "request-1"}
 	services := []*application.RuntimeCommandService{
-		application.NewRuntimeCommandService(nil, dispatcher, ids, func() time.Time { return now }),
-		application.NewRuntimeCommandService(repository, nil, ids, func() time.Time { return now }),
-		application.NewRuntimeCommandService(repository, dispatcher, nil, func() time.Time { return now }),
-		application.NewRuntimeCommandService(repository, dispatcher, ids, nil),
+		application.NewRuntimeCommandService(nil, dispatcher, &runtimeCommandBalanceFake{}, ids, func() time.Time { return now }),
+		application.NewRuntimeCommandService(repository, nil, &runtimeCommandBalanceFake{}, ids, func() time.Time { return now }),
+		application.NewRuntimeCommandService(repository, dispatcher, nil, ids, func() time.Time { return now }),
+		application.NewRuntimeCommandService(repository, dispatcher, &runtimeCommandBalanceFake{}, nil, func() time.Time { return now }),
+		application.NewRuntimeCommandService(repository, dispatcher, &runtimeCommandBalanceFake{}, ids, nil),
 	}
 	for index, service := range services {
 		if _, err := service.StartRuntime(t.Context(), input); !errors.Is(err, application.ErrInvalidRuntimeCommand) {
@@ -90,7 +195,7 @@ func TestRuntimeCommandServiceUsesClosedCanonicalCommands(t *testing.T) {
 			environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
 			repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime}
 			dispatcher := &runtimeCommandDispatcherFake{}
-			service := application.NewRuntimeCommandService(repository, dispatcher, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
+			service := application.NewRuntimeCommandService(repository, dispatcher, nil, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
 
 			command, err := test.command(service, t.Context(), application.RuntimeCommandInput{
 				OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "request-1",
@@ -107,14 +212,27 @@ func TestRuntimeCommandServiceUsesClosedCanonicalCommands(t *testing.T) {
 }
 
 type runtimeCommandRepositoryFake struct {
-	environment domain.Environment
-	runtime     domain.Runtime
-	operation   domain.Operation
-	calls       int
+	environment  domain.Environment
+	runtime      domain.Runtime
+	operation    domain.Operation
+	replay       bool
+	replayCalls  int
+	reserveCalls int
+	calls        int
+}
+
+func (repository *runtimeCommandRepositoryFake) ReplayRuntimeOperation(_ context.Context, _ domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error) {
+	repository.replayCalls++
+	if !repository.replay {
+		return domain.EnvironmentRuntimeOperation{}, false, nil
+	}
+	command, err := domain.RestoreEnvironmentRuntimeOperation(repository.environment, repository.runtime, repository.operation)
+	return command, true, err
 }
 
 func (repository *runtimeCommandRepositoryFake) ReserveRuntimeOperation(_ context.Context, operation domain.Operation) (domain.EnvironmentRuntimeOperation, error) {
 	repository.calls++
+	repository.reserveCalls++
 	if repository.operation.Snapshot().ID == "" {
 		repository.operation = operation
 	}
@@ -126,6 +244,24 @@ type runtimeCommandDispatcherFake struct{ operationIDs []string }
 func (dispatcher *runtimeCommandDispatcherFake) DispatchRuntimeOperation(_ context.Context, operationID string) error {
 	dispatcher.operationIDs = append(dispatcher.operationIDs, operationID)
 	return nil
+}
+
+type runtimeCommandBalanceFake struct {
+	expectedOwnerID string
+	credits         int64
+	err             error
+	calls           int
+}
+
+func (fake *runtimeCommandBalanceFake) CreditBalance(_ context.Context, ownerID string) (db.CreditBalanceProjection, error) {
+	fake.calls++
+	if fake.expectedOwnerID != "" && ownerID != fake.expectedOwnerID {
+		return db.CreditBalanceProjection{}, errors.New("unexpected Credit Balance owner")
+	}
+	if fake.err != nil {
+		return db.CreditBalanceProjection{}, fake.err
+	}
+	return db.CreditBalanceProjection{UserID: ownerID, Credits: fake.credits}, nil
 }
 
 func stoppedEnvironmentRuntime(t *testing.T, createdAt time.Time) (domain.Environment, domain.Runtime) {
