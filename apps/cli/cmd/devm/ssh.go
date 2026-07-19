@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"golang.org/x/crypto/ssh"
@@ -21,6 +22,7 @@ type localSSHKey struct {
 	PrivateKeyPath string
 	PublicKey      string
 	Fingerprint    string
+	LastUsed       time.Time
 }
 
 // discoverEd25519Keys reads public-key files only. A regular sibling private
@@ -68,6 +70,7 @@ func discoverEd25519Keys(sshDirectory string) ([]localSSHKey, error) {
 			PrivateKeyPath: filepath.Join(sshDirectory, privateName),
 			PublicKey:      publicKey,
 			Fingerprint:    fingerprint,
+			LastUsed:       fileLastUsed(privateInfo),
 		})
 	}
 	sort.Slice(keys, func(left, right int) bool {

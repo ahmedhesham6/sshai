@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ahmedhesham6/sshai/libs/connection"
 	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/coder/websocket"
 )
@@ -36,6 +38,7 @@ type sshProxyCommand struct {
 	attempt         string
 	input           io.Reader
 	output          io.Writer
+	errorOutput     io.Writer
 	now             func() time.Time
 }
 
@@ -97,9 +100,84 @@ func (command sshProxyCommand) run(ctx context.Context, environmentID string) er
 	}
 	defer connection.CloseNow()
 	connection.SetReadLimit(proxyReadLimitBytes)
+	if err := consumeSSHControlFrames(ctx, connection, command.stderr()); err != nil {
+		return err
+	}
 	stream := websocket.NetConn(ctx, connection, websocket.MessageBinary)
 	defer stream.Close()
 	return copySSHStream(ctx, stream, command.input, command.output)
+}
+
+func (command sshProxyCommand) stderr() io.Writer {
+	if command.errorOutput == nil {
+		return io.Discard
+	}
+	return command.errorOutput
+}
+
+func consumeSSHControlFrames(ctx context.Context, socket *websocket.Conn, stderr io.Writer) error {
+	for {
+		messageType, content, err := socket.Read(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
+			}
+			return errors.New("prepare SSH connection: regional proxy closed before it was ready")
+		}
+		if messageType != websocket.MessageText {
+			return errors.New("prepare SSH connection: protocol violation: binary frame received before ready")
+		}
+		var frame connection.ControlFrame
+		if err := json.Unmarshal(content, &frame); err != nil {
+			return errors.New("prepare SSH connection: regional proxy sent an invalid control frame")
+		}
+		if frame.Type == "" {
+			return errors.New("prepare SSH connection: protocol violation: control frame type is missing")
+		}
+		switch frame.Type {
+		case connection.ControlProgress:
+			step, known := sshControlStepText(frame.Step)
+			if known {
+				_, err = fmt.Fprintf(stderr, "devm: %s: %s\n", step.identifier, step.progress)
+			} else {
+				_, err = fmt.Fprintln(stderr, "devm: Preparing SSH connection")
+			}
+			if err != nil {
+				return errors.New("prepare SSH connection: write progress to stderr")
+			}
+		case connection.ControlReady:
+			return nil
+		case connection.ControlFailed:
+			step, known := sshControlStepText(frame.Step)
+			if known {
+				return fmt.Errorf("SSH connection failed during %s: %s; persistent Environment state remains intact", step.identifier, step.failure)
+			}
+			return errors.New("SSH connection failed while preparing the Runtime: the regional proxy could not prepare the Runtime; persistent Environment state remains intact")
+		default:
+			// Unknown control types are ignored so newer proxies can add
+			// advisory frames without breaking older CLIs.
+			continue
+		}
+	}
+}
+
+type sshControlStep struct {
+	identifier string
+	progress   string
+	failure    string
+}
+
+func sshControlStepText(value string) (sshControlStep, bool) {
+	switch value {
+	case "starting-runtime":
+		return sshControlStep{identifier: "starting-runtime", progress: "Starting Runtime", failure: "the Runtime could not be started"}, true
+	case "waiting-for-guest":
+		return sshControlStep{identifier: "waiting-for-guest", progress: "Waiting for SSH readiness", failure: "SSH readiness could not be confirmed"}, true
+	case "resolving-route":
+		return sshControlStep{identifier: "resolving-route", progress: "Resolving the Runtime route", failure: "the Runtime route could not be resolved"}, true
+	default:
+		return sshControlStep{}, false
+	}
 }
 
 func validateProxyCommand(command sshProxyCommand, environmentID string) error {

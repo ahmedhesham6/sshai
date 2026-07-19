@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/auth"
+	"github.com/ahmedhesham6/sshai/libs/connection"
 	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/coder/websocket"
 )
@@ -158,6 +159,142 @@ func TestSSHProxyCommandUsesFreshBearerForRealHTTPAndWSSBinaryStream(t *testing.
 	}
 	if stdout.String() != output || websocketCalls.Load() != 1 {
 		t.Fatalf("stream = output:%q websocket-calls:%d", stdout.String(), websocketCalls.Load())
+	}
+}
+
+func TestSSHProxyCommandRendersProgressUntilReadyThenBridgesBinary(t *testing.T) {
+	const token = "ACCESS_SECRET"
+	const peerMessage = "PEER_CONTROL_TEXT_MUST_NOT_BE_PRINTED"
+	server := newProxyControlServer(t, token, "env_01", func(ctx context.Context, socket *websocket.Conn) {
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "starting-runtime", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: "advisory", Message: "ignored"})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "waiting-for-guest", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "resolving-route", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "future-step", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlReady})
+		messageType, content, err := socket.Read(ctx)
+		if err != nil || messageType != websocket.MessageBinary || string(content) != "client-bytes" {
+			t.Errorf("client stream = type:%v content:%q error:%v", messageType, content, err)
+			return
+		}
+		_ = socket.Write(ctx, websocket.MessageBinary, []byte("server-bytes"))
+		_ = socket.Close(websocket.StatusNormalClosure, "")
+	})
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+		tokens: staticAccessTokenSource{token: token}, attempt: "attempt-01",
+		input: strings.NewReader("client-bytes"), output: &stdout, errorOutput: &stderr, now: time.Now,
+	}
+	if err := command.run(context.Background(), "env_01"); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "server-bytes" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	wantProgress := "devm: starting-runtime: Starting Runtime\n" +
+		"devm: waiting-for-guest: Waiting for SSH readiness\n" +
+		"devm: resolving-route: Resolving the Runtime route\n" +
+		"devm: Preparing SSH connection\n"
+	if stderr.String() != wantProgress {
+		t.Fatalf("stderr = %q, want %q", stderr.String(), wantProgress)
+	}
+}
+
+func TestSSHProxyCommandUsesGenericFailureForUnknownControlStep(t *testing.T) {
+	const peerText = "PEER_FAILURE_TEXT_MUST_NOT_BE_PRINTED"
+	server := newProxyControlServer(t, "ACCESS_SECRET", "env_01", func(ctx context.Context, socket *websocket.Conn) {
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{
+			Type: connection.ControlFailed, Step: peerText, Message: peerText,
+		})
+	})
+	defer server.Close()
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+		tokens: staticAccessTokenSource{token: "ACCESS_SECRET"}, attempt: "attempt-01",
+		input: bytes.NewReader(nil), output: io.Discard, now: time.Now,
+	}
+	err := command.run(context.Background(), "env_01")
+	message := fmt.Sprint(err)
+	if err == nil || !strings.Contains(message, "failed while preparing the Runtime") ||
+		!strings.Contains(message, "regional proxy could not prepare the Runtime") || strings.Contains(message, peerText) {
+		t.Fatalf("unknown-step failure = %v", err)
+	}
+}
+
+func TestSSHProxyCommandFailedControlNamesStepAndLeaksNoBearerOrPayload(t *testing.T) {
+	const token = "ACCESS_SECRET"
+	const payload = "SSH_PAYLOAD_SECRET"
+	server := newProxyControlServer(t, token, "env_01", func(ctx context.Context, socket *websocket.Conn) {
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{
+			Type: connection.ControlProgress, Step: "starting-runtime", Message: "token " + token,
+		})
+		content := fmt.Sprintf(`{"type":"failed","operationId":%q,"step":"waiting-for-guest","message":%q,"payload":%q}`, token, payload, payload)
+		_ = socket.Write(ctx, websocket.MessageText, []byte(content))
+	})
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+		tokens: staticAccessTokenSource{token: token}, attempt: "attempt-01",
+		input: strings.NewReader(payload), output: &stdout, errorOutput: &stderr, now: time.Now,
+	}
+	err := command.run(context.Background(), "env_01")
+	message := fmt.Sprint(err)
+	if err == nil || !strings.Contains(message, "waiting-for-guest") || !strings.Contains(message, "SSH readiness could not be confirmed") ||
+		!strings.Contains(message, "persistent Environment state remains intact") {
+		t.Fatalf("failed control error = %v", err)
+	}
+	if stdout.Len() != 0 || strings.Contains(message, token) || strings.Contains(message, payload) ||
+		strings.Contains(stderr.String(), token) || strings.Contains(stderr.String(), payload) {
+		t.Fatalf("failed control leaked data: stdout=%q stderr=%q error=%v", stdout.String(), stderr.String(), err)
+	}
+}
+
+func TestSSHProxyCommandRejectsBinaryBeforeReadyWithoutWritingPayload(t *testing.T) {
+	const payload = "SSH_PAYLOAD_SECRET"
+	server := newProxyControlServer(t, "ACCESS_SECRET", "env_01", func(ctx context.Context, socket *websocket.Conn) {
+		_ = socket.Write(ctx, websocket.MessageBinary, []byte(payload))
+	})
+	defer server.Close()
+	var stdout bytes.Buffer
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+		tokens: staticAccessTokenSource{token: "ACCESS_SECRET"}, attempt: "attempt-01",
+		input: bytes.NewReader(nil), output: &stdout, now: time.Now,
+	}
+	err := command.run(context.Background(), "env_01")
+	if err == nil || stdout.Len() != 0 || strings.Contains(fmt.Sprint(err), payload) {
+		t.Fatalf("binary-before-ready result = output:%q error:%v", stdout.Bytes(), err)
+	}
+}
+
+func TestSSHProxyCommandRejectsControlFramesWithoutTypes(t *testing.T) {
+	for _, body := range []string{"null", `{}`} {
+		t.Run(body, func(t *testing.T) {
+			server := newProxyControlServer(t, "ACCESS_SECRET", "env_01", func(ctx context.Context, socket *websocket.Conn) {
+				if err := socket.Write(ctx, websocket.MessageText, []byte(body)); err != nil {
+					t.Errorf("write empty-type frame: %v", err)
+					return
+				}
+				_, _, _ = socket.Read(ctx)
+			})
+			defer server.Close()
+			command := sshProxyCommand{
+				controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+				tokens: staticAccessTokenSource{token: "ACCESS_SECRET"}, attempt: "attempt-01",
+				input: bytes.NewReader(nil), output: io.Discard, now: time.Now,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := command.run(ctx, "env_01")
+			if err == nil || !strings.Contains(err.Error(), "control frame type is missing") {
+				t.Fatalf("empty-type control frame error = %v", err)
+			}
+		})
 	}
 }
 
@@ -335,6 +472,26 @@ func (source staticAccessTokenSource) FreshAccessToken(context.Context) (string,
 }
 
 func newProxyTracerServer(t *testing.T, token, environmentID string, stream func(context.Context, *websocket.Conn)) *httptest.Server {
+	t.Helper()
+	return newProxyControlServer(t, token, environmentID, func(ctx context.Context, socket *websocket.Conn) {
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlReady})
+		stream(ctx, socket)
+	})
+}
+
+func writeControlFrame(t *testing.T, ctx context.Context, socket *websocket.Conn, frame connection.ControlFrame) {
+	t.Helper()
+	content, err := json.Marshal(frame)
+	if err != nil {
+		t.Errorf("marshal control frame: %v", err)
+		return
+	}
+	if err := socket.Write(ctx, websocket.MessageText, content); err != nil {
+		t.Errorf("write control frame: %v", err)
+	}
+}
+
+func newProxyControlServer(t *testing.T, token, environmentID string, stream func(context.Context, *websocket.Conn)) *httptest.Server {
 	t.Helper()
 	var server *httptest.Server
 	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
