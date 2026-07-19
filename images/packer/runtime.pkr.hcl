@@ -12,12 +12,14 @@ packer {
 variable "aws_region" {
   type        = string
   description = "AWS region where the Runtime AMI is built."
-  default     = "us-east-1"
+  default     = "eu-central-1"
 }
 
 variable "source_revision" {
   type        = string
   description = "Immutable source revision recorded on the AMI and manifest."
+
+  default = "validate-only"
 
   validation {
     condition     = length(var.source_revision) > 0
@@ -28,11 +30,31 @@ variable "source_revision" {
 variable "build_vpc_id" {
   type        = string
   description = "Regional cell VPC used for the temporary Packer builder."
+  default     = "vpc-00000000000000000"
 }
 
 variable "build_subnet_id" {
   type        = string
   description = "Public regional cell subnet used for the temporary Packer builder."
+  default     = "subnet-00000000000000000"
+}
+
+variable "claude_code_version" {
+  type        = string
+  description = "Exact Claude Code version installed in the platform-owned system image."
+  default     = "2.1.215"
+}
+
+variable "codex_version" {
+  type        = string
+  description = "Exact Codex version installed in the platform-owned system image."
+  default     = "0.144.6"
+}
+
+variable "opencode_version" {
+  type        = string
+  description = "Exact OpenCode version installed in the platform-owned system image."
+  default     = "1.18.3"
 }
 
 variable "ami_name_prefix" {
@@ -83,7 +105,7 @@ source "amazon-ebs" "runtime" {
     device_name           = "/dev/sda1"
     delete_on_termination = true
     encrypted             = true
-    volume_size           = 16
+    volume_size           = 30
     volume_type           = "gp3"
   }
 
@@ -105,10 +127,58 @@ build {
     script = "${path.root}/scripts/install-guest-unit.sh"
   }
 
+  provisioner "shell" {
+    environment_vars = [
+      "CLAUDE_CODE_VERSION=${var.claude_code_version}",
+      "CODEX_VERSION=${var.codex_version}",
+      "OPENCODE_VERSION=${var.opencode_version}",
+    ]
+    script = "${path.root}/scripts/install-runtime-tooling.sh"
+  }
+
+  provisioner "shell" {
+    script = "${path.root}/scripts/configure-home-first-tooling.sh"
+  }
+
+  provisioner "shell" {
+    script = "${path.root}/scripts/configure-openssh.sh"
+  }
+
+  provisioner "shell" {
+    environment_vars = [
+      "CLAUDE_CODE_VERSION=${var.claude_code_version}",
+      "CODEX_VERSION=${var.codex_version}",
+      "OPENCODE_VERSION=${var.opencode_version}",
+    ]
+    script = "${path.root}/scripts/validate-runtime.sh"
+  }
+
+  # The reconnect proves the image remains reachable after a reboot. Deeper
+  # guest readiness and attached-data-volume checks require the credentialed
+  # EC2 harness and remain deferred build gates.
+  provisioner "shell" {
+    inline            = ["sudo shutdown -r now"]
+    expect_disconnect = true
+    pause_after       = "30s"
+  }
+
+  provisioner "shell" {
+    environment_vars = [
+      "CLAUDE_CODE_VERSION=${var.claude_code_version}",
+      "CODEX_VERSION=${var.codex_version}",
+      "OPENCODE_VERSION=${var.opencode_version}",
+      "SOURCE_REVISION=${var.source_revision}",
+    ]
+    script = "${path.root}/scripts/finalize-build-gates.sh"
+  }
+
   post-processor "manifest" {
     output = "${path.root}/manifest.json"
     custom_data = {
-      source_revision = var.source_revision
+      source_revision     = var.source_revision
+      claude_code_version = var.claude_code_version
+      codex_version       = var.codex_version
+      opencode_version    = var.opencode_version
     }
   }
 }

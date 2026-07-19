@@ -46,7 +46,9 @@ resource "aws_db_instance" "postgres" {
   db_subnet_group_name   = aws_db_subnet_group.postgres.name
   vpc_security_group_ids = [aws_security_group.postgres.id]
   publicly_accessible    = false
-  multi_az               = false
+  # TODO(decision-register): item 13 must define when production becomes
+  # Multi-AZ. Callers must state their current environment policy explicitly.
+  multi_az = var.multi_az
 
   backup_retention_period    = 7
   backup_window              = "03:00-04:00"
