@@ -8,6 +8,20 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type ActivitySnapshot struct {
+	RuntimeID            string
+	Sequence             int64
+	EnvironmentID        string
+	ObservedAt           pgtype.Timestamptz
+	SshConnections       int32
+	IdeConnections       int32
+	CodexProcesses       int32
+	ClaudeProcesses      int32
+	ProtectedProcesses   int32
+	SelectedContainers   int32
+	UnknownUserProcesses int32
+}
+
 type CapsuleLock struct {
 	ID                   string
 	EnvironmentID        string

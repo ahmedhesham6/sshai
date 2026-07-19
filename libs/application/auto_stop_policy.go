@@ -37,18 +37,23 @@ type AutoStopPolicyRepository interface {
 	UpdateAutoStopPolicy(context.Context, string, domain.AutoStopPolicy, domain.Operation) (domain.Operation, bool, error)
 }
 
+type AutoStopPolicyRefreshSender interface {
+	SendAutoStopPolicyRefresh(context.Context, string, string) error
+}
+
 type AutoStopPolicyService struct {
 	repository AutoStopPolicyRepository
+	refresh    AutoStopPolicyRefreshSender
 	ids        IDGenerator
 	now        func() time.Time
 }
 
-func NewAutoStopPolicyService(repository AutoStopPolicyRepository, ids IDGenerator, now func() time.Time) *AutoStopPolicyService {
-	return &AutoStopPolicyService{repository: repository, ids: ids, now: now}
+func NewAutoStopPolicyService(repository AutoStopPolicyRepository, refresh AutoStopPolicyRefreshSender, ids IDGenerator, now func() time.Time) *AutoStopPolicyService {
+	return &AutoStopPolicyService{repository: repository, refresh: refresh, ids: ids, now: now}
 }
 
 func (service *AutoStopPolicyService) UpdateAutoStopPolicy(ctx context.Context, input AutoStopPolicyUpdateInput) (AutoStopPolicyUpdate, error) {
-	if service.repository == nil || service.ids == nil || service.now == nil ||
+	if service.repository == nil || service.refresh == nil || service.ids == nil || service.now == nil ||
 		!canonicalIdentity(input.OwnerUserID) || !canonicalIdentity(input.EnvironmentID) ||
 		!canonicalIdentity(input.PolicyID) || !canonicalIdentity(input.IdempotencyKey) {
 		return AutoStopPolicyUpdate{}, ErrInvalidAutoStopPolicyUpdate
@@ -76,9 +81,8 @@ func (service *AutoStopPolicyService) UpdateAutoStopPolicy(ctx context.Context, 
 	if err != nil {
 		return AutoStopPolicyUpdate{}, fmt.Errorf("%w: %v", ErrInvalidAutoStopPolicyUpdate, err)
 	}
-	// This is the synchronous persistence fallback. The workflow integration
-	// required by docs/spec/09-api.md must replace it so policy changes durably
-	// cancel or replace pending Auto-stop timers.
+	// Policy persistence remains synchronous. The idempotent refresh signal
+	// below durably cancels or replaces any pending coordinator timer.
 	operation, err = operation.SucceedSynchronously(createdAt)
 	if err != nil {
 		return AutoStopPolicyUpdate{}, err
@@ -86,6 +90,9 @@ func (service *AutoStopPolicyService) UpdateAutoStopPolicy(ctx context.Context, 
 	persisted, applied, err := service.repository.UpdateAutoStopPolicy(ctx, input.OwnerUserID, policy, operation)
 	if err != nil {
 		return AutoStopPolicyUpdate{}, fmt.Errorf("update Auto-stop Policy: %w", err)
+	}
+	if err := service.refresh.SendAutoStopPolicyRefresh(ctx, input.EnvironmentID, "auto-stop-policy-refresh:"+persisted.Snapshot().ID); err != nil {
+		return AutoStopPolicyUpdate{}, fmt.Errorf("update Auto-stop Policy: signal coordinator refresh: %w", err)
 	}
 	return AutoStopPolicyUpdate{policy: policy, operation: persisted, applied: applied}, nil
 }

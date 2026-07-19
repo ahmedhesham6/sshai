@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/workflows"
+	"github.com/ahmedhesham6/sshai/libs/application"
 	"github.com/ahmedhesham6/sshai/libs/billing"
 	"github.com/ahmedhesham6/sshai/libs/capsule/oci"
 	"github.com/ahmedhesham6/sshai/libs/db"
@@ -31,6 +32,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
 	restate "github.com/restatedev/sdk-go"
+	"github.com/restatedev/sdk-go/ingress"
 	"github.com/restatedev/sdk-go/server"
 )
 
@@ -59,6 +61,7 @@ func run(ctx context.Context) error {
 	}
 	defer pool.Close()
 	store := db.NewStore(pool)
+	workflowClient := workflows.NewClient(ingress.NewClient(config.restateIngressURL))
 	polarClient, err := billing.NewPolarEventClient(
 		config.polarEventsEndpoint, config.polarAccessToken, &http.Client{Timeout: 10 * time.Second},
 	)
@@ -87,7 +90,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("construct Environment creation actions: %w", err)
 	}
-	dataVolumes, err := provideraws.New(ctx, provideraws.Config{
+	runtimeProvider, err := provideraws.New(ctx, provideraws.Config{
 		Region: config.defaultRegion, Environment: config.runtimeEnvironmentName,
 		SizeGiB: config.dataVolumeSizeGiB, EndpointURL: config.ec2EndpointURL,
 		Runtime: provideraws.RuntimeConfig{
@@ -97,16 +100,35 @@ func run(ctx context.Context) error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("construct Data Volume provider: %w", err)
+		return fmt.Errorf("construct Runtime provider: %w", err)
 	}
 
 	profileResolveActions := workflows.NewProfileResolveActions(&profileResolveStateStore{Store: store})
+	runtimeActions := &runtimeWorkflowActions{store: store, now: time.Now}
+	snapshots := autoStopSnapshotSource{store: store}
+	dataVolumes := runtimeDataVolumeVerifier{store: store}
+	guest := unavailableGuestTransport{}
+	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)
+	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, idGenerator{}, time.Now)
+	autoStop := workflows.AutoStopDefinition(snapshots, runtimeStopDispatcher{store: store, commands: runtimeCommands})
+	runtimeStart := workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{
+		Provider: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Credits: store,
+		Images: promotedImageSource{image: config.imageVersion}, Usage: store, Guest: guest, SSHKeys: guest,
+		Managed: guest, AutoStop: workflowClient, IDs: idGenerator{}, Now: time.Now,
+	})
+	runtimeStop := workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{
+		Provider: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Snapshots: snapshots,
+		Guest: guest, Usage: store, AutoStop: workflowClient, Now: time.Now,
+	})
 
 	restateServer := server.NewRestate()
 	for _, service := range buildServices(serviceDependencies{
 		polarDeliverer: polarClient, polarStore: store, now: time.Now,
-		environmentCreate: workflows.EnvironmentCreateDefinition(dataVolumes, creationActions, idGenerator{}, time.Now, config.imageVersion),
+		environmentCreate: workflows.EnvironmentCreateDefinition(runtimeProvider, creationActions, idGenerator{}, time.Now, config.imageVersion),
 		profileResolve:    workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolver, idGenerator{}, time.Now),
+		autoStop:          autoStop,
+		runtimeStart:      runtimeStart,
+		runtimeStop:       runtimeStop,
 	}) {
 		restateServer.Bind(service)
 	}
@@ -117,11 +139,8 @@ func run(ctx context.Context) error {
 }
 
 // serviceDependencies carries the production implementations behind each
-// workflow service. BillingDelivery, EnvironmentCreate, and ProfileResolve
-// have complete production dependency sets; autoStop joins once its
-// production seams (workflows.AutoStopSnapshotSource and
-// workflows.RuntimeStopDispatcher) exist — buildServices already binds any
-// non-nil field.
+// workflow service. Every production definition is built in run; the
+// nullable fields keep buildServices easy to exercise in focused tests.
 type serviceDependencies struct {
 	polarDeliverer workflows.PolarEventDeliverer
 	polarStore     workflows.PolarDeliveryStore
@@ -129,9 +148,9 @@ type serviceDependencies struct {
 
 	environmentCreate restate.ServiceDefinition
 	profileResolve    restate.ServiceDefinition
-	// autoStop is pending production workflows.AutoStopSnapshotSource and
-	// workflows.RuntimeStopDispatcher implementations.
-	autoStop restate.ServiceDefinition
+	autoStop          restate.ServiceDefinition
+	runtimeStart      restate.ServiceDefinition
+	runtimeStop       restate.ServiceDefinition
 }
 
 func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition {
@@ -140,6 +159,7 @@ func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition
 	}
 	for _, pending := range []restate.ServiceDefinition{
 		dependencies.environmentCreate, dependencies.profileResolve, dependencies.autoStop,
+		dependencies.runtimeStart, dependencies.runtimeStop,
 	} {
 		if pending != nil {
 			services = append(services, pending)
@@ -153,6 +173,7 @@ type config struct {
 	polarEventsEndpoint string
 	polarAccessToken    string
 	listenAddress       string
+	restateIngressURL   string
 
 	defaultRegion string
 	s3EndpointURL string
@@ -187,6 +208,7 @@ func loadConfig() (config, error) {
 		polarEventsEndpoint: os.Getenv("POLAR_EVENTS_ENDPOINT"),
 		polarAccessToken:    os.Getenv("POLAR_ACCESS_TOKEN"),
 		listenAddress:       valueOrDefault("LISTEN_ADDR", ":9080"),
+		restateIngressURL:   valueOrDefault("RESTATE_INGRESS_URL", "http://localhost:8080"),
 
 		defaultRegion: valueOrDefault("DEFAULT_REGION", "us-east-1"),
 		s3EndpointURL: os.Getenv("AWS_ENDPOINT_URL_S3"),

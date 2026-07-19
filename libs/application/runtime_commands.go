@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 )
 
@@ -29,18 +30,36 @@ type RuntimeOperationDispatcher interface {
 	DispatchRuntimeOperation(context.Context, string) error
 }
 
+type RuntimeCreditBalanceSource interface {
+	CreditBalance(context.Context, string) (db.CreditBalanceProjection, error)
+}
+
 type RuntimeCommandService struct {
 	repository RuntimeOperationRepository
 	dispatcher RuntimeOperationDispatcher
+	credits    RuntimeCreditBalanceSource
 	ids        IDGenerator
 	now        func() time.Time
 }
 
-func NewRuntimeCommandService(repository RuntimeOperationRepository, dispatcher RuntimeOperationDispatcher, ids IDGenerator, now func() time.Time) *RuntimeCommandService {
-	return &RuntimeCommandService{repository: repository, dispatcher: dispatcher, ids: ids, now: now}
+func NewRuntimeCommandService(repository RuntimeOperationRepository, dispatcher RuntimeOperationDispatcher, credits RuntimeCreditBalanceSource, ids IDGenerator, now func() time.Time) *RuntimeCommandService {
+	return &RuntimeCommandService{repository: repository, dispatcher: dispatcher, credits: credits, ids: ids, now: now}
 }
 
 func (service *RuntimeCommandService) StartRuntime(ctx context.Context, input RuntimeCommandInput) (domain.EnvironmentRuntimeOperation, error) {
+	if !service.valid(input) || service.credits == nil {
+		return domain.EnvironmentRuntimeOperation{}, ErrInvalidRuntimeCommand
+	}
+	balance, err := service.credits.CreditBalance(ctx, input.OwnerUserID)
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("start Runtime: load Credit Balance: %w", err)
+	}
+	if balance.UserID != input.OwnerUserID {
+		return domain.EnvironmentRuntimeOperation{}, errors.New("start Runtime: Credit Balance belongs to another User")
+	}
+	if balance.Credits <= 0 {
+		return domain.EnvironmentRuntimeOperation{}, ErrCreditsPolicyBlocked
+	}
 	return service.commandRuntime(ctx, input, domain.OperationRuntimeStart, []byte(`{}`))
 }
 
@@ -67,8 +86,7 @@ func (service *RuntimeCommandService) ReplaceRuntime(ctx context.Context, input 
 }
 
 func (service *RuntimeCommandService) commandRuntime(ctx context.Context, input RuntimeCommandInput, operationType domain.OperationType, canonicalInput []byte) (domain.EnvironmentRuntimeOperation, error) {
-	if service.repository == nil || service.dispatcher == nil || service.ids == nil || service.now == nil ||
-		!canonicalIdentity(input.OwnerUserID) || !canonicalIdentity(input.EnvironmentID) || !canonicalIdentity(input.IdempotencyKey) {
+	if !service.valid(input) {
 		return domain.EnvironmentRuntimeOperation{}, ErrInvalidRuntimeCommand
 	}
 	operation, err := domain.QueueOperation(domain.OperationRequest{
@@ -87,4 +105,9 @@ func (service *RuntimeCommandService) commandRuntime(ctx context.Context, input 
 		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("command Runtime: dispatch Operation: %w", err)
 	}
 	return command, nil
+}
+
+func (service *RuntimeCommandService) valid(input RuntimeCommandInput) bool {
+	return service != nil && service.repository != nil && service.dispatcher != nil && service.ids != nil && service.now != nil &&
+		canonicalIdentity(input.OwnerUserID) && canonicalIdentity(input.EnvironmentID) && canonicalIdentity(input.IdempotencyKey)
 }

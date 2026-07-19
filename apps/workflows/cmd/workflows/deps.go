@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ahmedhesham6/sshai/apps/workflows"
+	"github.com/ahmedhesham6/sshai/libs/application"
 	"github.com/ahmedhesham6/sshai/libs/capsule/oci"
 	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
@@ -209,3 +210,139 @@ func embeddedExactDigest(ref string) (string, error) {
 }
 
 var _ workflows.PinnedProfileVersionResolver = (*pinnedProfileVersionResolver)(nil)
+
+type runtimeWorkflowActions struct {
+	store *db.Store
+	now   func() time.Time
+}
+
+func (actions *runtimeWorkflowActions) LoadRuntimeOperation(ctx context.Context, input domain.RuntimeOperationDispatch, invocationID string, at time.Time) (workflows.RuntimeOperationState, error) {
+	state, err := actions.store.LoadRuntimeWorkflowOperation(ctx, input, invocationID, at)
+	if err != nil {
+		return workflows.RuntimeOperationState{}, err
+	}
+	return workflows.RuntimeOperationState{
+		OwnerUserID: state.OwnerUserID, Runtime: state.Runtime, DataVolumeProviderID: state.DataVolumeProviderID,
+		ComputeUsageIntervalID: state.ComputeUsageIntervalID,
+	}, nil
+}
+
+func (actions *runtimeWorkflowActions) PersistRuntimeTransition(ctx context.Context, operationID string, expectedVersion int64, next domain.RuntimeSnapshot) error {
+	return actions.store.PersistRuntimeWorkflowTransition(ctx, operationID, expectedVersion, next)
+}
+
+func (actions *runtimeWorkflowActions) CompleteRuntimeOperation(ctx context.Context, operationID string, at time.Time) error {
+	return actions.store.CompleteRuntimeWorkflowOperation(ctx, operationID, at)
+}
+
+func (actions *runtimeWorkflowActions) RecordRuntimeFailure(ctx context.Context, operationID, code string, at time.Time) error {
+	return actions.store.RecordRuntimeWorkflowFailure(ctx, operationID, code, at)
+}
+
+func (actions *runtimeWorkflowActions) RecordRuntimeStartDecision(ctx context.Context, operationID, decision, image string) error {
+	return actions.store.RecordRuntimeWorkflowStep(ctx, operationID, "start-decision", decision+":"+image, actions.now())
+}
+
+func (actions *runtimeWorkflowActions) RecordRuntimeStopReason(ctx context.Context, operationID string, reason domain.RuntimeStopReason) error {
+	return actions.store.RecordRuntimeWorkflowStep(ctx, operationID, "stop-reason", string(reason), actions.now())
+}
+
+func (actions *runtimeWorkflowActions) RecordRuntimeStopSnapshot(ctx context.Context, operationID string, observation workflows.AutoStopObservation) error {
+	return actions.store.RecordRuntimeStopSnapshotEvidence(ctx, operationID, observation.Snapshot, actions.now())
+}
+
+func (actions *runtimeWorkflowActions) RecordRuntimeStopAudit(ctx context.Context, operationID string, evidence domain.RuntimeStopAuditEvidence) error {
+	return actions.store.RecordRuntimeStopAuditEvidence(ctx, operationID, evidence, actions.now())
+}
+
+type autoStopSnapshotSource struct{ store *db.Store }
+
+func (source autoStopSnapshotSource) RefreshAutoStop(ctx context.Context, request workflows.AutoStopRefreshRequest) (workflows.AutoStopObservation, error) {
+	state, err := source.store.LatestAutoStopSnapshot(ctx, request.EnvironmentID, request.RuntimeID)
+	if err != nil {
+		return workflows.AutoStopObservation{}, err
+	}
+	return workflows.AutoStopObservation{
+		RuntimeID: state.RuntimeID, Policy: state.Policy, PolicyGeneration: state.PolicyGeneration,
+		FreshAfter: request.FreshAfter, Snapshot: state.Snapshot, Conflicts: state.Conflicts,
+	}, nil
+}
+
+type runtimeDataVolumeVerifier struct{ store *db.Store }
+
+func (verifier runtimeDataVolumeVerifier) VerifyRuntimeDataVolume(ctx context.Context, request workflows.RuntimeDataVolumeRequest) error {
+	return verifier.store.VerifyRuntimeDataVolumeOwnership(ctx, request.OwnerUserID, request.EnvironmentID, request.DataVolumeProviderID)
+}
+
+type promotedImageSource struct{ image string }
+
+func (source promotedImageSource) CurrentPromotedImage(context.Context, string) (string, error) {
+	if source.image == "" {
+		return "", errors.New("current promoted image is not configured")
+	}
+	return source.image, nil
+}
+
+type unavailableGuestTransport struct{}
+
+type unavailableGuestTransportError struct{ operation string }
+
+func (err unavailableGuestTransportError) Error() string {
+	return "guest control transport is unavailable for " + err.operation
+}
+
+func (unavailableGuestTransportError) Transient() bool { return false }
+
+func (unavailableGuestTransport) WaitForRuntimeReady(context.Context, workflows.RuntimeGuestReadinessRequest) (workflows.RuntimeGuestReadiness, error) {
+	return workflows.RuntimeGuestReadiness{}, unavailableGuestTransportError{operation: "Runtime readiness"}
+}
+
+func (unavailableGuestTransport) ReconcileRuntimeSSHKeys(context.Context, workflows.RuntimeGuestReadinessRequest) error {
+	return unavailableGuestTransportError{operation: "SSH Key reconciliation"}
+}
+
+func (unavailableGuestTransport) ReconcileRuntimeManagedConfiguration(context.Context, workflows.RuntimeGuestReadinessRequest) error {
+	return unavailableGuestTransportError{operation: "managed configuration reconciliation"}
+}
+
+func (unavailableGuestTransport) PrepareRuntimeShutdown(context.Context, workflows.RuntimeGuestReadinessRequest) error {
+	return unavailableGuestTransportError{operation: "graceful Runtime shutdown"}
+}
+
+type runtimeStopDispatcher struct {
+	store    *db.Store
+	commands *application.RuntimeCommandService
+}
+
+func (dispatcher runtimeStopDispatcher) DispatchRuntimeStop(ctx context.Context, request workflows.RuntimeStopRequest) error {
+	if request.Reason != domain.RuntimeStopAutoStop || request.AuditEvidence == nil {
+		return errors.New("dispatch automatic Runtime stop: automatic reason and audit evidence are required")
+	}
+	ownerID, err := dispatcher.store.RuntimeStopDispatchOwner(ctx, request.EnvironmentID, request.RuntimeID)
+	if err != nil {
+		return err
+	}
+	command, err := dispatcher.commands.StopRuntimeWithReason(ctx, application.RuntimeCommandInput{
+		OwnerUserID: ownerID, EnvironmentID: request.EnvironmentID, IdempotencyKey: request.IdempotencyKey,
+	}, request.Reason, request.AuditEvidence)
+	if err != nil {
+		return err
+	}
+	if command.Runtime().Snapshot().ID != request.RuntimeID {
+		return errors.New("dispatch automatic Runtime stop: Runtime is no longer current")
+	}
+	return nil
+}
+
+var (
+	_ workflows.RuntimeStartActions                   = (*runtimeWorkflowActions)(nil)
+	_ workflows.RuntimeStopActions                    = (*runtimeWorkflowActions)(nil)
+	_ workflows.AutoStopSnapshotSource                = autoStopSnapshotSource{}
+	_ workflows.RuntimeDataVolumeVerifier             = runtimeDataVolumeVerifier{}
+	_ workflows.PromotedImageSource                   = promotedImageSource{}
+	_ workflows.RuntimeGuestReadinessSource           = unavailableGuestTransport{}
+	_ workflows.RuntimeSSHKeyReconciler               = unavailableGuestTransport{}
+	_ workflows.RuntimeManagedConfigurationReconciler = unavailableGuestTransport{}
+	_ workflows.RuntimeGuestShutdownPreparer          = unavailableGuestTransport{}
+	_ workflows.RuntimeStopDispatcher                 = runtimeStopDispatcher{}
+)

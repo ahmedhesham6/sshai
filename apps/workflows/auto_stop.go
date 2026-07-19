@@ -15,7 +15,9 @@ const (
 	AutoStopExpireHandler   = "Expire"
 	AutoStopSuppressHandler = "Suppress"
 	AutoStopResumeHandler   = "Resume"
+	AutoStopRefreshHandler  = "Refresh"
 	autoStopStateKey        = "coordination"
+	autoStopStaleThreshold  = 5 * time.Minute
 )
 
 type AutoStopRefreshRequest struct {
@@ -32,6 +34,8 @@ type AutoStopSnapshotSource interface {
 type AutoStopRuntimeRequest struct {
 	RuntimeID string `json:"runtimeId"`
 }
+
+type AutoStopRefreshSignal struct{}
 
 type RuntimeAutoStopController interface {
 	SuppressAutoStop(context.Context, string, string) error
@@ -53,7 +57,8 @@ func AutoStopDefinition(source AutoStopSnapshotSource, dispatcher RuntimeStopDis
 		Handler(AutoStopObserveHandler, restate.NewObjectHandler(object.Observe)).
 		Handler(AutoStopExpireHandler, restate.NewObjectHandler(object.Expire)).
 		Handler(AutoStopSuppressHandler, restate.NewObjectHandler(object.Suppress)).
-		Handler(AutoStopResumeHandler, restate.NewObjectHandler(object.Resume))
+		Handler(AutoStopResumeHandler, restate.NewObjectHandler(object.Resume)).
+		Handler(AutoStopRefreshHandler, restate.NewObjectHandler(object.Refresh))
 }
 
 func (object *autoStopObject) Suppress(ctx restate.ObjectContext, input AutoStopRuntimeRequest) (AutoStopTransition, error) {
@@ -111,6 +116,40 @@ func (object *autoStopObject) Observe(ctx restate.ObjectContext, input AutoStopO
 	transition, err := (AutoStopCoordinator{}).Observe(state, input)
 	if err != nil {
 		return AutoStopTransition{}, restate.TerminalErrorf("invalid Auto-stop observation: %v", err)
+	}
+	restate.Set(ctx, autoStopStateKey, transition.State)
+	object.schedule(ctx, transition.Timer)
+	return transition, nil
+}
+
+// Refresh re-reads the current policy and latest stored Activity Snapshot.
+// Policy-update signals are idempotent Restate sends, so replaying one can
+// only reproduce the same coordinator transition and timer generation.
+func (object *autoStopObject) Refresh(ctx restate.ObjectContext, _ AutoStopRefreshSignal) (AutoStopTransition, error) {
+	state, err := object.coordinationState(ctx)
+	if err != nil || state.RuntimeID == "" {
+		return AutoStopTransition{State: state}, err
+	}
+	processedAt, err := restate.Run(ctx, func(restate.RunContext) (time.Time, error) {
+		return time.Now().UTC(), nil
+	}, restate.WithName("record-auto-stop-refresh-time"))
+	if err != nil {
+		return AutoStopTransition{}, err
+	}
+	observation, err := restate.Run(ctx, func(runCtx restate.RunContext) (AutoStopObservation, error) {
+		return object.source.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
+			EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID,
+			FreshAfter: processedAt.Add(-autoStopStaleThreshold),
+		})
+	}, restate.WithName("refresh-auto-stop-policy"))
+	if err != nil {
+		return AutoStopTransition{}, err
+	}
+	observation.FreshAfter = processedAt.Add(-autoStopStaleThreshold)
+	observation.ProcessedAt = processedAt
+	transition, err := (AutoStopCoordinator{}).Observe(state, observation)
+	if err != nil {
+		return AutoStopTransition{}, restate.TerminalErrorf("invalid Auto-stop refresh: %v", err)
 	}
 	restate.Set(ctx, autoStopStateKey, transition.State)
 	object.schedule(ctx, transition.Timer)
@@ -189,5 +228,12 @@ func (client *Client) ResumeAutoStop(ctx context.Context, environmentID, runtime
 	_, err := ingress.Object[AutoStopRuntimeRequest, AutoStopTransition](
 		client.ingress, AutoStopService, environmentID, AutoStopResumeHandler,
 	).Request(ctx, AutoStopRuntimeRequest{RuntimeID: runtimeID})
+	return err
+}
+
+func (client *Client) SendAutoStopPolicyRefresh(ctx context.Context, environmentID, idempotencyKey string) error {
+	_, err := ingress.ObjectSend[AutoStopRefreshSignal](
+		client.ingress, AutoStopService, environmentID, AutoStopRefreshHandler,
+	).Send(ctx, AutoStopRefreshSignal{}, restate.WithIdempotencyKey(idempotencyKey))
 	return err
 }

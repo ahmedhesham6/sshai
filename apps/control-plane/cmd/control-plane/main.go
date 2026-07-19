@@ -66,12 +66,21 @@ func run(ctx context.Context) error {
 	defer verifier.Close(context.Background())
 	workflowClient := workflows.NewClient(ingress.NewClient(config.restateIngressURL))
 	dispatcher := application.NewEnvironmentCreateDispatcher(store, workflowClient)
+	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)
 	recovery := application.NewWorkflowRecovery(dispatcher, 5*time.Second, 100, func(err error) {
 		slog.Error("workflow recovery failed", "error", err)
+	})
+	runtimeRecovery := application.NewRuntimeWorkflowRecovery(runtimeDispatcher, 5*time.Second, 100, func(err error) {
+		slog.Error("Runtime workflow recovery failed", "error", err)
 	})
 	go func() {
 		if err := recovery.Run(ctx); err != nil {
 			slog.Error("workflow recovery stopped", "error", err)
+		}
+	}()
+	go func() {
+		if err := runtimeRecovery.Run(ctx); err != nil {
+			slog.Error("Runtime workflow recovery stopped", "error", err)
 		}
 	}()
 	ids := uuidGenerator{}
@@ -107,8 +116,8 @@ func run(ctx context.Context) error {
 		store, dispatcher, ids, time.Now,
 		map[string]string{config.defaultRegion: config.defaultAvailabilityZone},
 	)
-	runtimeCommands := application.NewRuntimeCommandService(store, runtimeWorkflowUnavailable{}, ids, time.Now)
-	autoStopPolicies := application.NewAutoStopPolicyService(store, ids, time.Now)
+	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, ids, time.Now)
+	autoStopPolicies := application.NewAutoStopPolicyService(store, workflowClient, ids, time.Now)
 	registerProjectSeed := application.NewRegisterProjectSeedService(store, uploads, ids, time.Now)
 	profiles := application.NewProfileService(store, uploads, ids, time.Now)
 	sshKeys := application.NewSSHKeyService(store, ids, time.Now)
@@ -175,9 +184,3 @@ func valueOrDefault(name, fallback string) string {
 type uuidGenerator struct{}
 
 func (uuidGenerator) NewID() string { return uuid.NewString() }
-
-type runtimeWorkflowUnavailable struct{}
-
-func (runtimeWorkflowUnavailable) DispatchRuntimeOperation(context.Context, string) error {
-	return errors.New("Runtime workflow dispatch is not configured")
-}

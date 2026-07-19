@@ -64,6 +64,31 @@ func TestAutoStopCoordinatorResetsTimerOnPolicyAndRuntimeChanges(t *testing.T) {
 	}
 }
 
+func TestAutoStopCoordinatorReevaluatesPolicyChangeDuringGrace(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	coordinator := workflows.AutoStopCoordinator{}
+	disconnected := mustAutoStopPolicy(t, domain.AutoStopWhenDisconnected, 300)
+	activeAgent := activity(now, 1)
+	activeAgent.CodexProcesses = 1
+	started := observe(t, coordinator, workflows.AutoStopCoordinationState{EnvironmentID: "environment-1"}, observation(disconnected, 1, activeAgent))
+	if started.Timer == nil {
+		t.Fatalf("disconnected policy did not start grace: %#v", started)
+	}
+
+	agents := mustAutoStopPolicy(t, domain.AutoStopWhenAgentsFinish, 300)
+	changed := observe(t, coordinator, started.State, observation(agents, 2, activity(now.Add(time.Minute), 2)))
+	if !changed.Cancelled || changed.Timer == nil {
+		t.Fatalf("policy refresh did not replace pending grace: %#v", changed)
+	}
+
+	stillActive := activity(now.Add(2*time.Minute), 3)
+	stillActive.CodexProcesses = 1
+	blocked := observe(t, coordinator, changed.State, observation(agents, 2, stillActive))
+	if !blocked.Cancelled || blocked.Timer != nil || blocked.Decision.Reason != domain.AutoStopBlockedActivity {
+		t.Fatalf("new policy was not re-evaluated during grace: %#v", blocked)
+	}
+}
+
 func TestAutoStopCoordinatorExpiryRequiresFreshCurrentSnapshotAndDispatchesOnce(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	policy := mustAutoStopPolicy(t, domain.AutoStopWhenFullyIdle, 10)

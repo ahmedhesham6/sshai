@@ -123,7 +123,7 @@ func TestRuntimeCommandHTTPReplaysProjectCurrentEnvironmentState(t *testing.T) {
 					expectedOwnerID: "user-1",
 					replay:          succeededSynchronousPolicyOperation(t, "operation-policy-historical"),
 				}
-				service := application.NewAutoStopPolicyService(repository, &idsFake{values: []string{"operation-unused"}}, fixedNow)
+				service := application.NewAutoStopPolicyService(repository, autoStopRefreshFake{}, &idsFake{values: []string{"operation-unused"}}, fixedNow)
 				return serveRuntimeCommandRequest(runtimeCommandHandler(detail, nil, nil, service), "/v1/environments/environment-1/auto-stop-policy", `{"mode":"when_fully_idle","gracePeriodSeconds":300}`)
 			},
 			check: func(t *testing.T, accepted contracts.EnvironmentOperation) {
@@ -169,7 +169,7 @@ func TestUpdateAutoStopPolicyHTTP(t *testing.T) {
 			detail := runtimeEnvironmentDetail(t)
 			reads := &environmentReaderFake{expectedOwnerID: "user-1", environments: map[string]db.EnvironmentDetail{"environment-1": detail}}
 			repository := &autoStopPolicyHTTPRepositoryFake{expectedOwnerID: "user-1"}
-			autoStopPolicies := application.NewAutoStopPolicyService(repository, &idsFake{values: []string{"operation-policy-1"}}, fixedNow)
+			autoStopPolicies := application.NewAutoStopPolicyService(repository, autoStopRefreshFake{}, &idsFake{values: []string{"operation-policy-1"}}, fixedNow)
 			handler := runtimeCommandHandlerWithReads(reads, nil, nil, autoStopPolicies)
 			response := serveRuntimeCommandRequest(handler, test.path, test.body)
 
@@ -273,6 +273,18 @@ func (fake *runtimeCommandHTTPDispatcherFake) DispatchRuntimeOperation(_ context
 	return nil
 }
 
+type runtimeCommandBalanceHTTPFake struct{}
+
+func (runtimeCommandBalanceHTTPFake) CreditBalance(_ context.Context, ownerID string) (db.CreditBalanceProjection, error) {
+	return db.CreditBalanceProjection{UserID: ownerID, Credits: 1}, nil
+}
+
+type autoStopRefreshFake struct{}
+
+func (autoStopRefreshFake) SendAutoStopPolicyRefresh(context.Context, string, string) error {
+	return nil
+}
+
 type autoStopPolicyHTTPRepositoryFake struct {
 	expectedOwnerID string
 	policy          domain.AutoStopPolicy
@@ -302,7 +314,7 @@ func runtimeCommandHandler(detail db.EnvironmentDetail, repository application.R
 func runtimeCommandHandlerWithReads(reads controlplane.EnvironmentReader, repository application.RuntimeOperationRepository, dispatcher application.RuntimeOperationDispatcher, autoStopPolicies *application.AutoStopPolicyService) http.Handler {
 	var runtimeCommands *application.RuntimeCommandService
 	if repository != nil {
-		runtimeCommands = application.NewRuntimeCommandService(repository, dispatcher, &idsFake{values: []string{"operation-1"}}, fixedNow)
+		runtimeCommands = application.NewRuntimeCommandService(repository, dispatcher, runtimeCommandBalanceHTTPFake{}, &idsFake{values: []string{"operation-1"}}, fixedNow)
 	}
 	return controlplane.NewHandler(controlplane.Config{
 		RuntimeCommands: runtimeCommands, AutoStopPolicies: autoStopPolicies, EnvironmentReads: reads,

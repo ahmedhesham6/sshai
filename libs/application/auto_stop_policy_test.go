@@ -25,7 +25,7 @@ func TestAutoStopPolicyServiceEnforcesCadenceFloor(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			repository := &autoStopPolicyRepositoryFake{}
-			service := application.NewAutoStopPolicyService(repository, &idsFake{values: []string{"operation-1"}}, fixedAutoStopNow)
+			service := application.NewAutoStopPolicyService(repository, &autoStopPolicyRefreshFake{}, &idsFake{values: []string{"operation-1"}}, fixedAutoStopNow)
 			_, err := service.UpdateAutoStopPolicy(t.Context(), application.AutoStopPolicyUpdateInput{
 				OwnerUserID: "user-1", EnvironmentID: "environment-1", PolicyID: "policy-1",
 				Mode: test.mode, GracePeriod: test.grace, IdempotencyKey: "request-key-0001",
@@ -45,7 +45,8 @@ func TestAutoStopPolicyServiceEnforcesCadenceFloor(t *testing.T) {
 
 func TestAutoStopPolicyServiceRecordsHonestSynchronousSuccess(t *testing.T) {
 	repository := &autoStopPolicyRepositoryFake{}
-	service := application.NewAutoStopPolicyService(repository, &idsFake{values: []string{"operation-1"}}, fixedAutoStopNow)
+	refresh := &autoStopPolicyRefreshFake{}
+	service := application.NewAutoStopPolicyService(repository, refresh, &idsFake{values: []string{"operation-1"}}, fixedAutoStopNow)
 
 	update, err := service.UpdateAutoStopPolicy(t.Context(), application.AutoStopPolicyUpdateInput{
 		OwnerUserID: "user-1", EnvironmentID: "environment-1", PolicyID: "policy-1",
@@ -59,6 +60,9 @@ func TestAutoStopPolicyServiceRecordsHonestSynchronousSuccess(t *testing.T) {
 		operation.RestateInvocationID != nil || operation.CompletedAt == nil || !operation.CompletedAt.Equal(fixedAutoStopNow()) {
 		t.Fatalf("synchronous Operation = %#v", operation)
 	}
+	if refresh.calls != 1 || refresh.environmentID != "environment-1" || refresh.idempotencyKey != "auto-stop-policy-refresh:operation-1" {
+		t.Fatalf("coordinator refresh = %#v", refresh)
+	}
 }
 
 type autoStopPolicyRepositoryFake struct {
@@ -71,6 +75,19 @@ func (repository *autoStopPolicyRepositoryFake) UpdateAutoStopPolicy(_ context.C
 	repository.calls++
 	repository.policy, repository.operation = policy, operation
 	return operation, true, nil
+}
+
+type autoStopPolicyRefreshFake struct {
+	calls          int
+	environmentID  string
+	idempotencyKey string
+}
+
+func (fake *autoStopPolicyRefreshFake) SendAutoStopPolicyRefresh(_ context.Context, environmentID, idempotencyKey string) error {
+	fake.calls++
+	fake.environmentID = environmentID
+	fake.idempotencyKey = idempotencyKey
+	return nil
 }
 
 func fixedAutoStopNow() time.Time {
