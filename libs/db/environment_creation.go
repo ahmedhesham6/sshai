@@ -35,6 +35,9 @@ func (store *Store) ReserveEnvironmentCreation(ctx context.Context, candidate do
 	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
 		return domain.EnvironmentCreation{}, fmt.Errorf("reserve Environment creation: lock idempotency key: %w", err)
 	}
+	if err := rejectActiveConnectionIntentIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
+		return domain.EnvironmentCreation{}, err
+	}
 
 	existingOperation, err := queries.GetOperationByIdempotencyKey(ctx, dbsql.GetOperationByIdempotencyKeyParams{
 		OwnerUserID: ownerID, IdempotencyKey: idempotencyKey,

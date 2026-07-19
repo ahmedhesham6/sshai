@@ -42,6 +42,9 @@ func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domai
 	if err := lockOperationIdempotencyKey(ctx, tx, operation.RequestedByUserID, operation.IdempotencyKey); err != nil {
 		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: lock idempotency key: %w", err)
 	}
+	if err := rejectActiveConnectionIntentIdempotencyKey(ctx, tx, operation.RequestedByUserID, operation.IdempotencyKey); err != nil {
+		return domain.EnvironmentRuntimeOperation{}, err
+	}
 
 	command, present, err := replayRuntimeOperation(ctx, queries, candidate)
 	if err != nil {

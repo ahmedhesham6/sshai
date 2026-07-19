@@ -96,6 +96,12 @@ Every resource is owned by the authenticated WorkOS user projection. A missing f
 - Same key and identical canonical input returns the existing Operation.
 - Same key and different input returns `409 IDEMPOTENCY_CONFLICT`.
 - Connection Intent creation may use a short deterministic key derived from Environment and CLI attempt.
+- An unexpired Connection Intent key replays the stored Intent identity, expiry,
+  and nullable start Operation reference even if Runtime state has since changed.
+  At expiry the record is replaced under the same User/key serialization lock;
+  expired records are also pruned by the control-plane retention loop.
+- A non-start active Operation conflicts with new Connection Intent creation;
+  concurrent attempts may join the same active Runtime start.
 
 ## Errors
 
