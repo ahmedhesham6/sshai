@@ -113,9 +113,11 @@ type RuntimeGuestShutdownPreparer interface {
 }
 
 type runtimeProviderOutcome struct {
-	Runtime     provider.Runtime `json:"runtime"`
-	FailureCode string           `json:"failureCode,omitempty"`
-	Failure     string           `json:"failure,omitempty"`
+	Runtime          provider.Runtime `json:"runtime"`
+	ObservedAt       time.Time        `json:"observedAt,omitempty"`
+	RetryableFailure bool             `json:"retryableFailure,omitempty"`
+	FailureCode      string           `json:"failureCode,omitempty"`
+	Failure          string           `json:"failure,omitempty"`
 }
 
 func runtimeLifecycleRequest(state RuntimeOperationState) (provider.RuntimeLifecycleRequest, error) {
@@ -181,6 +183,27 @@ func providerOutcome(runtime provider.Runtime, err error) (runtimeProviderOutcom
 	return runtimeProviderOutcome{FailureCode: code, Failure: err.Error()}, nil
 }
 
+func timestampProviderOutcome(outcome runtimeProviderOutcome, err error, observedAt time.Time) (runtimeProviderOutcome, error) {
+	if err != nil {
+		return runtimeProviderOutcome{}, err
+	}
+	outcome.ObservedAt = observedAt
+	return outcome, nil
+}
+
+func providerPollOutcome(runtime provider.Runtime, err error, observedAt time.Time) runtimeProviderOutcome {
+	var classified interface{ Transient() bool }
+	if err != nil && errors.As(err, &classified) && classified.Transient() {
+		return runtimeProviderOutcome{ObservedAt: observedAt, RetryableFailure: true}
+	}
+	outcome, actionErr := providerOutcome(runtime, err)
+	if actionErr != nil {
+		return runtimeProviderOutcome{ObservedAt: observedAt, RetryableFailure: true}
+	}
+	outcome.ObservedAt = observedAt
+	return outcome
+}
+
 func persistRuntimeTransition(ctx restate.WorkflowContext, actions RuntimeLifecycleActions, operationID, name string, before domain.RuntimeSnapshot, after domain.Runtime) (domain.RuntimeSnapshot, error) {
 	next := after.Snapshot()
 	result, err := restate.Run(ctx, func(runCtx restate.RunContext) (domain.RuntimeSnapshot, error) {
@@ -229,11 +252,12 @@ func waitForProviderState(
 	ctx restate.WorkflowContext,
 	runtimeProvider provider.RuntimeProvider,
 	request provider.RuntimeLifecycleRequest,
-	initial provider.Runtime,
+	initial runtimeProviderOutcome,
 	expected provider.RuntimeState,
 	transitional provider.RuntimeState,
 	stepPrefix string,
 	pollInterval, pollTimeout time.Duration,
+	now func() time.Time,
 ) (runtimeProviderOutcome, error) {
 	if pollInterval <= 0 {
 		pollInterval = defaultProviderPollInterval
@@ -242,31 +266,35 @@ func waitForProviderState(
 		pollTimeout = defaultProviderPollTimeout
 	}
 	observed := initial
-	elapsed := time.Duration(0)
+	if observed.ObservedAt.IsZero() {
+		return providerDivergenceOutcome(errors.New("Runtime provider observation time is required")), nil
+	}
+	deadline := observed.ObservedAt.Add(pollTimeout)
 	delay := pollInterval
 	for attempt := 0; ; attempt++ {
-		if err := validateProviderRuntimeIdentity(observed, request); err != nil {
-			return providerDivergenceOutcome(err), nil
+		if !observed.RetryableFailure {
+			if err := validateProviderRuntimeIdentity(observed.Runtime, request); err != nil {
+				return providerDivergenceOutcome(err), nil
+			}
+			if observed.Runtime.State == expected {
+				return observed, nil
+			}
+			if observed.Runtime.State != transitional {
+				return providerDivergenceOutcome(fmt.Errorf("Runtime provider observation diverged: state is %q, want %q or %q", observed.Runtime.State, transitional, expected)), nil
+			}
 		}
-		if observed.State == expected {
-			return runtimeProviderOutcome{Runtime: observed}, nil
-		}
-		if observed.State != transitional {
-			return providerDivergenceOutcome(fmt.Errorf("Runtime provider observation diverged: state is %q, want %q or %q", observed.State, transitional, expected)), nil
-		}
-		if elapsed >= pollTimeout {
+		if !observed.ObservedAt.Before(deadline) {
 			return runtimeProviderOutcome{
 				FailureCode: string(provider.ErrorCodeUnavailable),
 				Failure:     fmt.Sprintf("provider did not reach %q before the durable wait deadline", expected),
 			}, nil
 		}
-		if delay > pollTimeout-elapsed {
-			delay = pollTimeout - elapsed
+		if remaining := deadline.Sub(observed.ObservedAt); delay > remaining {
+			delay = remaining
 		}
 		if err := restate.Sleep(ctx, delay, restate.WithName(fmt.Sprintf("%s-wait-%d", stepPrefix, attempt+1))); err != nil {
 			return runtimeProviderOutcome{}, err
 		}
-		elapsed += delay
 		if delay < 30*time.Second {
 			delay *= 2
 			if delay > 30*time.Second {
@@ -275,7 +303,7 @@ func waitForProviderState(
 		}
 		next, err := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
 			runtime, err := runtimeProvider.ObserveRuntime(runCtx, request)
-			return providerOutcome(runtime, err)
+			return providerPollOutcome(runtime, err, now()), nil
 		}, restate.WithName(fmt.Sprintf("%s-observe-%d", stepPrefix, attempt+1)))
 		if err != nil {
 			return runtimeProviderOutcome{}, err
@@ -283,7 +311,7 @@ func waitForProviderState(
 		if next.Failure != "" {
 			return next, nil
 		}
-		observed = next.Runtime
+		observed = next
 	}
 }
 

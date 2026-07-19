@@ -91,6 +91,9 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 	}, restate.WithName("suppress-auto-stop")); err != nil {
 		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
 	}
+	failWhileReady := func(code, message string) error {
+		return resumeAutoStopAndFailRuntimeStop(ctx, dependencies, input, state, code, message)
+	}
 	snapshot, err := restate.Run(ctx, func(runCtx restate.RunContext) (AutoStopObservation, error) {
 		observation, err := dependencies.Snapshots.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
 			EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID, FreshAfter: dependencies.Now(),
@@ -98,15 +101,15 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 		return observation, classifyDurableError(err)
 	}, restate.WithName("request-activity-snapshot"))
 	if err != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, err.Error())
 	}
 	if snapshot.RuntimeID != input.RuntimeID || snapshot.Snapshot == nil || snapshot.Snapshot.RuntimeID != input.RuntimeID {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, "Activity Snapshot belongs to another Runtime", dependencies.Now)
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, "Activity Snapshot belongs to another Runtime")
 	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.Actions.RecordRuntimeStopSnapshot(runCtx, input.OperationID, snapshot))
 	}, restate.WithName("record-stop-activity-snapshot")); err != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, err.Error())
 	}
 	guestRequest := RuntimeGuestReadinessRequest{
 		OwnerUserID: input.OwnerUserID, EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID,
@@ -118,23 +121,25 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.Guest.PrepareRuntimeShutdown(runCtx, guestRequest))
 	}, restate.WithName("prepare-guest-shutdown")); err != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, err.Error())
 	}
 	runtime, restoreErr := domain.RestoreRuntime(state.Runtime)
 	if restoreErr != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, restoreErr.Error(), dependencies.Now)
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, restoreErr.Error())
 	}
 	stopping, transitionErr := runtime.BeginStop(dependencies.Now())
 	if transitionErr != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, transitionErr.Error(), dependencies.Now)
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, transitionErr.Error())
 	}
-	state.Runtime, transitionErr = persistRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "begin-runtime-stop", state.Runtime, stopping)
+	nextRuntime, transitionErr := persistRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "begin-runtime-stop", state.Runtime, stopping)
 	if transitionErr != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, transitionErr.Error(), dependencies.Now)
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, transitionErr.Error())
 	}
+	state.Runtime = nextRuntime
 	stopped, err := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
 		runtime, err := dependencies.Provider.StopRuntime(runCtx, request)
-		return providerOutcome(runtime, err)
+		outcome, outcomeErr := providerOutcome(runtime, err)
+		return timestampProviderOutcome(outcome, outcomeErr, dependencies.Now())
 	}, restate.WithName("stop-runtime-provider"))
 	if err != nil {
 		return RuntimeStopOutput{}, err
@@ -148,7 +153,7 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 		}
 		return RuntimeStopOutput{}, markRuntimeProviderFailure(ctx, dependencies.Actions, input.OperationID, state.Runtime, providerDivergenceOutcome(err), dependencies.Now)
 	}
-	observed, waitErr := waitForProviderState(ctx, dependencies.Provider, request, stopped.Runtime, provider.RuntimeStateStopped, provider.RuntimeStateStopping, "wait-runtime-stopped", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout)
+	observed, waitErr := waitForProviderState(ctx, dependencies.Provider, request, stopped, provider.RuntimeStateStopped, provider.RuntimeStateStopping, "wait-runtime-stopped", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout, dependencies.Now)
 	if waitErr != nil {
 		return RuntimeStopOutput{}, waitErr
 	}
@@ -168,7 +173,7 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 	} else {
 		if _, err := restate.Run(ctx, func(runCtx restate.RunContext) (string, error) {
 			transaction, err := dependencies.Usage.CloseComputeUsageInterval(runCtx, dbstore.CloseComputeUsageIntervalInput{
-				IntervalID: state.ComputeUsageIntervalID, StoppedAt: dependencies.Now(), Source: dbstore.ComputeUsageClosedByRuntimeStop,
+				IntervalID: state.ComputeUsageIntervalID, StoppedAt: observed.ObservedAt, Source: dbstore.ComputeUsageClosedByRuntimeStop,
 			})
 			if err != nil {
 				return "", classifyDurableError(err)
@@ -198,4 +203,15 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
 	}
 	return RuntimeStopOutput{RuntimeID: input.RuntimeID, Reason: input.StopReason}, nil
+}
+
+func resumeAutoStopAndFailRuntimeStop(ctx restate.WorkflowContext, dependencies RuntimeStopDependencies, input domain.RuntimeOperationDispatch, state RuntimeOperationState, code, message string) error {
+	if state.Runtime.Status == domain.RuntimeReady {
+		if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
+			return classifyDurableError(dependencies.AutoStop.ResumeAutoStop(runCtx, input.EnvironmentID, input.RuntimeID))
+		}, restate.WithName("resume-auto-stop-after-failed-stop")); err != nil {
+			return err
+		}
+	}
+	return failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, code, message, dependencies.Now)
 }

@@ -32,8 +32,10 @@ func TestAutoStopObjectRefreshesAtExpiryAndDispatchesOneIdempotentStop(t *testin
 	}
 	select {
 	case request := <-dispatcher.requests:
+		evidence := request.AuditEvidence
 		if request.EnvironmentID != "environment-1" || request.RuntimeID != "runtime-1" || request.Reason != domain.RuntimeStopAutoStop || request.IdempotencyKey == "" ||
-			request.AuditEvidence == nil || len(request.AuditEvidence.QualifyingSnapshots) != 2 {
+			evidence == nil || len(evidence.QualifyingSnapshots) != 2 || !evidence.GraceStartedAt.After(input.Snapshot.ObservedAt) ||
+			evidence.GraceExpiredAt.Before(evidence.GraceStartedAt) {
 			t.Fatalf("Runtime stop request = %#v", request)
 		}
 	case <-time.After(20 * time.Second):

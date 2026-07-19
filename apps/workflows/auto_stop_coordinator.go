@@ -29,6 +29,7 @@ type AutoStopObservation struct {
 	Policy           domain.AutoStopPolicySnapshot
 	PolicyGeneration uint64
 	FreshAfter       time.Time
+	ProcessedAt      time.Time
 	Snapshot         *domain.AutoStopActivitySnapshot
 	Conflicts        []domain.AutoStopConflict
 }
@@ -144,8 +145,11 @@ func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation 
 	transition.State.TimerGeneration++
 	transition.State.TimerPending = true
 	if observation.Snapshot != nil {
+		if observation.ProcessedAt.IsZero() {
+			return AutoStopTransition{}, errors.New("coordinate Auto-stop: processing time is required")
+		}
 		snapshot := *observation.Snapshot
-		transition.State.GraceStartedAt = snapshot.ObservedAt
+		transition.State.GraceStartedAt = observation.ProcessedAt
 		transition.State.GraceStartSnapshot = &snapshot
 	}
 	transition.Timer = &AutoStopTimer{

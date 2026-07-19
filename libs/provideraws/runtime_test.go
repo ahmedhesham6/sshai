@@ -2,6 +2,7 @@ package provideraws
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -24,6 +25,12 @@ type divergentRuntimeEC2 struct {
 	describeCalls int
 }
 
+type acceptedStartEC2 struct {
+	*recordingEC2
+	describeCalls int
+	startCalls    int
+}
+
 func (client *divergentRuntimeEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
 	client.describeCalls++
 	current := ownedInstanceForTest("i-current", "runtime-1")
@@ -32,6 +39,22 @@ func (client *divergentRuntimeEC2) DescribeInstances(context.Context, *ec2.Descr
 		instances = append(instances, ownedInstanceForTest("i-extra", "runtime-extra"))
 	}
 	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: instances}}}, nil
+}
+
+func (client *acceptedStartEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+	client.describeCalls++
+	if client.describeCalls > 1 {
+		return nil, errors.New("unexpected follow-up Runtime observation")
+	}
+	instance := ownedInstanceForTest("i-runtime", "runtime-1")
+	instance.State.Name = types.InstanceStateNameStopped
+	instance.PrivateIpAddress = nil
+	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{instance}}}}, nil
+}
+
+func (client *acceptedStartEC2) StartInstances(context.Context, *ec2.StartInstancesInput, ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {
+	client.startCalls++
+	return &ec2.StartInstancesOutput{}, nil
 }
 
 func (client *recordingEC2) DetachVolume(context.Context, *ec2.DetachVolumeInput, ...func(*ec2.Options)) (*ec2.DetachVolumeOutput, error) {
@@ -105,6 +128,30 @@ func TestEnsureRuntimeLaunchesPrivateOwnedRuntimeAndAttachesPersistentData(t *te
 	assertRuntimeLaunchInput(t, client.runInput)
 	if client.attachInput == nil || aws.ToString(client.attachInput.InstanceId) != "i-runtime" || aws.ToString(client.attachInput.VolumeId) != "vol-data" || aws.ToString(client.attachInput.Device) != "/dev/sdf" {
 		t.Fatalf("AttachVolume input = %#v", client.attachInput)
+	}
+}
+
+func TestStartRuntimeReturnsAcceptedPendingWithoutFollowUpObservation(t *testing.T) {
+	client := &acceptedStartEC2{recordingEC2: &recordingEC2{}}
+	adapter, err := newProvider(client, Config{
+		Region: "us-east-1", Environment: "development", SizeGiB: 100,
+		Runtime: RuntimeConfig{
+			AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"},
+			SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newProvider(): %v", err)
+	}
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	started, err := adapter.StartRuntime(t.Context(), provider.RuntimeLifecycleRequest{
+		RuntimeSpec: request.RuntimeSpec, ProviderID: "i-runtime",
+	})
+	if err != nil {
+		t.Fatalf("StartRuntime(): %v", err)
+	}
+	if client.startCalls != 1 || client.describeCalls != 1 || started.State != provider.RuntimeStatePending || started.PrivateIPv4 != "" {
+		t.Fatalf("accepted start calls/observation = %d/%d %#v", client.startCalls, client.describeCalls, started)
 	}
 }
 

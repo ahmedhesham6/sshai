@@ -101,6 +101,13 @@ func (object *autoStopObject) Observe(ctx restate.ObjectContext, input AutoStopO
 	if state.EnvironmentID == "" {
 		state.EnvironmentID = restate.Key(ctx)
 	}
+	processedAt, processedAtErr := restate.Run(ctx, func(restate.RunContext) (time.Time, error) {
+		return time.Now().UTC(), nil
+	}, restate.WithName("record-auto-stop-processing-time"))
+	if processedAtErr != nil {
+		return AutoStopTransition{}, processedAtErr
+	}
+	input.ProcessedAt = processedAt
 	transition, err := (AutoStopCoordinator{}).Observe(state, input)
 	if err != nil {
 		return AutoStopTransition{}, restate.TerminalErrorf("invalid Auto-stop observation: %v", err)
@@ -125,6 +132,7 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 			AfterSnapshotSequence: state.LastSnapshotSequence, FreshAfter: freshAfter,
 		})
 		observation.FreshAfter = freshAfter
+		observation.ProcessedAt = time.Now().UTC()
 		return observation, err
 	}, restate.WithName("refresh-activity-snapshot"))
 	if err != nil {

@@ -37,8 +37,7 @@ type RuntimeStartOutput struct {
 type runtimeStartWorkflow struct{ dependencies RuntimeStartDependencies }
 
 type runtimeComputeUsageSeed struct {
-	ID        string    `json:"id"`
-	StartedAt time.Time `json:"startedAt"`
+	ID string `json:"id"`
 }
 
 func RuntimeStartDefinition(dependencies RuntimeStartDependencies) restate.ServiceDefinition {
@@ -148,7 +147,8 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 	}
 	started, err := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
 		runtime, err := dependencies.Provider.StartRuntime(runCtx, request)
-		return providerOutcome(runtime, err)
+		outcome, outcomeErr := providerOutcome(runtime, err)
+		return timestampProviderOutcome(outcome, outcomeErr, dependencies.Now())
 	}, restate.WithName("start-runtime-provider"))
 	if err != nil {
 		return RuntimeStartOutput{}, err
@@ -163,7 +163,7 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 		return RuntimeStartOutput{}, markRuntimeProviderFailure(ctx, dependencies.Actions, input.OperationID, state.Runtime, providerDivergenceOutcome(err), dependencies.Now)
 	}
 	usageSeed, err := restate.Run(ctx, func(restate.RunContext) (runtimeComputeUsageSeed, error) {
-		return runtimeComputeUsageSeed{ID: dependencies.IDs.NewID(), StartedAt: dependencies.Now()}, nil
+		return runtimeComputeUsageSeed{ID: dependencies.IDs.NewID()}, nil
 	}, restate.WithName("reserve-compute-usage-identity"))
 	if err != nil {
 		return RuntimeStartOutput{}, markRuntimeErrorAndFail(ctx, dependencies.Actions, input.OperationID, state.Runtime, RuntimeStartFailed, err.Error(), dependencies.Now)
@@ -171,7 +171,7 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 	interval, err := restate.Run(ctx, func(runCtx restate.RunContext) (dbstore.ComputeUsageInterval, error) {
 		interval, err := dependencies.Usage.OpenComputeUsageInterval(runCtx, dbstore.OpenComputeUsageIntervalInput{
 			ID: usageSeed.ID, UserID: input.OwnerUserID, EnvironmentID: input.EnvironmentID,
-			RuntimeID: input.RuntimeID, StartedAt: usageSeed.StartedAt,
+			RuntimeID: input.RuntimeID, StartedAt: started.ObservedAt,
 		})
 		return interval, classifyDurableError(err)
 	}, restate.WithName("open-compute-usage"))
@@ -181,7 +181,7 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 	if interval.UserID != input.OwnerUserID || interval.EnvironmentID != input.EnvironmentID || interval.RuntimeID != input.RuntimeID {
 		return RuntimeStartOutput{}, markRuntimeErrorAndFail(ctx, dependencies.Actions, input.OperationID, state.Runtime, RuntimeStartFailed, "Compute Usage Interval ownership diverged", dependencies.Now)
 	}
-	running, waitErr := waitForProviderState(ctx, dependencies.Provider, request, started.Runtime, provider.RuntimeStateRunning, provider.RuntimeStatePending, "wait-runtime-running", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout)
+	running, waitErr := waitForProviderState(ctx, dependencies.Provider, request, started, provider.RuntimeStateRunning, provider.RuntimeStatePending, "wait-runtime-running", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout, dependencies.Now)
 	if waitErr != nil {
 		return RuntimeStartOutput{}, waitErr
 	}

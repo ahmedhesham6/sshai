@@ -90,7 +90,9 @@ func TestAutoStopCoordinatorExpiryRequiresFreshCurrentSnapshotAndDispatchesOnce(
 		t.Fatalf("activity at timer expiry = %#v", active)
 	}
 
-	restarted = observe(t, coordinator, active.State, observation(policy, 7, activity(now.Add(4*time.Second), 13)))
+	restartObservation := observation(policy, 7, activity(now.Add(4*time.Second), 13))
+	restartObservation.ProcessedAt = now.Add(5 * time.Second)
+	restarted = observe(t, coordinator, active.State, restartObservation)
 	freshGeneration := restarted.Timer.Generation
 	expired := expire(t, coordinator, restarted.State, workflows.AutoStopExpiry{
 		RuntimeID: "runtime-1", Generation: freshGeneration,
@@ -101,7 +103,7 @@ func TestAutoStopCoordinatorExpiryRequiresFreshCurrentSnapshotAndDispatchesOnce(
 	}
 	if evidence := expired.Stop.AuditEvidence; evidence == nil || evidence.Policy.ID != "policy-1" || evidence.PolicyGeneration != 7 ||
 		len(evidence.QualifyingSnapshots) != 2 || evidence.QualifyingSnapshots[0].Sequence != 13 || evidence.QualifyingSnapshots[1].Sequence != 14 ||
-		evidence.GracePeriodSeconds != 10 || evidence.GraceStartedAt.IsZero() || evidence.GraceExpiredAt.IsZero() {
+		evidence.GracePeriodSeconds != 10 || !evidence.GraceStartedAt.Equal(restartObservation.ProcessedAt) || evidence.GraceExpiredAt.IsZero() {
 		t.Fatalf("Auto-stop audit evidence = %#v", evidence)
 	}
 	replayed := expire(t, coordinator, expired.State, workflows.AutoStopExpiry{
@@ -160,9 +162,13 @@ func TestAutoStopCoordinatorSuppressesUntilTheRuntimeResumes(t *testing.T) {
 }
 
 func observation(policy domain.AutoStopPolicy, generation uint64, snapshot *domain.AutoStopActivitySnapshot) workflows.AutoStopObservation {
+	processedAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	if snapshot != nil {
+		processedAt = snapshot.ObservedAt
+	}
 	return workflows.AutoStopObservation{
 		RuntimeID: "runtime-1", Policy: policy.Snapshot(), PolicyGeneration: generation,
-		FreshAfter: time.Date(2026, time.July, 13, 11, 59, 0, 0, time.UTC), Snapshot: snapshot,
+		FreshAfter: time.Date(2026, time.July, 13, 11, 59, 0, 0, time.UTC), ProcessedAt: processedAt, Snapshot: snapshot,
 	}
 }
 

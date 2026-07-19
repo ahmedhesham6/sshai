@@ -1,9 +1,11 @@
 package providertest
 
 import (
+	"context"
 	"errors"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/provider"
 )
@@ -47,9 +49,7 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if err != nil {
 		t.Fatalf("StartRuntime(): %v", err)
 	}
-	if running.State != provider.RuntimeStateRunning || !privateIPv4(running.PrivateIPv4) {
-		t.Fatalf("started Runtime = %#v", running)
-	}
+	running = awaitRunning(t, ctx, harness.Adapter, request, running)
 	replayed, err = harness.Adapter.StartRuntime(ctx, request)
 	if err != nil {
 		t.Fatalf("StartRuntime() replay: %v", err)
@@ -78,9 +78,7 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if err != nil {
 		t.Fatalf("restart Runtime: %v", err)
 	}
-	if running.State != provider.RuntimeStateRunning || !privateIPv4(running.PrivateIPv4) {
-		t.Fatalf("restarted Runtime = %#v", running)
-	}
+	running = awaitRunning(t, ctx, harness.Adapter, request, running)
 	if _, err := harness.Adapter.StopRuntime(ctx, request); err != nil {
 		t.Fatalf("stop Runtime before retirement: %v", err)
 	}
@@ -103,6 +101,44 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	assertSameRuntime(t, observed, retired)
 	if harness.AssertDataVolumePreserved != nil {
 		harness.AssertDataVolumePreserved(t)
+	}
+}
+
+func awaitRunning(
+	t *testing.T,
+	ctx context.Context,
+	adapter provider.RuntimeProvider,
+	request provider.RuntimeLifecycleRequest,
+	observation provider.Runtime,
+) provider.Runtime {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		switch observation.State {
+		case provider.RuntimeStateRunning:
+			if !privateIPv4(observation.PrivateIPv4) {
+				t.Fatalf("running Runtime = %#v", observation)
+			}
+			return observation
+		case provider.RuntimeStatePending:
+		case provider.RuntimeStateStopping, provider.RuntimeStateStopped, provider.RuntimeStateTerminated:
+			t.Fatalf("started Runtime = %#v", observation)
+		default:
+			t.Fatalf("started Runtime has unknown state: %#v", observation)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("observe started Runtime: %v", ctx.Err())
+		case <-deadline.C:
+			t.Fatalf("started Runtime remained pending: %#v", observation)
+		case <-time.After(10 * time.Millisecond):
+		}
+		var err error
+		observation, err = adapter.ObserveRuntime(ctx, request)
+		if err != nil {
+			t.Fatalf("ObserveRuntime() after start: %v", err)
+		}
 	}
 }
 

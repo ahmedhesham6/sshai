@@ -96,7 +96,9 @@ func (adapter *Provider) StartRuntime(ctx context.Context, request provider.Runt
 		if _, err := adapter.client.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{request.ProviderID}}); err != nil {
 			return provider.Runtime{}, containError("start Runtime", err)
 		}
-		return adapter.ObserveRuntime(ctx, request)
+		observation.State = provider.RuntimeStatePending
+		observation.PrivateIPv4 = ""
+		return observation, nil
 	case provider.RuntimeStateStopping:
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeUnavailable, "Runtime is still stopping", nil)
 	default:
