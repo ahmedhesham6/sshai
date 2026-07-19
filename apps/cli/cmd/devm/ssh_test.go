@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -110,6 +111,52 @@ func TestDiscoverEd25519KeysRejectsSymlinkedScannerRoot(t *testing.T) {
 	}
 	if _, err := discoverEd25519Keys(root); err == nil {
 		t.Fatal("discoverEd25519Keys() accepted a symlinked scanner root")
+	}
+}
+
+func TestChooseLocalSSHKeyFollowsRatifiedRules(t *testing.T) {
+	sshDirectory := t.TempDir()
+	writeEd25519KeyPair(t, sshDirectory, "id_older", "")
+	writeEd25519KeyPair(t, sshDirectory, "id_recent", "")
+	now := time.Now().Truncate(time.Second)
+	older := now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(sshDirectory, "id_older"), older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(sshDirectory, "id_recent"), now, now); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := discoverEd25519Keys(sshDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		keys       []localSSHKey
+		override   string
+		wantLabel  string
+		wantNotice bool
+	}{
+		{name: "none requests generation", keys: nil},
+		{name: "single is silent", keys: keys[:1], wantLabel: "id_older"},
+		{name: "multiple picks most recently used", keys: keys, wantLabel: "id_recent", wantNotice: true},
+		{name: "override by path", keys: keys, override: filepath.Join(sshDirectory, "id_older"), wantLabel: "id_older"},
+		{name: "override by label", keys: keys, override: "id_older", wantLabel: "id_older"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selected, notice, err := chooseLocalSSHKey(test.keys, test.override)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selected.Label != test.wantLabel || notice != test.wantNotice {
+				t.Fatalf("selection = label:%q notice:%t", selected.Label, notice)
+			}
+		})
+	}
+	if _, _, err := chooseLocalSSHKey(keys, filepath.Join(sshDirectory, "missing")); err == nil {
+		t.Fatal("missing override was accepted")
 	}
 }
 
