@@ -107,7 +107,10 @@ func run(ctx context.Context) error {
 	runtimeActions := &runtimeWorkflowActions{store: store, now: time.Now}
 	snapshots := newAutoStopSnapshotSource(store)
 	dataVolumes := runtimeDataVolumeVerifier{store: store}
-	guest := unavailableGuestTransport{}
+	guest, err := newRuntimeGuestTransport(config.guestControl)
+	if err != nil {
+		return fmt.Errorf("construct guest control transport: %w", err)
+	}
 	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)
 	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, idGenerator{}, time.Now)
 	autoStop := workflows.AutoStopDefinition(snapshots, runtimeStopDispatcher{store: store, commands: runtimeCommands})
@@ -188,6 +191,7 @@ type config struct {
 	runtimeSystemVolumeGiB int32
 	runtimePresets         map[string]string
 	imageVersion           string
+	guestControl           guestControlConfig
 }
 
 func loadConfig() (config, error) {
@@ -223,6 +227,10 @@ func loadConfig() (config, error) {
 		runtimeSystemVolumeGiB: runtimeSystemVolumeGiB,
 		runtimePresets:         presets,
 		imageVersion:           os.Getenv("IMAGE_VERSION"),
+		guestControl: guestControlConfig{
+			endpoint: os.Getenv("GUEST_CONTROL_ENDPOINT"), certificateFile: os.Getenv("GUEST_CONTROL_TLS_CERT_FILE"),
+			privateKeyFile: os.Getenv("GUEST_CONTROL_TLS_KEY_FILE"), caFile: os.Getenv("GUEST_CONTROL_TLS_CA_FILE"),
+		},
 	}
 	if config.databaseURL == "" || config.polarEventsEndpoint == "" || config.polarAccessToken == "" ||
 		config.capsuleBucket == "" || config.runtimeEnvironmentName == "" || config.runtimeAMI == "" ||

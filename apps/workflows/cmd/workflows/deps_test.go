@@ -93,6 +93,28 @@ func TestAutoStopSnapshotSourceExposesSingleNonBlockingReads(t *testing.T) {
 	}
 }
 
+func TestGuestControlTransportKeepsPermanentFailureWhenUnconfigured(t *testing.T) {
+	transport, err := newRuntimeGuestTransport(guestControlConfig{})
+	if err != nil {
+		t.Fatalf("construct unconfigured guest transport: %v", err)
+	}
+	_, err = transport.WaitForRuntimeReady(t.Context(), workflows.RuntimeGuestReadinessRequest{})
+	if err == nil {
+		t.Fatal("unconfigured guest transport unexpectedly succeeded")
+	}
+	var classified interface{ Transient() bool }
+	if !errors.As(err, &classified) || classified.Transient() {
+		t.Fatalf("unconfigured error = %T %v, want permanent classified error", err, err)
+	}
+}
+
+func TestGuestControlTransportRejectsPartialConfiguration(t *testing.T) {
+	_, err := newRuntimeGuestTransport(guestControlConfig{endpoint: "https://10.0.0.8:9443"})
+	if err == nil || !strings.Contains(err.Error(), "all required") {
+		t.Fatalf("partial guest transport error = %v", err)
+	}
+}
+
 type autoStopSnapshotStoreFake struct {
 	state         dbstore.AutoStopSnapshotState
 	snapshot      *domain.AutoStopActivitySnapshot
