@@ -11,6 +11,61 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getEnvironmentProjectSeed = `-- name: GetEnvironmentProjectSeed :one
+SELECT
+    id,
+    owner_user_id,
+    repository_url,
+    base_revision,
+    digest,
+    git_bundle_digest,
+    tracked_patch_digest,
+    untracked_bundle_digest,
+    manifest_digest,
+    created_at
+FROM project_seeds
+WHERE id = $1
+  AND owner_user_id = $2
+  AND environment_id = $3
+`
+
+type GetEnvironmentProjectSeedParams struct {
+	ID            string
+	OwnerUserID   string
+	EnvironmentID *string
+}
+
+type GetEnvironmentProjectSeedRow struct {
+	ID                    string
+	OwnerUserID           string
+	RepositoryUrl         string
+	BaseRevision          string
+	Digest                string
+	GitBundleDigest       *string
+	TrackedPatchDigest    *string
+	UntrackedBundleDigest *string
+	ManifestDigest        string
+	CreatedAt             pgtype.Timestamptz
+}
+
+func (q *Queries) GetEnvironmentProjectSeed(ctx context.Context, arg GetEnvironmentProjectSeedParams) (GetEnvironmentProjectSeedRow, error) {
+	row := q.db.QueryRow(ctx, getEnvironmentProjectSeed, arg.ID, arg.OwnerUserID, arg.EnvironmentID)
+	var i GetEnvironmentProjectSeedRow
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerUserID,
+		&i.RepositoryUrl,
+		&i.BaseRevision,
+		&i.Digest,
+		&i.GitBundleDigest,
+		&i.TrackedPatchDigest,
+		&i.UntrackedBundleDigest,
+		&i.ManifestDigest,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getProjectSeedByDigest = `-- name: GetProjectSeedByDigest :one
 SELECT
     id,

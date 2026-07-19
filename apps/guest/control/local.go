@@ -31,15 +31,16 @@ type SSHHostIdentityActivator interface {
 }
 
 type LocalOperationsConfig struct {
-	Target        Target
-	Readiness     *guest.ReadinessReporter
-	WorkspaceRoot string
-	HomeRoot      string
-	CacheRoot     string
-	PlatformRoot  string
-	SSHDRoot      string
-	DevUID        int
-	DevGID        int
+	Target           Target
+	Readiness        *guest.ReadinessReporter
+	WorkspaceRoot    string
+	HomeRoot         string
+	CacheRoot        string
+	PlatformRoot     string
+	SSHDRoot         string
+	DevUID           int
+	DevGID           int
+	AgentExecutables []string
 
 	HostIdentityGenerator guest.SSHHostIdentityGenerator
 	HostIdentityActivator SSHHostIdentityActivator
@@ -76,6 +77,15 @@ func NewLocalOperations(config LocalOperationsConfig) (*LocalOperations, error) 
 			return nil, fmt.Errorf("construct local guest operations: %s root is required", name)
 		}
 	}
+	if len(config.AgentExecutables) == 0 {
+		return nil, errors.New("construct local guest operations: selected agent executables are required")
+	}
+	for _, executable := range config.AgentExecutables {
+		if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
+			return nil, errors.New("construct local guest operations: selected agent executable paths must be absolute and clean")
+		}
+	}
+	config.AgentExecutables = append([]string(nil), config.AgentExecutables...)
 	return &LocalOperations{config: config}, nil
 }
 
@@ -225,6 +235,40 @@ func (operations *LocalOperations) ApplyMaterialization(ctx context.Context, req
 		return nil, err
 	}
 	return results, nil
+}
+
+func (operations *LocalOperations) ValidateToolchain(_ context.Context, target Target) error {
+	if err := operations.validateTarget(target); err != nil {
+		return err
+	}
+	if err := validateAgentExecutables(operations.config.AgentExecutables); err != nil {
+		return permanentOperationError(fmt.Errorf("validate selected agent toolchain: %w", err))
+	}
+	return nil
+}
+
+func validateAgentExecutables(paths []string) error {
+	if len(paths) == 0 {
+		return errors.New("at least one selected agent executable is required")
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, executable := range paths {
+		if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
+			return fmt.Errorf("agent executable path %q is not absolute and clean", executable)
+		}
+		if _, duplicate := seen[executable]; duplicate {
+			return fmt.Errorf("agent executable path %q is duplicated", executable)
+		}
+		seen[executable] = struct{}{}
+		info, err := os.Stat(executable)
+		if err != nil {
+			return fmt.Errorf("inspect agent executable %q: %w", executable, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("agent executable %q is not an executable file", executable)
+		}
+	}
+	return nil
 }
 
 type readGrantProvider struct {

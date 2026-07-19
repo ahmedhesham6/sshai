@@ -170,7 +170,7 @@ func TestEnsureRuntimeInventoriesAllocationBeforeAttachingPersistentData(t *test
 	if err != nil {
 		t.Fatalf("EnsureRuntime(): %v", err)
 	}
-	if runtime.Provider != "aws" || runtime.ProviderID != "i-runtime" || runtime.SystemVolumeProviderID != "vol-system" || runtime.PrivateIPv4 != "" || runtime.State != provider.RuntimeStatePending || runtime.RuntimeID != "runtime-1" {
+	if runtime.Provider != "aws" || runtime.ProviderID != "i-runtime" || runtime.SystemVolumeProviderID != "" || runtime.PrivateIPv4 != "" || runtime.State != provider.RuntimeStatePending || runtime.RuntimeID != "runtime-1" {
 		t.Fatalf("Runtime = %#v", runtime)
 	}
 	assertRuntimeLaunchInput(t, client.runInput)
@@ -178,8 +178,12 @@ func TestEnsureRuntimeInventoriesAllocationBeforeAttachingPersistentData(t *test
 		t.Fatalf("EnsureRuntime attached Data Volume before allocation was inventoried: %#v", client.attachInput)
 	}
 	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
-	if _, err := adapter.EnsureRuntimeDataVolumeAttachment(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: runtime.ProviderID}); err != nil {
+	attached, err := adapter.EnsureRuntimeDataVolumeAttachment(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: runtime.ProviderID})
+	if err != nil {
 		t.Fatalf("EnsureRuntimeDataVolumeAttachment(): %v", err)
+	}
+	if attached.SystemVolumeProviderID != "vol-system" {
+		t.Fatalf("attached Runtime system volume = %q, want %q", attached.SystemVolumeProviderID, "vol-system")
 	}
 	if client.attachInput == nil || aws.ToString(client.attachInput.InstanceId) != "i-runtime" || aws.ToString(client.attachInput.VolumeId) != "vol-data" || aws.ToString(client.attachInput.Device) != "/dev/sdf" {
 		t.Fatalf("AttachVolume input = %#v", client.attachInput)

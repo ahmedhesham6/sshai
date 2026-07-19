@@ -107,7 +107,13 @@ func run(ctx context.Context) error {
 	runtimeActions := &runtimeWorkflowActions{store: store, now: time.Now}
 	snapshots := newAutoStopSnapshotSource(store)
 	dataVolumes := runtimeDataVolumeVerifier{store: store}
-	guest, err := newRuntimeGuestTransport(config.guestControl)
+	guest, err := newRuntimeGuestTransport(config.guestControl, guestTransportDependencies{
+		projectSeeds: storedProjectSeedSource{
+			metadata: store,
+			objects:  s3ProjectSeedObjectSource{client: capsuleClient, bucket: config.capsuleBucket},
+		},
+		capsuleGrants: capsuleMaterializationGrantSource{provider: grantProvider},
+	})
 	if err != nil {
 		return fmt.Errorf("construct guest control transport: %w", err)
 	}

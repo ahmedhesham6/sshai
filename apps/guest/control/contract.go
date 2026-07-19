@@ -18,6 +18,7 @@ const (
 	managedConfigurationPath   = "/v1/managed-configuration/reconcile"
 	shutdownPath               = "/v1/shutdown/prepare"
 	materializationPath        = "/v1/materialization/apply"
+	toolchainValidationPath    = "/v1/toolchain/validate"
 	activitySnapshotPath       = "/v1/activity-snapshot"
 	defaultMaximumRequestBytes = 1 << 30
 )
@@ -96,6 +97,7 @@ type Operations interface {
 	ReconcileManagedConfiguration(context.Context, Target) error
 	PrepareShutdown(context.Context, Target) error
 	ApplyMaterialization(context.Context, MaterializationRequest) ([]profile.ProfileMaterializationResult, error)
+	ValidateToolchain(context.Context, Target) error
 	ReadActivitySnapshot(context.Context, Target) (ActivitySnapshot, error)
 }
 

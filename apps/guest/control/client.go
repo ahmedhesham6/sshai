@@ -158,6 +158,10 @@ func (client *Client) ApplyMaterialization(ctx context.Context, request Material
 	return response.Results, err
 }
 
+func (client *Client) ValidateToolchain(ctx context.Context, target Target) error {
+	return client.post(ctx, target, toolchainValidationPath, targetRequest{Target: target}, &emptyResponse{})
+}
+
 func (client *Client) ReadActivitySnapshot(ctx context.Context, target Target) (ActivitySnapshot, error) {
 	var response activitySnapshotResponse
 	err := client.post(ctx, target, activitySnapshotPath, targetRequest{Target: target}, &response)

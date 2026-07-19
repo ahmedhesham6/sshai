@@ -114,6 +114,7 @@ func (provider *S3GrantProvider) Grant(ctx context.Context, request GrantRequest
 		client := provider.httpClient
 		return Grant{
 			ExpiresAt: expiresAt,
+			URL:       signed.URL,
 			Read: func(ctx context.Context) (io.ReadCloser, error) {
 				return presignedRead(ctx, client, signed)
 			},

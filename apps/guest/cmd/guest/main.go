@@ -32,8 +32,9 @@ import (
 )
 
 const (
-	maximumRequestDuration = 10 * time.Minute
-	gracefulStopDuration   = 11 * time.Minute
+	maximumRequestDuration  = 10 * time.Minute
+	gracefulStopDuration    = 11 * time.Minute
+	defaultAgentExecutables = "/usr/local/bin/claude,/usr/local/bin/codex,/usr/local/bin/opencode"
 )
 
 func main() {
@@ -103,6 +104,7 @@ func run(ctx context.Context) error {
 		},
 		SSHKeys:              optionalSSHKeySource(config.authorizedKeysFile),
 		ManagedConfiguration: optionalManagedConfigurationSource(config.managedConfigurationFile),
+		AgentExecutables:     splitList(config.agentExecutables),
 		Activity:             observer,
 		Shutdown: func(context.Context) error {
 			syscall.Sync()
@@ -180,6 +182,7 @@ type config struct {
 	claudeExecutables        string
 	protectedExecutables     string
 	selectedContainers       string
+	agentExecutables         string
 }
 
 func loadConfig() (config, error) {
@@ -219,6 +222,7 @@ func loadConfig() (config, error) {
 		activitySampleFile: os.Getenv("GUEST_ACTIVITY_SAMPLE_FILE"),
 		codexExecutables:   os.Getenv("GUEST_CODEX_EXECUTABLES"), claudeExecutables: os.Getenv("GUEST_CLAUDE_EXECUTABLES"),
 		protectedExecutables: os.Getenv("GUEST_PROTECTED_EXECUTABLES"), selectedContainers: os.Getenv("GUEST_SELECTED_CONTAINERS"),
+		agentExecutables: valueOrDefault("GUEST_AGENT_EXECUTABLES", defaultAgentExecutables),
 	}
 	if value.listenAddress == "" {
 		value.listenAddress = net.JoinHostPort(value.target.PrivateIPv4, "9443")

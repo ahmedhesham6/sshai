@@ -21,15 +21,46 @@ type guestControlConfig struct {
 type runtimeGuestTransport interface {
 	workflows.RuntimeGuestReadinessSource
 	workflows.RuntimeSSHKeyReconciler
+	workflows.RuntimeSSHHostIdentityReconciler
 	workflows.RuntimeManagedConfigurationReconciler
 	workflows.RuntimeGuestShutdownPreparer
+	workflows.EnvironmentSSHIdentityRestorer
+	workflows.EnvironmentProjectSeedApplicator
+	workflows.EnvironmentCapsuleMaterializer
+	workflows.EnvironmentToolchainValidator
+}
+
+type guestControlClient interface {
+	ReadReadiness(context.Context, guestcontrol.Target) (guestcontrol.ReadinessStatus, error)
+	ApplyProjectSeed(context.Context, guestcontrol.ProjectSeedRequest) error
+	RestoreSSHHostIdentity(context.Context, guestcontrol.Target) (guest.SSHHostIdentityStatus, error)
+	ReconcileSSHKeys(context.Context, guestcontrol.Target) error
+	ReconcileManagedConfiguration(context.Context, guestcontrol.Target) error
+	PrepareShutdown(context.Context, guestcontrol.Target) error
+	ApplyMaterialization(context.Context, guestcontrol.MaterializationRequest) ([]profile.ProfileMaterializationResult, error)
+	ValidateToolchain(context.Context, guestcontrol.Target) error
+}
+
+type environmentProjectSeedSource interface {
+	LoadProjectSeedApplication(context.Context, string, string, string) (guest.ProjectSeedApplicationInput, error)
+}
+
+type environmentCapsuleGrantSource interface {
+	MaterializationReadGrants(context.Context, string, workflows.EnvironmentCapsuleState) (map[string]guestcontrol.ReadGrant, error)
+}
+
+type guestTransportDependencies struct {
+	projectSeeds  environmentProjectSeedSource
+	capsuleGrants environmentCapsuleGrantSource
 }
 
 type configuredGuestTransport struct {
-	client *guestcontrol.Client
+	client        guestControlClient
+	projectSeeds  environmentProjectSeedSource
+	capsuleGrants environmentCapsuleGrantSource
 }
 
-func newRuntimeGuestTransport(config guestControlConfig) (runtimeGuestTransport, error) {
+func newRuntimeGuestTransport(config guestControlConfig, provided ...guestTransportDependencies) (runtimeGuestTransport, error) {
 	if config.serverName != "" && config.certificateDirectory == "" && config.privateKeyDirectory == "" && config.caFile == "" {
 		return nil, errors.New("GUEST_CONTROL_TLS_SERVER_NAME requires guest control TLS configuration")
 	}
@@ -55,7 +86,10 @@ func newRuntimeGuestTransport(config guestControlConfig) (runtimeGuestTransport,
 	if err != nil {
 		return nil, err
 	}
-	return &configuredGuestTransport{client: client}, nil
+	if len(provided) != 1 || provided[0].projectSeeds == nil || provided[0].capsuleGrants == nil {
+		return nil, errors.New("configured guest control requires Project Seed and Capsule grant sources")
+	}
+	return &configuredGuestTransport{client: client, projectSeeds: provided[0].projectSeeds, capsuleGrants: provided[0].capsuleGrants}, nil
 }
 
 func (transport *configuredGuestTransport) WaitForRuntimeReady(ctx context.Context, request workflows.RuntimeGuestReadinessRequest) (workflows.RuntimeGuestReadiness, error) {
@@ -73,6 +107,11 @@ func (transport *configuredGuestTransport) ReconcileRuntimeSSHKeys(ctx context.C
 	return transport.client.ReconcileSSHKeys(ctx, guestTarget(request))
 }
 
+func (transport *configuredGuestTransport) RestoreRuntimeSSHHostIdentity(ctx context.Context, request workflows.RuntimeGuestReadinessRequest) error {
+	_, err := transport.client.RestoreSSHHostIdentity(ctx, guestTarget(request))
+	return err
+}
+
 func (transport *configuredGuestTransport) ReconcileRuntimeManagedConfiguration(ctx context.Context, request workflows.RuntimeGuestReadinessRequest) error {
 	return transport.client.ReconcileManagedConfiguration(ctx, guestTarget(request))
 }
@@ -81,14 +120,35 @@ func (transport *configuredGuestTransport) PrepareRuntimeShutdown(ctx context.Co
 	return transport.client.PrepareShutdown(ctx, guestTarget(request))
 }
 
-// ApplyProjectSeed and ApplyMaterialization expose the create-workflow guest
-// contracts without changing environment_create's current dependency shape.
-func (transport *configuredGuestTransport) ApplyProjectSeed(ctx context.Context, request guestcontrol.ProjectSeedRequest) error {
-	return transport.client.ApplyProjectSeed(ctx, request)
+func (transport *configuredGuestTransport) RestoreEnvironmentSSHIdentity(ctx context.Context, request workflows.EnvironmentCreateGuestRequest) error {
+	_, err := transport.client.RestoreSSHHostIdentity(ctx, guestTarget(request.RuntimeGuestReadinessRequest))
+	return err
 }
 
-func (transport *configuredGuestTransport) ApplyMaterialization(ctx context.Context, request guestcontrol.MaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
-	return transport.client.ApplyMaterialization(ctx, request)
+func (transport *configuredGuestTransport) EnsureEnvironmentProjectSeedApplied(ctx context.Context, request workflows.EnvironmentProjectSeedRequest) error {
+	seed, err := transport.projectSeeds.LoadProjectSeedApplication(ctx, request.Guest.OwnerUserID, request.Guest.EnvironmentID, request.ProjectSeedID)
+	if err != nil {
+		return err
+	}
+	return transport.client.ApplyProjectSeed(ctx, guestcontrol.ProjectSeedRequest{
+		Target: guestTarget(request.Guest.RuntimeGuestReadinessRequest), Seed: seed,
+	})
+}
+
+func (transport *configuredGuestTransport) EnsureEnvironmentCapsuleMaterialized(ctx context.Context, request workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+	grants, err := transport.capsuleGrants.MaterializationReadGrants(ctx, request.Guest.OwnerUserID, request.State)
+	if err != nil {
+		return nil, err
+	}
+	return transport.client.ApplyMaterialization(ctx, guestcontrol.MaterializationRequest{
+		Target: guestTarget(request.Guest.RuntimeGuestReadinessRequest), Lock: request.State.CapsuleLock,
+		OwnerID: request.Guest.OwnerUserID, Intent: profile.IntentReconcile,
+		Installed: request.State.Materializations, ReadGrants: grants,
+	})
+}
+
+func (transport *configuredGuestTransport) ValidateEnvironmentToolchain(ctx context.Context, request workflows.EnvironmentCreateGuestRequest) error {
+	return transport.client.ValidateToolchain(ctx, guestTarget(request.RuntimeGuestReadinessRequest))
 }
 
 func guestTarget(request workflows.RuntimeGuestReadinessRequest) guestcontrol.Target {

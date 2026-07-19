@@ -4,11 +4,33 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	capsuleoci "github.com/ahmedhesham6/sshai/libs/capsule/oci"
 )
+
+func TestValidateAgentExecutablesRequiresPinnedExecutableFiles(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "claude")
+	nonExecutable := filepath.Join(root, "codex")
+	if err := os.WriteFile(executable, []byte("agent"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nonExecutable, []byte("agent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAgentExecutables([]string{executable}); err != nil {
+		t.Fatalf("validate executable agent: %v", err)
+	}
+	for _, path := range []string{nonExecutable, filepath.Join(root, "missing")} {
+		if err := validateAgentExecutables([]string{path}); err == nil {
+			t.Fatalf("validateAgentExecutables(%q) error = nil", path)
+		}
+	}
+}
 
 func TestGrantHTTPErrorClassification(t *testing.T) {
 	for _, test := range []struct {

@@ -138,6 +138,8 @@ func (server *server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		defer server.endMutation()
 		results, err := server.operations.ApplyMaterialization(request.Context(), input)
 		server.writeResult(response, materializationResponse{Results: results}, err)
+	case toolchainValidationPath:
+		server.runTargetOperation(response, request, false, server.operations.ValidateToolchain)
 	case activitySnapshotPath:
 		var input targetRequest
 		if !server.decode(response, request, &input) || !server.authorize(response, input.Target) {

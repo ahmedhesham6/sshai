@@ -125,6 +125,36 @@ func (store *Store) RegisterProjectSeed(ctx context.Context, candidate domain.Pr
 	return seed, nil
 }
 
+// LoadEnvironmentProjectSeed returns only a Project Seed claimed by the
+// requested owner and Environment. The combined predicate keeps workflow
+// payload construction on the same Environment-claim boundary as the guest
+// control request itself.
+func (store *Store) LoadEnvironmentProjectSeed(ctx context.Context, ownerUserID, environmentID, projectSeedID string) (domain.ProjectSeedSnapshot, error) {
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(environmentID) == "" || strings.TrimSpace(projectSeedID) == "" {
+		return domain.ProjectSeedSnapshot{}, ErrReferenceNotOwned
+	}
+	row, err := store.queries.GetEnvironmentProjectSeed(ctx, dbsql.GetEnvironmentProjectSeedParams{
+		ID: projectSeedID, OwnerUserID: ownerUserID, EnvironmentID: &environmentID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ProjectSeedSnapshot{}, ErrReferenceNotOwned
+	}
+	if err != nil {
+		return domain.ProjectSeedSnapshot{}, fmt.Errorf("load Environment Project Seed: %w", err)
+	}
+	seed, err := domain.RegisterProjectSeed(domain.ProjectSeedSnapshot{
+		ID: row.ID, OwnerUserID: row.OwnerUserID, RepositoryURL: row.RepositoryUrl,
+		BaseRevision: row.BaseRevision, Digest: row.Digest,
+		GitBundleDigest: optionalStringValue(row.GitBundleDigest), TrackedPatchDigest: optionalStringValue(row.TrackedPatchDigest),
+		UntrackedBundleDigest: optionalStringValue(row.UntrackedBundleDigest), ManifestDigest: row.ManifestDigest,
+		CreatedAt: row.CreatedAt.Time,
+	})
+	if err != nil {
+		return domain.ProjectSeedSnapshot{}, fmt.Errorf("load Environment Project Seed: restore: %w", err)
+	}
+	return seed.Snapshot(), nil
+}
+
 func projectSeedInputFromSnapshot(snapshot domain.ProjectSeedSnapshot) projectSeedInput {
 	return projectSeedInput{
 		RepositoryURL: snapshot.RepositoryURL, BaseRevision: snapshot.BaseRevision, Digest: snapshot.Digest,

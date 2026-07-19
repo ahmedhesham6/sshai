@@ -36,9 +36,11 @@ func TestRuntimeReplaceStoppedRuntimeReattachesOnlyAfterObservedDetachment(t *te
 	}
 	retireIndex := eventIndex(harness.provider.events, "retire-old")
 	detachedIndex := eventIndex(harness.provider.events, "observe-detached")
-	ensureIndex := eventIndex(harness.provider.events, "ensure-new-rw")
-	if retireIndex < 0 || detachedIndex <= retireIndex || ensureIndex <= detachedIndex {
-		t.Fatalf("provider ordering = %v, want retire < detached observation < new RW attach", harness.provider.events)
+	ensureIndex := eventIndex(harness.provider.events, "ensure-new-allocation")
+	persistIndex := eventIndex(harness.provider.events, "persist-new-provider-identity")
+	attachIndex := eventIndex(harness.provider.events, "attach-new-rw")
+	if retireIndex < 0 || detachedIndex <= retireIndex || ensureIndex <= detachedIndex || persistIndex <= ensureIndex || attachIndex <= persistIndex {
+		t.Fatalf("provider ordering = %v, want retire < detached observation < allocation < persisted identity < new RW attachment", harness.provider.events)
 	}
 	if harness.usage.openCalls != 1 || harness.usage.openInputs[0].RuntimeID != "runtime-2" {
 		t.Fatalf("replacement usage opens = %#v", harness.usage.openInputs)
@@ -195,10 +197,11 @@ func newRuntimeReplaceHarness(ready bool) *runtimeReplaceHarness {
 		providerState = provider.RuntimeStateRunning
 		usageID = "usage-old"
 	}
-	actions := &runtimeReplaceActionsFake{state: RuntimeOperationState{OwnerUserID: "user-1", Runtime: snapshot, DataVolumeProviderID: "volume-1", ComputeUsageIntervalID: usageID}, current: snapshot, rows: map[string]domain.RuntimeSnapshot{"runtime-1": snapshot}}
+	providerFake := &runtimeReplaceProviderFake{old: provider.Runtime{RuntimeSpec: providerSpec(), Provider: "aws", ProviderID: "instance-1", SystemVolumeProviderID: "volume-system-1", PrivateIPv4: "10.0.0.7", State: providerState}}
+	actions := &runtimeReplaceActionsFake{state: RuntimeOperationState{OwnerUserID: "user-1", Runtime: snapshot, DataVolumeProviderID: "volume-1", ComputeUsageIntervalID: usageID}, current: snapshot, rows: map[string]domain.RuntimeSnapshot{"runtime-1": snapshot}, provider: providerFake}
 	return &runtimeReplaceHarness{
 		actions:  actions,
-		provider: &runtimeReplaceProviderFake{old: provider.Runtime{RuntimeSpec: providerSpec(), Provider: "aws", ProviderID: "instance-1", SystemVolumeProviderID: "volume-system-1", PrivateIPv4: "10.0.0.7", State: providerState}},
+		provider: providerFake,
 		volume:   &runtimeVolumeFake{expectedOwnerID: "user-1"}, images: &runtimeReplaceImageFake{image: "image-v2"},
 		usage: &runtimeUsageFake{expectedOwnerID: "user-1"}, guest: &runtimeGuestFake{expectedOwnerID: "user-1", readiness: RuntimeGuestReadiness{BootID: "boot-replacement", PrivateIPv4: "10.0.0.9", DataMounted: true}},
 		auto: &runtimeAutoStopFake{}, ids: &runtimeReplaceIDs{values: []string{"runtime-2", "resource-runtime-2", "resource-system-2", "usage-new"}}, clock: time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC),
@@ -227,6 +230,7 @@ type runtimeReplaceActionsFake struct {
 	completeCalls, failureCalls int
 	inventoryCalls              int
 	failureCode, startDecision  string
+	provider                    *runtimeReplaceProviderFake
 }
 
 func (fake *runtimeReplaceActionsFake) LoadRuntimeOperation(context.Context, domain.RuntimeOperationDispatch, string, time.Time) (RuntimeOperationState, error) {
@@ -266,6 +270,9 @@ func (fake *runtimeReplaceActionsFake) PersistReplacementRuntimeTransition(_ con
 		return errors.New("stale replacement Runtime transition")
 	}
 	fake.current, fake.state.Runtime, fake.rows[next.ID] = next, next, next
+	if next.ProviderInstanceRef != nil && fake.provider != nil && eventIndex(fake.provider.events, "persist-new-provider-identity") < 0 {
+		fake.provider.events = append(fake.provider.events, "persist-new-provider-identity")
+	}
 	return nil
 }
 func (fake *runtimeReplaceActionsFake) CompleteRuntimeOperation(context.Context, string, time.Time) error {
@@ -335,11 +342,22 @@ func (fake *runtimeReplaceProviderFake) EnsureRuntime(_ context.Context, request
 	if fake.detachmentReads < 2 {
 		return provider.Runtime{}, errors.New("new RW attachment preceded old detachment observation")
 	}
-	fake.events = append(fake.events, "ensure-new-rw")
+	fake.events = append(fake.events, "ensure-new-allocation")
 	if fake.ensureErr != nil {
 		return provider.Runtime{}, fake.ensureErr
 	}
-	fake.new = provider.Runtime{RuntimeSpec: request.RuntimeSpec, Provider: "aws", ProviderID: "instance-2", SystemVolumeProviderID: "volume-system-2", State: provider.RuntimeStatePending}
+	fake.new = provider.Runtime{RuntimeSpec: request.RuntimeSpec, Provider: "aws", ProviderID: "instance-2", State: provider.RuntimeStatePending}
+	return fake.new, nil
+}
+func (fake *runtimeReplaceProviderFake) EnsureRuntimeDataVolumeAttachment(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	if eventIndex(fake.events, "persist-new-provider-identity") < 0 {
+		return provider.Runtime{}, errors.New("replacement data attachment preceded persisted provider identity")
+	}
+	if request.RuntimeSpec != fake.new.RuntimeSpec || request.ProviderID != fake.new.ProviderID {
+		return provider.Runtime{}, errors.New("wrong replacement attachment identity")
+	}
+	fake.events = append(fake.events, "attach-new-rw")
+	fake.new.SystemVolumeProviderID = "volume-system-2"
 	return fake.new, nil
 }
 func (fake *runtimeReplaceProviderFake) StartRuntime(context.Context, provider.RuntimeLifecycleRequest) (provider.Runtime, error) {

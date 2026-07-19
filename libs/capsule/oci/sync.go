@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -55,8 +56,67 @@ type Grant struct {
 	// ExpiresAt is the capability expiry, when the provider knows it. A zero
 	// value means the provider did not supply expiry metadata.
 	ExpiresAt time.Time
-	Read      func(context.Context) (io.ReadCloser, error)
-	Write     func(context.Context, io.Reader, int64) error
+	// URL carries a serializable read capability when the provider is backed by
+	// a presigned URL. Callers must never include it in errors or logs.
+	URL   string
+	Read  func(context.Context) (io.ReadCloser, error)
+	Write func(context.Context, io.Reader, int64) error
+}
+
+// CapsuleReadKeys resolves the exact owner-scoped index and blob keys needed
+// to pull the requested Capsule digests. It reads only each bounded index and
+// image manifest; config and layer content remains guest-fetched through the
+// returned per-object capabilities.
+func CapsuleReadKeys(ctx context.Context, ownerID string, capsuleDigests []string, grants GrantProvider) ([]string, error) {
+	client, err := NewClient(ownerID, grants)
+	if err != nil {
+		return nil, err
+	}
+	seenCapsules := make(map[string]struct{}, len(capsuleDigests))
+	seenKeys := make(map[string]struct{})
+	for _, capsuleDigest := range capsuleDigests {
+		if _, duplicate := seenCapsules[capsuleDigest]; duplicate {
+			continue
+		}
+		seenCapsules[capsuleDigest] = struct{}{}
+		target, err := parseSHA256Digest(capsuleDigest)
+		if err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: target digest: %w", err)
+		}
+		indexKey := IndexKey(ownerID, target.String())
+		indexBytes, err := client.readObject(ctx, indexKey, maxIndexSize)
+		if err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: fetch OCI index: %w", err)
+		}
+		manifestDescriptor, err := findManifestDescriptor(indexBytes, target.String())
+		if err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: resolve target %s: %w", target, err)
+		}
+		manifestKey := ManifestKey(ownerID, manifestDescriptor.Digest.String())
+		manifestBytes, err := client.readObjectAsBlob(ctx, manifestKey, manifestDescriptor)
+		if err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: fetch image manifest: %w", err)
+		}
+		var imageManifest ocispec.Manifest
+		if err := json.Unmarshal(manifestBytes, &imageManifest); err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: decode image manifest: %w", err)
+		}
+		if imageManifest.MediaType != ocispec.MediaTypeImageManifest || imageManifest.ArtifactType != capsule.ArtifactMediaType || imageManifest.Config.MediaType != ConfigMediaType {
+			return nil, errors.New("discover Capsule read keys: remote object is not a Capsule image manifest")
+		}
+		seenKeys[indexKey] = struct{}{}
+		seenKeys[manifestKey] = struct{}{}
+		seenKeys[BlobKey(ownerID, imageManifest.Config.Digest.String())] = struct{}{}
+		for _, layer := range imageManifest.Layers {
+			seenKeys[BlobKey(ownerID, layer.Digest.String())] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(seenKeys))
+	for key := range seenKeys {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 // GrantProvider mints one short-lived capability for an owner-scoped object.

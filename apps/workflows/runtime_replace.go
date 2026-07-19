@@ -244,7 +244,8 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 	}
 
 	// Step 6: the preceding terminal old-runtime observation is the explicit
-	// safety gate. EnsureRuntime may now create compute and attach the data RW.
+	// safety gate. Allocation happens first so its provider identity can be
+	// durably persisted before the separate data-volume attachment side effect.
 	ensureRequest := provider.EnsureRuntimeRequest{RuntimeSpec: provider.RuntimeSpec{
 		RuntimeID: replacement.ID, EnvironmentID: replacement.EnvironmentID, Sequence: replacement.Sequence,
 		Region: replacement.Region, AvailabilityZone: replacement.AvailabilityZone,
@@ -262,21 +263,11 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 	if ensured.Failure != "" {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, ensured.FailureCode, ensured.Failure)
 	}
-	if ensured.Runtime.RuntimeSpec != ensureRequest.RuntimeSpec || ensured.Runtime.Provider == "" || ensured.Runtime.ProviderID == "" || ensured.Runtime.SystemVolumeProviderID == "" {
+	if ensured.Runtime.RuntimeSpec != ensureRequest.RuntimeSpec || ensured.Runtime.Provider == "" || ensured.Runtime.ProviderID == "" {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, string(provider.ErrorCodeResourceDiverged), "replacement Runtime provider identity diverged")
 	}
 	if ensured.Runtime.State != provider.RuntimeStatePending && ensured.Runtime.State != provider.RuntimeStateRunning {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, string(provider.ErrorCodeResourceDiverged), fmt.Sprintf("replacement Runtime provider state is %q", ensured.Runtime.State))
-	}
-	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
-		return classifyDurableError(dependencies.Actions.InventoryReplacementRuntimeResources(runCtx, input.OperationID, dbstore.RuntimeProviderResourceInventory{
-			RuntimeID: replacement.ID, RuntimeResourceID: identity.RuntimeResourceID,
-			SystemVolumeResourceID: identity.SystemVolumeResourceID,
-			RuntimeProviderID:      ensured.Runtime.ProviderID, SystemVolumeProviderID: ensured.Runtime.SystemVolumeProviderID,
-			Provider: ensured.Runtime.Provider, CreatedAt: identity.CreatedAt,
-		}))
-	}, restate.WithName("inventory-replacement-provider-resources")); err != nil {
-		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, RuntimeReplaceFailed, err.Error())
 	}
 	next, err := domain.RestoreRuntime(replacement)
 	if err != nil {
@@ -289,6 +280,35 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 	replacement, err = persistReplacementRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "provision-replacement-runtime", replacement, provisioned)
 	if err != nil {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, RuntimeReplaceFailed, err.Error())
+	}
+	lifecycleRequest := provider.RuntimeLifecycleRequest{RuntimeSpec: ensureRequest.RuntimeSpec, ProviderID: ensured.Runtime.ProviderID}
+	attached, err := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
+		runtime, attachErr := dependencies.Provider.EnsureRuntimeDataVolumeAttachment(runCtx, lifecycleRequest)
+		outcome, outcomeErr := providerOutcome(runtime, attachErr)
+		return timestampProviderOutcome(outcome, outcomeErr, dependencies.Now())
+	}, restate.WithName("ensure-replacement-runtime-data-volume-attachment"))
+	if err != nil {
+		return RuntimeReplaceOutput{}, err
+	}
+	if attached.Failure != "" {
+		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, attached.FailureCode, attached.Failure)
+	}
+	if err := validateProviderRuntimeIdentity(attached.Runtime, lifecycleRequest); err != nil {
+		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, string(provider.ErrorCodeResourceDiverged), err.Error())
+	}
+	if attached.Runtime.Provider == "" || attached.Runtime.SystemVolumeProviderID == "" ||
+		(attached.Runtime.State != provider.RuntimeStatePending && attached.Runtime.State != provider.RuntimeStateRunning) {
+		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, string(provider.ErrorCodeResourceDiverged), "replacement Runtime attachment identity diverged")
+	}
+	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
+		return classifyDurableError(dependencies.Actions.InventoryReplacementRuntimeResources(runCtx, input.OperationID, dbstore.RuntimeProviderResourceInventory{
+			RuntimeID: replacement.ID, RuntimeResourceID: identity.RuntimeResourceID,
+			SystemVolumeResourceID: identity.SystemVolumeResourceID,
+			RuntimeProviderID:      attached.Runtime.ProviderID, SystemVolumeProviderID: attached.Runtime.SystemVolumeProviderID,
+			Provider: attached.Runtime.Provider, CreatedAt: identity.CreatedAt,
+		}))
+	}, restate.WithName("inventory-replacement-provider-resources")); err != nil {
+		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, RuntimeReplaceFailed, err.Error())
 	}
 	next, _ = domain.RestoreRuntime(replacement)
 	startRequestedAt, err := durableWorkflowTime(ctx, "record-replacement-start-requested-at", dependencies.Now)
@@ -322,8 +342,8 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, RuntimeReplaceFailed, "Compute Usage Interval ownership diverged")
 	}
 
-	request := provider.RuntimeLifecycleRequest{RuntimeSpec: ensureRequest.RuntimeSpec, ProviderID: ensured.Runtime.ProviderID}
-	running, err := waitForProviderState(ctx, dependencies.Provider, request, ensured, provider.RuntimeStateRunning, provider.RuntimeStatePending, "wait-replacement-runtime-running", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout, dependencies.Now)
+	request := lifecycleRequest
+	running, err := waitForProviderState(ctx, dependencies.Provider, request, attached, provider.RuntimeStateRunning, provider.RuntimeStatePending, "wait-replacement-runtime-running", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout, dependencies.Now)
 	if err != nil {
 		return RuntimeReplaceOutput{}, err
 	}

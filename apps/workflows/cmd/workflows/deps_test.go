@@ -397,6 +397,8 @@ func newMemoryGrantProvider() *memoryGrantProvider {
 
 func (provider *memoryGrantProvider) Grant(_ context.Context, request oci.GrantRequest) (oci.Grant, error) {
 	return oci.Grant{
+		URL:       "https://capsules.example.test/read",
+		ExpiresAt: time.Now().Add(time.Minute),
 		Read: func(context.Context) (io.ReadCloser, error) {
 			provider.mu.Lock()
 			data, ok := provider.objects[request.Key]

@@ -83,6 +83,9 @@ func TestClientAndServerRoundTrip(t *testing.T) {
 			}
 			return err
 		}},
+		{name: "agent toolchain validation", run: func() error {
+			return client.ValidateToolchain(context.Background(), target)
+		}},
 		{name: "shutdown preparation", run: func() error { return client.PrepareShutdown(context.Background(), target) }},
 		{name: "Activity Snapshot", run: func() error {
 			snapshot, err := client.ReadActivitySnapshot(context.Background(), target)
@@ -423,6 +426,8 @@ func (*fakeOperations) ReconcileSSHKeys(context.Context, control.Target) error {
 func (*fakeOperations) ReconcileManagedConfiguration(context.Context, control.Target) error {
 	return nil
 }
+
+func (*fakeOperations) ValidateToolchain(context.Context, control.Target) error { return nil }
 
 func (*fakeOperations) PrepareShutdown(context.Context, control.Target) error { return nil }
 

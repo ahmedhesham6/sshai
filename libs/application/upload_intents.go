@@ -190,14 +190,16 @@ func (service *UploadIntentService) Verify(ctx context.Context, input VerifyUplo
 		observed.VersionID == "" {
 		return VerifiedUpload{}, ErrUploadNotVerified
 	}
-	finalKey := finalizedUploadObjectKey(snapshot.OwnerUserID, snapshot.Kind, snapshot.Digest)
+	finalKey := FinalizedUploadObjectKey(snapshot.OwnerUserID, snapshot.Kind, snapshot.Digest)
 	if err := service.finalizer.FinalizeUpload(ctx, observed, finalKey); err != nil {
 		return VerifiedUpload{}, fmt.Errorf("verify upload: finalize immutable object: %w", err)
 	}
 	return VerifiedUpload{Intent: intent, ObjectKey: finalKey}, nil
 }
 
-func finalizedUploadObjectKey(ownerID string, kind domain.UploadKind, digest string) string {
+// FinalizedUploadObjectKey is the immutable object location shared by upload
+// finalization and owner-scoped Project Seed delivery.
+func FinalizedUploadObjectKey(ownerID string, kind domain.UploadKind, digest string) string {
 	ownerDigest := sha256.Sum256([]byte(ownerID))
 	return fmt.Sprintf("objects/%x/%s/%s", ownerDigest, kind, strings.TrimPrefix(digest, "sha256:"))
 }
