@@ -6,6 +6,10 @@
 // again, exactly as before this protocol existed.
 package connection
 
+// IntentHeader carries the opaque, single-use Connection Intent identity on
+// the authenticated WebSocket upgrade request.
+const IntentHeader = "X-Connection-Intent-ID"
+
 // ControlFrameType enumerates the pre-bridge text frames.
 type ControlFrameType string
 

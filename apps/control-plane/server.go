@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -79,6 +80,16 @@ type BillingReader interface {
 	Subscription(context.Context, string) (db.SubscriptionProjection, bool, error)
 }
 
+type ConnectionIntentRepository interface {
+	CreateOrReplayConnectionIntent(
+		context.Context,
+		string, string, string,
+		time.Time, time.Time,
+		func(context.Context) (*string, error),
+		func() string,
+	) (db.ConnectionIntentRecord, error)
+}
+
 type Config struct {
 	CreateEnvironment   *application.CreateEnvironmentService
 	RuntimeCommands     *application.RuntimeCommandService
@@ -91,8 +102,12 @@ type Config struct {
 	Users               UserProjection
 	UserIDs             application.IDGenerator
 	RequestIDs          application.IDGenerator
+	ConnectionIntentIDs application.IDGenerator
+	ConnectionIntents   ConnectionIntentRepository
 	DefaultRegion       string
 	Now                 func() time.Time
+	RegionalProxyURLs   map[string]string
+	ConnectionIntentTTL time.Duration
 	CapsulePresigner    CapsulePresigner
 	CapsuleOwnership    CapsuleOwnership
 	CapsuleBucket       string
@@ -117,6 +132,10 @@ type server struct {
 	capsuleBucket       string
 	capsuleAccessTTL    time.Duration
 	now                 func() time.Time
+	connectionIntentIDs application.IDGenerator
+	connectionIntents   ConnectionIntentRepository
+	regionalProxyURLs   map[string]*url.URL
+	connectionIntentTTL time.Duration
 	environmentReads    EnvironmentReader
 	operationReads      OperationReader
 	profileReads        ProfileReader
@@ -124,13 +143,25 @@ type server struct {
 }
 
 func NewHandler(config Config) http.Handler {
+	regionalProxyURLs, err := parseRegionalProxyURLs(config.RegionalProxyURLs)
+	if err != nil {
+		panic("create control-plane handler: " + err.Error())
+	}
+	connectionIntentTTL := config.ConnectionIntentTTL
+	if connectionIntentTTL == 0 {
+		connectionIntentTTL = defaultConnectionIntentTTL
+	}
+	if connectionIntentTTL < 0 {
+		panic("create control-plane handler: Connection Intent TTL must be positive")
+	}
 	api := &server{
 		createEnvironment: config.CreateEnvironment, registerProjectSeed: config.RegisterProjectSeed,
 		runtimeCommands: config.RuntimeCommands, autoStopPolicies: config.AutoStopPolicies,
 		profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys,
 		capsulePresigner: config.CapsulePresigner, capsuleOwnership: config.CapsuleOwnership,
 		capsuleBucket: config.CapsuleBucket, capsuleAccessTTL: config.CapsuleAccessTTL,
-		now:              config.Now,
+		now: config.Now, connectionIntentIDs: config.ConnectionIntentIDs, connectionIntents: config.ConnectionIntents,
+		regionalProxyURLs: regionalProxyURLs, connectionIntentTTL: connectionIntentTTL,
 		environmentReads: config.EnvironmentReads, operationReads: config.OperationReads,
 		profileReads: config.ProfileReads, billingReads: config.BillingReads,
 	}

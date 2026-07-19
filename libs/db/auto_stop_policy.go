@@ -26,6 +26,9 @@ func (store *Store) UpdateAutoStopPolicy(ctx context.Context, ownerID string, po
 	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, operation.IdempotencyKey); err != nil {
 		return domain.Operation{}, false, fmt.Errorf("update Auto-stop Policy: lock idempotency key: %w", err)
 	}
+	if err := rejectActiveConnectionIntentIdempotencyKey(ctx, tx, ownerID, operation.IdempotencyKey); err != nil {
+		return domain.Operation{}, false, err
+	}
 	existing, err := queries.GetOperationByIdempotencyKey(ctx, dbsql.GetOperationByIdempotencyKeyParams{
 		OwnerUserID: ownerID, IdempotencyKey: operation.IdempotencyKey,
 	})

@@ -32,6 +32,7 @@ func run(ctx context.Context, arguments []string) error {
 
 type cli struct {
 	output           io.Writer
+	errorOutput      io.Writer
 	input            io.Reader
 	clientID         string
 	controlPlaneURL  string
@@ -48,6 +49,7 @@ type cli struct {
 func newCLI() cli {
 	return cli{
 		output:           os.Stdout,
+		errorOutput:      os.Stderr,
 		input:            os.Stdin,
 		clientID:         os.Getenv("DEVM_WORKOS_CLIENT_ID"),
 		controlPlaneURL:  os.Getenv("DEVM_CONTROL_PLANE_URL"),
@@ -78,7 +80,7 @@ func newCLI() cli {
 
 func (application cli) run(ctx context.Context, arguments []string) error {
 	if len(arguments) == 0 {
-		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh-proxy>")
+		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh|ssh-proxy>")
 	}
 	switch arguments[0] {
 	case "login":
@@ -103,11 +105,55 @@ func (application cli) run(ctx context.Context, arguments []string) error {
 		return application.runInspect(ctx, arguments[1:])
 	case "capsule":
 		return application.runCapsule(ctx, arguments[1:])
+	case "ssh":
+		return application.runSSH(ctx, arguments[1:])
 	case "ssh-proxy":
 		return application.runSSHProxy(ctx, arguments[1:])
 	default:
-		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh-proxy>")
+		return fmt.Errorf("usage: devm <inspect|plan|capsule|login|ssh|ssh-proxy>")
 	}
+}
+
+func (application cli) runSSH(ctx context.Context, arguments []string) error {
+	if len(arguments) == 0 || arguments[0] != "setup" {
+		return errors.New("usage: devm ssh setup [--identity-file PATH]")
+	}
+	flags := flag.NewFlagSet("ssh setup", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	identityFile := flags.String("identity-file", "", "discovered Ed25519 private-key path")
+	if err := flags.Parse(arguments[1:]); err != nil || flags.NArg() != 0 {
+		return errors.New("usage: devm ssh setup [--identity-file PATH]")
+	}
+	if strings.TrimSpace(application.clientID) == "" {
+		return errors.New("DEVM_WORKOS_CLIENT_ID is required")
+	}
+	if _, err := secureControlPlaneURL(application.controlPlaneURL); err != nil {
+		return err
+	}
+	if application.newRefreshClient == nil || application.configDirectory == nil || application.sshDirectory == nil {
+		return errors.New("configure SSH setup: command is incomplete")
+	}
+	refresher, err := application.newRefreshClient(application.clientID)
+	if err != nil {
+		return err
+	}
+	configDirectory, err := application.configDirectory()
+	if err != nil {
+		return errors.New("resolve user config directory for SSH setup")
+	}
+	sshDirectory, err := application.sshDirectory()
+	if err != nil {
+		return errors.New("resolve user SSH directory for SSH setup")
+	}
+	command := sshSetupCommand{
+		controlPlaneURL: application.controlPlaneURL,
+		httpClient:      application.httpClient,
+		tokens:          newTokenSession(configDirectory, refresher, application.now),
+		configDirectory: configDirectory,
+		sshDirectory:    sshDirectory,
+		output:          application.output,
+	}
+	return command.run(ctx, *identityFile)
 }
 
 func (application cli) runCapsule(ctx context.Context, arguments []string) error {
@@ -173,6 +219,7 @@ func (application cli) runSSHProxy(ctx context.Context, arguments []string) erro
 		attempt:         attempt,
 		input:           application.input,
 		output:          application.output,
+		errorOutput:     application.errorOutput,
 		now:             application.now,
 	}
 	return command.run(ctx, *environmentID)
