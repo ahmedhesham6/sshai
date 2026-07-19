@@ -67,6 +67,7 @@ func TestRuntimeCommandHTTPMapsOwnershipAndCommandErrors(t *testing.T) {
 		{name: "foreign Environment", missing: true, wantStatus: http.StatusNotFound, wantCode: "ENVIRONMENT_NOT_FOUND"},
 		{name: "active Operation", repository: db.ErrOperationConflict, wantStatus: http.StatusConflict, wantCode: "OPERATION_CONFLICT"},
 		{name: "credit policy", repository: application.ErrCreditsPolicyBlocked, wantStatus: http.StatusForbidden, wantCode: "CREDITS_POLICY_BLOCKED"},
+		{name: "invalid Runtime state", repository: domain.ErrRuntimeCommandState, wantStatus: http.StatusUnprocessableEntity, wantCode: "RUNTIME_COMMAND_INVALID_STATE"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			detail := runtimeEnvironmentDetail(t)
@@ -88,6 +89,64 @@ func TestRuntimeCommandHTTPMapsOwnershipAndCommandErrors(t *testing.T) {
 			if test.missing && repository.calls != 0 {
 				t.Fatalf("foreign Environment reserved %d Operations", repository.calls)
 			}
+		})
+	}
+}
+
+func TestRuntimeCommandHTTPReplaysProjectCurrentEnvironmentState(t *testing.T) {
+	tests := []struct {
+		name  string
+		serve func(t *testing.T, detail db.EnvironmentDetail) *httptest.ResponseRecorder
+		check func(t *testing.T, accepted contracts.EnvironmentOperation)
+	}{
+		{
+			name: "terminal Runtime Operation does not become active",
+			serve: func(t *testing.T, detail db.EnvironmentDetail) *httptest.ResponseRecorder {
+				repository := &runtimeCommandHTTPRepositoryFake{
+					expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime,
+					replay: succeededOperation(t, domain.OperationRuntimeStart, "operation-historical", `{}`),
+				}
+				return serveRuntimeCommandRequest(runtimeCommandHandler(detail, repository, &runtimeCommandHTTPDispatcherFake{}, nil), "/v1/environments/environment-1/start", "")
+			},
+			check: func(t *testing.T, accepted contracts.EnvironmentOperation) {
+				if accepted.Operation.Id != "operation-historical" || accepted.Operation.Status != contracts.OperationStatus(domain.OperationSucceeded) ||
+					accepted.Environment.ActiveOperationId == nil || *accepted.Environment.ActiveOperationId != "operation-current" {
+					t.Fatalf("Runtime replay = %#v", accepted)
+				}
+			},
+		},
+		{
+			name: "historical Policy does not replace current projection",
+			serve: func(t *testing.T, detail db.EnvironmentDetail) *httptest.ResponseRecorder {
+				repository := &autoStopPolicyHTTPRepositoryFake{
+					expectedOwnerID: "user-1",
+					replay:          succeededSynchronousPolicyOperation(t, "operation-policy-historical"),
+				}
+				service := application.NewAutoStopPolicyService(repository, &idsFake{values: []string{"operation-unused"}}, fixedNow)
+				return serveRuntimeCommandRequest(runtimeCommandHandler(detail, nil, nil, service), "/v1/environments/environment-1/auto-stop-policy", `{"mode":"when_fully_idle","gracePeriodSeconds":300}`)
+			},
+			check: func(t *testing.T, accepted contracts.EnvironmentOperation) {
+				if accepted.Operation.Id != "operation-policy-historical" || accepted.Environment.AutoStopPolicy.Mode != contracts.AutoStopPolicyMode(domain.AutoStopManual) ||
+					accepted.Environment.AutoStopPolicy.GracePeriodSeconds != 0 || accepted.Environment.ActiveOperationId == nil || *accepted.Environment.ActiveOperationId != "operation-current" {
+					t.Fatalf("Policy replay = %#v", accepted)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			detail := runtimeEnvironmentDetail(t)
+			activeOperationID := "operation-current"
+			detail.ActiveOperationID = &activeOperationID
+			response := test.serve(t, detail)
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, body:%s", response.Code, response.Body.String())
+			}
+			var accepted contracts.EnvironmentOperation
+			if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+				t.Fatal(err)
+			}
+			test.check(t, accepted)
 		})
 	}
 }
@@ -145,6 +204,7 @@ type runtimeCommandHTTPRepositoryFake struct {
 	environment     domain.Environment
 	runtime         domain.Runtime
 	operation       domain.Operation
+	replay          domain.Operation
 	err             error
 	calls           int
 }
@@ -155,10 +215,54 @@ func (fake *runtimeCommandHTTPRepositoryFake) ReserveRuntimeOperation(_ context.
 		return domain.EnvironmentRuntimeOperation{}, err
 	}
 	fake.operation = operation
+	if fake.replay.Snapshot().ID != "" {
+		fake.operation = fake.replay
+	}
 	if fake.err != nil {
 		return domain.EnvironmentRuntimeOperation{}, fake.err
 	}
-	return domain.NewEnvironmentRuntimeOperation(fake.environment, fake.runtime, operation)
+	return domain.NewEnvironmentRuntimeOperation(fake.environment, fake.runtime, fake.operation)
+}
+
+func succeededOperation(t *testing.T, operationType domain.OperationType, operationID, input string) domain.Operation {
+	t.Helper()
+	operation, err := domain.QueueOperation(domain.OperationRequest{
+		ID: operationID, EnvironmentID: "environment-1", Type: operationType,
+		RequestedByUserID: "user-1", IdempotencyKey: "runtime-request-0001", Input: []byte(input), CreatedAt: fixedNow().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = operation.Start(fixedNow().Add(-30 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = operation.RecordRestateInvocation("invocation-historical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = operation.Succeed(fixedNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return operation
+}
+
+func succeededSynchronousPolicyOperation(t *testing.T, operationID string) domain.Operation {
+	t.Helper()
+	operation, err := domain.QueueOperation(domain.OperationRequest{
+		ID: operationID, EnvironmentID: "environment-1", Type: domain.OperationEnvironmentUpdateAutoStop,
+		RequestedByUserID: "user-1", IdempotencyKey: "runtime-request-0001",
+		Input: []byte(`{"gracePeriodSeconds":300,"mode":"when_fully_idle"}`), CreatedAt: fixedNow(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = operation.SucceedSynchronously(fixedNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return operation
 }
 
 type runtimeCommandHTTPDispatcherFake struct{ operationIDs []string }
@@ -172,17 +276,21 @@ type autoStopPolicyHTTPRepositoryFake struct {
 	expectedOwnerID string
 	policy          domain.AutoStopPolicy
 	operation       domain.Operation
+	replay          domain.Operation
 	err             error
 	calls           int
 }
 
-func (fake *autoStopPolicyHTTPRepositoryFake) UpdateAutoStopPolicy(_ context.Context, ownerID string, policy domain.AutoStopPolicy, operation domain.Operation) (domain.Operation, error) {
+func (fake *autoStopPolicyHTTPRepositoryFake) UpdateAutoStopPolicy(_ context.Context, ownerID string, policy domain.AutoStopPolicy, operation domain.Operation) (domain.Operation, bool, error) {
 	fake.calls++
 	if err := requireOwner("UpdateAutoStopPolicy", ownerID, fake.expectedOwnerID); err != nil {
-		return domain.Operation{}, err
+		return domain.Operation{}, false, err
 	}
 	fake.policy, fake.operation = policy, operation
-	return operation, fake.err
+	if fake.replay.Snapshot().ID != "" {
+		return fake.replay, false, fake.err
+	}
+	return operation, true, fake.err
 }
 
 func runtimeCommandHandler(detail db.EnvironmentDetail, repository application.RuntimeOperationRepository, dispatcher application.RuntimeOperationDispatcher, autoStopPolicies *application.AutoStopPolicyService) http.Handler {

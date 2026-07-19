@@ -23,9 +23,7 @@ func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domai
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := store.queries.WithTx(tx)
 	operation := candidate.Snapshot()
-	if _, err := queries.LockRuntimeOperationIdempotency(ctx, dbsql.LockRuntimeOperationIdempotencyParams{
-		OwnerUserID: operation.RequestedByUserID, IdempotencyKey: operation.IdempotencyKey,
-	}); err != nil {
+	if err := lockOperationIdempotencyKey(ctx, tx, operation.RequestedByUserID, operation.IdempotencyKey); err != nil {
 		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: lock idempotency key: %w", err)
 	}
 

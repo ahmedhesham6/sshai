@@ -49,10 +49,9 @@ func (server *server) handleRuntimeCommand(response http.ResponseWriter, request
 		return
 	}
 	operation := command.Operation().Snapshot()
-	detail.Environment = command.Environment()
-	runtime := command.Runtime()
-	detail.Runtime = &runtime
-	detail.ActiveOperationID = &operation.ID
+	if operation.Status == domain.OperationQueued || operation.Status == domain.OperationRunning {
+		detail.ActiveOperationID = &operation.ID
+	}
 	body := environmentOperationResponse(detail, command.Operation())
 	if start {
 		result := contracts.StartEnvironmentRuntime202JSONResponse{
@@ -99,9 +98,11 @@ func (server *server) UpdateAutoStopPolicy(response http.ResponseWriter, request
 		server.writeRuntimeCommandError(response, request, err)
 		return
 	}
-	policy := update.Policy().Snapshot()
-	detail.AutoStopMode, detail.GracePeriodSeconds = policy.Mode, policy.GracePeriodSeconds
-	detail.ActiveOperationID = nil
+	if update.Applied() {
+		policy := update.Policy().Snapshot()
+		detail.AutoStopMode, detail.GracePeriodSeconds = policy.Mode, policy.GracePeriodSeconds
+		detail.ActiveOperationID = nil
+	}
 	result := contracts.UpdateAutoStopPolicy202JSONResponse{
 		Headers: contracts.UpdateAutoStopPolicy202ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
 		Body:    environmentOperationResponse(detail, update.Operation()),
@@ -123,6 +124,8 @@ func (server *server) writeRuntimeCommandError(response http.ResponseWriter, req
 		writeError(response, request, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "The idempotency key was already used with different input.")
 	case errors.Is(err, db.ErrOperationConflict):
 		writeError(response, request, http.StatusConflict, "OPERATION_CONFLICT", "The Environment already has an active Operation.")
+	case errors.Is(err, domain.ErrRuntimeCommandState):
+		writeError(response, request, http.StatusUnprocessableEntity, "RUNTIME_COMMAND_INVALID_STATE", "The Runtime command cannot be applied to its current state.")
 	default:
 		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The command could not be accepted safely.")
 	}

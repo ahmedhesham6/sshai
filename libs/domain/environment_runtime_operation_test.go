@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -133,6 +134,9 @@ func TestEnvironmentRuntimeOperationEligibilityMatchesLifecycle(t *testing.T) {
 			_, err := domain.NewEnvironmentRuntimeOperation(environment, test.runtime, operation)
 			if (err == nil) != test.wantAllowed {
 				t.Fatalf("NewEnvironmentRuntimeOperation() error = %v, allowed = %t", err, test.wantAllowed)
+			}
+			if !test.wantAllowed && !errors.Is(err, domain.ErrRuntimeCommandState) {
+				t.Fatalf("NewEnvironmentRuntimeOperation() error = %v, want ErrRuntimeCommandState", err)
 			}
 		})
 	}

@@ -1,6 +1,11 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrRuntimeCommandState = errors.New("Runtime command cannot be applied to current state")
 
 type EnvironmentRuntimeOperation struct {
 	environment Environment
@@ -13,13 +18,13 @@ func NewEnvironmentRuntimeOperation(environment Environment, runtime Runtime, op
 	runtimeSnapshot := runtime.Snapshot()
 	operationSnapshot := operation.Snapshot()
 	if environmentSnapshot.Lifecycle != EnvironmentActive {
-		return EnvironmentRuntimeOperation{}, errors.New("create Runtime Operation: Environment is not active")
+		return EnvironmentRuntimeOperation{}, fmt.Errorf("%w: Environment is not active", ErrRuntimeCommandState)
 	}
 	if err := validateRuntimeOwnership(environmentSnapshot, runtimeSnapshot); err != nil {
 		return EnvironmentRuntimeOperation{}, errors.New("create Runtime Operation: Runtime does not belong to Environment")
 	}
 	if !operationSnapshot.Status.terminal() && (environmentSnapshot.CurrentRuntimeID == nil || *environmentSnapshot.CurrentRuntimeID != runtimeSnapshot.ID) {
-		return EnvironmentRuntimeOperation{}, errors.New("create Runtime Operation: Runtime is not current for Environment")
+		return EnvironmentRuntimeOperation{}, fmt.Errorf("%w: Runtime is not current for Environment", ErrRuntimeCommandState)
 	}
 	if operationSnapshot.EnvironmentID != environmentSnapshot.ID || operationSnapshot.RequestedByUserID != environmentSnapshot.OwnerUserID {
 		return EnvironmentRuntimeOperation{}, errors.New("create Runtime Operation: Operation does not belong to Environment owner")
@@ -28,7 +33,7 @@ func NewEnvironmentRuntimeOperation(environment Environment, runtime Runtime, op
 		return EnvironmentRuntimeOperation{}, errors.New("create Runtime Operation: Operation type is not a Runtime command")
 	}
 	if !operationSnapshot.Status.terminal() && !operationSnapshot.Type.acceptsRuntimeState(runtimeSnapshot.Status, operationSnapshot.Status) {
-		return EnvironmentRuntimeOperation{}, errors.New("create Runtime Operation: current Runtime status does not accept command")
+		return EnvironmentRuntimeOperation{}, fmt.Errorf("%w: current Runtime status does not accept command", ErrRuntimeCommandState)
 	}
 	return EnvironmentRuntimeOperation{environment: environment, runtime: runtime, operation: operation}, nil
 }

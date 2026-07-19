@@ -12,7 +12,7 @@ import (
 
 var ErrInvalidAutoStopPolicyUpdate = errors.New("invalid Auto-stop Policy update")
 
-const operationEnvironmentUpdateAutoStop domain.OperationType = "environment.update_auto_stop"
+const autoStopSnapshotCadenceSeconds = 60
 
 type AutoStopPolicyUpdateInput struct {
 	OwnerUserID    string
@@ -26,13 +26,15 @@ type AutoStopPolicyUpdateInput struct {
 type AutoStopPolicyUpdate struct {
 	policy    domain.AutoStopPolicy
 	operation domain.Operation
+	applied   bool
 }
 
 func (update AutoStopPolicyUpdate) Policy() domain.AutoStopPolicy { return update.policy }
 func (update AutoStopPolicyUpdate) Operation() domain.Operation   { return update.operation }
+func (update AutoStopPolicyUpdate) Applied() bool                 { return update.applied }
 
 type AutoStopPolicyRepository interface {
-	UpdateAutoStopPolicy(context.Context, string, domain.AutoStopPolicy, domain.Operation) (domain.Operation, error)
+	UpdateAutoStopPolicy(context.Context, string, domain.AutoStopPolicy, domain.Operation) (domain.Operation, bool, error)
 }
 
 type AutoStopPolicyService struct {
@@ -51,6 +53,9 @@ func (service *AutoStopPolicyService) UpdateAutoStopPolicy(ctx context.Context, 
 		!canonicalIdentity(input.PolicyID) || !canonicalIdentity(input.IdempotencyKey) {
 		return AutoStopPolicyUpdate{}, ErrInvalidAutoStopPolicyUpdate
 	}
+	if input.Mode != domain.AutoStopManual && input.GracePeriod < autoStopSnapshotCadenceSeconds {
+		return AutoStopPolicyUpdate{}, fmt.Errorf("%w: grace period must be at least %d seconds", ErrInvalidAutoStopPolicyUpdate, autoStopSnapshotCadenceSeconds)
+	}
 	policy, err := domain.NewAutoStopPolicy(input.PolicyID, input.EnvironmentID, input.Mode, input.GracePeriod)
 	if err != nil {
 		return AutoStopPolicyUpdate{}, fmt.Errorf("%w: %v", ErrInvalidAutoStopPolicyUpdate, err)
@@ -64,28 +69,23 @@ func (service *AutoStopPolicyService) UpdateAutoStopPolicy(ctx context.Context, 
 	}
 	createdAt := service.now()
 	operation, err := domain.QueueOperation(domain.OperationRequest{
-		ID: service.ids.NewID(), EnvironmentID: input.EnvironmentID, Type: operationEnvironmentUpdateAutoStop,
+		ID: service.ids.NewID(), EnvironmentID: input.EnvironmentID, Type: domain.OperationEnvironmentUpdateAutoStop,
 		RequestedByUserID: input.OwnerUserID, IdempotencyKey: input.IdempotencyKey,
 		Input: canonicalInput, CreatedAt: createdAt,
 	})
 	if err != nil {
 		return AutoStopPolicyUpdate{}, fmt.Errorf("%w: %v", ErrInvalidAutoStopPolicyUpdate, err)
 	}
-	operation, err = operation.RecordRestateInvocation("control-plane:synchronous-auto-stop-policy")
+	// This is the synchronous persistence fallback. The workflow integration
+	// required by docs/spec/09-api.md must replace it so policy changes durably
+	// cancel or replace pending Auto-stop timers.
+	operation, err = operation.SucceedSynchronously(createdAt)
 	if err != nil {
 		return AutoStopPolicyUpdate{}, err
 	}
-	operation, err = operation.Start(createdAt)
-	if err != nil {
-		return AutoStopPolicyUpdate{}, err
-	}
-	operation, err = operation.Succeed(createdAt)
-	if err != nil {
-		return AutoStopPolicyUpdate{}, err
-	}
-	persisted, err := service.repository.UpdateAutoStopPolicy(ctx, input.OwnerUserID, policy, operation)
+	persisted, applied, err := service.repository.UpdateAutoStopPolicy(ctx, input.OwnerUserID, policy, operation)
 	if err != nil {
 		return AutoStopPolicyUpdate{}, fmt.Errorf("update Auto-stop Policy: %w", err)
 	}
-	return AutoStopPolicyUpdate{policy: policy, operation: persisted}, nil
+	return AutoStopPolicyUpdate{policy: policy, operation: persisted, applied: applied}, nil
 }
