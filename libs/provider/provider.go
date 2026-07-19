@@ -101,6 +101,7 @@ type Runtime struct {
 
 type RuntimeProvider interface {
 	EnsureRuntime(context.Context, EnsureRuntimeRequest) (Runtime, error)
+	EnsureRuntimeDataVolumeAttachment(context.Context, RuntimeLifecycleRequest) (Runtime, error)
 	StartRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)
 	StopRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)
 	RetireRuntime(context.Context, RuntimeLifecycleRequest) (Runtime, error)

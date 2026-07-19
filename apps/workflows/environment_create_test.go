@@ -7,6 +7,7 @@ package workflows_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -92,9 +93,9 @@ func TestEnvironmentCreateWorkflowResolvesAndPinsCapsuleStateAfterRuntime(t *tes
 	capsule := &capsuleStateFake{
 		completionFake: completion,
 		state: workflows.EnvironmentCapsuleState{
-			CapsuleLock:   domain.CapsuleLockSnapshot{ID: "lock-1", EnvironmentID: "environment-1", ProfileVersionID: "version-1"},
+			CapsuleLock:   materializationLock(),
 			UpgradePolicy: domain.UpgradeNotify,
-			ApplyResults:  []profile.ProfileMaterializationResult{{ComponentID: "config:editor", LockID: "lock-1", LockDigest: "sha256:lock", ComponentDigest: "sha256:component"}},
+			ApplyResults:  []profile.ProfileMaterializationResult{successfulMaterializationResult("config:editor")},
 		},
 	}
 	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
@@ -407,10 +408,10 @@ func TestEnvironmentCreateWorkflowCompletesStepsFourThroughEleven(t *testing.T) 
 	if result.output.RuntimeID != "runtime-1" || result.output.DataVolumeProviderID != "volume-1" {
 		t.Fatalf("Environment create output = %#v", result.output)
 	}
-	if harness.provider.ensureRuntimeCalls != 1 || harness.actions.completeCalls != 1 {
-		t.Fatalf("provider/completion calls = ensure:%d complete:%d", harness.provider.ensureRuntimeCalls, harness.actions.completeCalls)
+	if harness.provider.ensureRuntimeCalls != 1 || harness.provider.attachRuntimeCalls != 1 || harness.actions.completeCalls != 1 {
+		t.Fatalf("provider/completion calls = allocate:%d attach:%d complete:%d", harness.provider.ensureRuntimeCalls, harness.provider.attachRuntimeCalls, harness.actions.completeCalls)
 	}
-	if got := harness.guest.calls; strings.Join(got, ",") != "restore-identity,readiness,seed,materialize,credentials,toolchain" {
+	if got := harness.guest.calls; strings.Join(got, ",") != "restore-identity,readiness,ssh-keys,seed,materialize,credentials,toolchain" {
 		t.Fatalf("guest step order = %#v", got)
 	}
 	if status := harness.actions.lastRuntime.Status; status != domain.RuntimeReady {
@@ -418,6 +419,21 @@ func TestEnvironmentCreateWorkflowCompletesStepsFourThroughEleven(t *testing.T) 
 	}
 	if len(harness.actions.outcomes) != 0 {
 		t.Fatalf("successful create recorded terminal outcomes = %#v", harness.actions.outcomes)
+	}
+}
+
+func TestEnvironmentCreateWorkflowAttachmentFailureKeepsInventoriedRuntime(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	harness.provider.attachRuntimeErr = provider.NewError(provider.ErrorCodePlacementConflict, "attachment failed", nil)
+	result := harness.run(t, "attachment-failure")
+	if result.err == nil {
+		t.Fatal("attachment failure completed successfully")
+	}
+	if harness.actions.lastRuntime.Status != domain.RuntimeError || harness.actions.lastRuntime.ProviderInstanceRef == nil || *harness.actions.lastRuntime.ProviderInstanceRef != "instance-1" {
+		t.Fatalf("Runtime after attachment failure = %#v", harness.actions.lastRuntime)
+	}
+	if harness.provider.ensureRuntimeCalls != 1 || harness.provider.attachRuntimeCalls != 1 || harness.provider.dataVolumeDeletes != 0 {
+		t.Fatalf("provider mutations = allocate:%d attach:%d Data Volume deletes:%d", harness.provider.ensureRuntimeCalls, harness.provider.attachRuntimeCalls, harness.provider.dataVolumeDeletes)
 	}
 }
 
@@ -471,6 +487,21 @@ func TestEnvironmentCreateWorkflowSeedFailureFinalizesOperation(t *testing.T) {
 	}
 }
 
+func TestEnvironmentCreateWorkflowGuestMutationRetriesUseStableEnsureIdentity(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	harness.actions.capsuleState.CapsuleLock = materializationLock()
+	harness.guest.materializations = []profile.ProfileMaterializationResult{successfulMaterializationResult("config:editor")}
+	harness.guest.seedResponseLoss = true
+	harness.guest.materializationResponseLoss = true
+	result := harness.run(t, "guest-response-loss")
+	if result.err != nil {
+		t.Fatalf("create after ambiguous guest responses: %v", result.err)
+	}
+	if harness.guest.seedAttempts != 2 || harness.guest.seedMutations != 1 || harness.guest.materializationAttempts != 2 || harness.guest.materializationMutations != 1 {
+		t.Fatalf("guest attempts/mutations = seed:%d/%d materialization:%d/%d", harness.guest.seedAttempts, harness.guest.seedMutations, harness.guest.materializationAttempts, harness.guest.materializationMutations)
+	}
+}
+
 func TestEnvironmentCreateWorkflowRecordsRequiresInputOutcome(t *testing.T) {
 	harness := newEnvironmentCreateStepsHarness()
 	harness.guest.binding = workflows.EnvironmentCredentialBindingOutcome{
@@ -491,12 +522,8 @@ func TestEnvironmentCreateWorkflowRecordsRequiresInputOutcome(t *testing.T) {
 
 func TestEnvironmentCreateWorkflowRecordsMaterializationResultsFromGuest(t *testing.T) {
 	harness := newEnvironmentCreateStepsHarness()
-	harness.guest.materializations = []profile.ProfileMaterializationResult{{
-		ID: "editor", LockID: "lock-1", LockDigest: "sha256:lock", CapsuleDigest: "sha256:capsule",
-		ComponentID: "config:editor", ComponentDigest: "sha256:component", Adapter: "claude",
-		AdapterVersion: "v1", Scope: domain.ScopeUser, Mode: profile.MaterializationManaged,
-		Root: profile.MaterializationHome, Target: ".config/editor", Selector: "$", EffectiveCacheKey: "sha256:key",
-	}}
+	harness.actions.capsuleState.CapsuleLock = materializationLock()
+	harness.guest.materializations = []profile.ProfileMaterializationResult{successfulMaterializationResult("config:editor")}
 	result := harness.run(t, "materialization")
 	if result.err != nil {
 		t.Fatalf("materialized create: %v", result.err)
@@ -504,6 +531,60 @@ func TestEnvironmentCreateWorkflowRecordsMaterializationResultsFromGuest(t *test
 	state := harness.actions.persistedCapsule
 	if len(state.ApplyResults) != 1 || len(state.Materializations) != 1 || state.Materializations[0].EffectiveCacheKey != "sha256:key" {
 		t.Fatalf("persisted materialization state = %#v", state)
+	}
+}
+
+func TestEnvironmentCreateWorkflowRejectsIncompleteOrNonConvergedMaterialization(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*environmentCreateStepsHarness)
+	}{
+		{name: "incomplete", prepare: func(harness *environmentCreateStepsHarness) {}},
+		{name: "duplicate", prepare: func(harness *environmentCreateStepsHarness) {
+			lock := materializationLock()
+			lock.ResolvedComponents["config:shell"] = domain.ResolvedComponent{ID: "config:shell", CapsuleDigest: "sha256:capsule", ComponentDigest: "sha256:shell", Scope: domain.ScopeUser}
+			harness.actions.capsuleState.CapsuleLock = lock
+			result := successfulMaterializationResult("config:editor")
+			harness.guest.materializations = []profile.ProfileMaterializationResult{result, result}
+		}},
+		{name: "non-converged", prepare: func(harness *environmentCreateStepsHarness) {
+			result := successfulMaterializationResult("config:editor")
+			result.Operation = profile.OperationConflict
+			harness.guest.materializations = []profile.ProfileMaterializationResult{result}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newEnvironmentCreateStepsHarness()
+			harness.actions.capsuleState.CapsuleLock = materializationLock()
+			test.prepare(harness)
+			result := harness.run(t, "materialization-"+test.name)
+			if result.err == nil {
+				t.Fatal("invalid materialization completed successfully")
+			}
+			if harness.actions.persistCapsuleCalls != 0 || len(harness.actions.outcomes) != 1 || harness.actions.outcomes[0].Code != "PROFILE_CONFLICT" {
+				t.Fatalf("invalid materialization persistence/outcome = %d/%#v", harness.actions.persistCapsuleCalls, harness.actions.outcomes)
+			}
+		})
+	}
+}
+
+func materializationLock() domain.CapsuleLockSnapshot {
+	return domain.CapsuleLockSnapshot{
+		ID: "lock-1", EnvironmentID: "environment-1", ProfileVersionID: "version-1", Digest: "sha256:lock",
+		ResolvedComponents: map[string]domain.ResolvedComponent{
+			"config:editor": {ID: "config:editor", CapsuleDigest: "sha256:capsule", ComponentDigest: "sha256:component", Scope: domain.ScopeUser},
+		},
+	}
+}
+
+func successfulMaterializationResult(componentID string) profile.ProfileMaterializationResult {
+	return profile.ProfileMaterializationResult{
+		ID: "editor", LockID: "lock-1", LockDigest: "sha256:lock", CapsuleDigest: "sha256:capsule",
+		ComponentID: componentID, ComponentDigest: "sha256:component", Adapter: "claude",
+		AdapterVersion: "v1", Scope: domain.ScopeUser, Mode: profile.MaterializationManaged,
+		Root: profile.MaterializationHome, Target: ".config/editor", Selector: "$", EffectiveCacheKey: "sha256:key",
+		DesiredDigest: "sha256:desired", LastAppliedDigest: "sha256:desired", ObservedDigest: "sha256:desired", Operation: profile.OperationCreate,
 	}
 }
 
@@ -527,7 +608,7 @@ func newEnvironmentCreateStepsHarness() *environmentCreateStepsHarness {
 	harness := &environmentCreateStepsHarness{provider: providerFake, actions: actions, guest: guest}
 	harness.dependencies = workflows.EnvironmentCreateDependencies{
 		Provider: providerFake, Actions: actions, Capsules: actions,
-		SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
 		Credentials: guest, Toolchain: guest,
 		IDs: &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
 		Now: time.Now, ImageVersion: "image-v1", ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
@@ -564,6 +645,8 @@ type environmentCreateStepsProvider struct {
 	runtime            provider.Runtime
 	ensureRuntimeCalls int
 	ensureRuntimeErr   error
+	attachRuntimeCalls int
+	attachRuntimeErr   error
 	dataVolumeDeletes  int
 }
 
@@ -580,6 +663,19 @@ func (fake *environmentCreateStepsProvider) EnsureRuntime(_ context.Context, req
 	}
 	if fake.runtime.ProviderID == "" {
 		fake.runtime = provider.Runtime{RuntimeSpec: request.RuntimeSpec, ProviderID: "instance-1", State: provider.RuntimeStatePending}
+	}
+	return fake.runtime, nil
+}
+
+func (fake *environmentCreateStepsProvider) EnsureRuntimeDataVolumeAttachment(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.attachRuntimeCalls++
+	if fake.attachRuntimeErr != nil {
+		return provider.Runtime{}, fake.attachRuntimeErr
+	}
+	if fake.runtime.RuntimeID != request.RuntimeID || fake.runtime.ProviderID != request.ProviderID {
+		return provider.Runtime{}, errors.New("attach Runtime identity does not match allocation")
 	}
 	return fake.runtime, nil
 }
@@ -617,8 +713,10 @@ type environmentCreateStepsActions struct {
 	persistCapsuleCalls int
 }
 
-func (*environmentCreateStepsActions) RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error {
-	return nil
+func (*environmentCreateStepsActions) RecordEnvironmentCreateInvocation(_ context.Context, _ string, _ string, _ time.Time) (workflows.EnvironmentCreateInvocation, error) {
+	return workflows.EnvironmentCreateInvocation{
+		OwnerUserID: "user-1", EnvironmentID: "environment-1", ProjectSeedID: "project-seed-1",
+	}, nil
 }
 
 func (*environmentCreateStepsActions) InventoryEnvironmentState(_ context.Context, _ string, reservation domain.EnvironmentStateReservation) (string, error) {
@@ -660,12 +758,20 @@ func (actions *environmentCreateStepsActions) PersistEnvironmentCapsuleState(_ c
 }
 
 type environmentCreateStepsGuest struct {
-	mu               sync.Mutex
-	calls            []string
-	readiness        workflows.RuntimeGuestReadiness
-	seedErr          error
-	materializations []profile.ProfileMaterializationResult
-	binding          workflows.EnvironmentCredentialBindingOutcome
+	mu                          sync.Mutex
+	calls                       []string
+	readiness                   workflows.RuntimeGuestReadiness
+	seedErr                     error
+	seedResponseLoss            bool
+	seedAttempts                int
+	seedMutations               int
+	seedEnsureIdentity          string
+	materializations            []profile.ProfileMaterializationResult
+	materializationResponseLoss bool
+	materializationAttempts     int
+	materializationMutations    int
+	materializationEnsureID     string
+	binding                     workflows.EnvironmentCredentialBindingOutcome
 }
 
 func (fake *environmentCreateStepsGuest) record(call string) {
@@ -695,13 +801,64 @@ func (fake *environmentCreateStepsGuest) WaitForRuntimeReady(context.Context, wo
 	return fake.readiness, nil
 }
 
-func (fake *environmentCreateStepsGuest) ApplyEnvironmentProjectSeed(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+func (fake *environmentCreateStepsGuest) ReconcileRuntimeSSHKeys(_ context.Context, request workflows.RuntimeGuestReadinessRequest) error {
+	if request.OwnerUserID != "user-1" {
+		return fmt.Errorf("reconcile SSH Keys owner = %q", request.OwnerUserID)
+	}
+	fake.record("ssh-keys")
+	return nil
+}
+
+func (fake *environmentCreateStepsGuest) EnsureEnvironmentProjectSeedApplied(_ context.Context, request workflows.EnvironmentProjectSeedRequest) error {
+	if request.Guest.OwnerUserID != "user-1" || request.ProjectSeedID != "project-seed-1" {
+		return fmt.Errorf("Project Seed request = %#v", request)
+	}
 	fake.record("seed")
+	if fake.seedResponseLoss {
+		fake.mu.Lock()
+		identity := request.Guest.OperationID + ":" + request.ProjectSeedID
+		if fake.seedEnsureIdentity == "" {
+			fake.seedEnsureIdentity = identity
+		}
+		identityChanged := fake.seedEnsureIdentity != identity
+		fake.seedAttempts++
+		firstAttempt := fake.seedAttempts == 1
+		if firstAttempt {
+			fake.seedMutations++
+		}
+		fake.mu.Unlock()
+		if identityChanged {
+			return permanentActionError{errors.New("Project Seed ensure identity changed across retry")}
+		}
+		if firstAttempt {
+			return transientActionError{errors.New("Project Seed response lost after apply")}
+		}
+	}
 	return fake.seedErr
 }
 
-func (fake *environmentCreateStepsGuest) MaterializeEnvironmentCapsule(context.Context, workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+func (fake *environmentCreateStepsGuest) EnsureEnvironmentCapsuleMaterialized(_ context.Context, request workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
 	fake.record("materialize")
+	if fake.materializationResponseLoss {
+		fake.mu.Lock()
+		identity := request.Guest.OperationID + ":" + request.State.CapsuleLock.ID + ":" + request.State.CapsuleLock.Digest
+		if fake.materializationEnsureID == "" {
+			fake.materializationEnsureID = identity
+		}
+		identityChanged := fake.materializationEnsureID != identity
+		fake.materializationAttempts++
+		firstAttempt := fake.materializationAttempts == 1
+		if firstAttempt {
+			fake.materializationMutations++
+		}
+		fake.mu.Unlock()
+		if identityChanged {
+			return nil, permanentActionError{errors.New("materialization ensure identity changed across retry")}
+		}
+		if firstAttempt {
+			return nil, transientActionError{errors.New("materialization response lost after apply")}
+		}
+	}
 	return fake.materializations, nil
 }
 
@@ -750,12 +907,14 @@ func (fake *completionFake) InventoryEnvironmentState(_ context.Context, operati
 	return reservation.ProviderID, nil
 }
 
-func (fake *completionFake) RecordEnvironmentCreateInvocation(_ context.Context, operationID, invocationID string, at time.Time) error {
+func (fake *completionFake) RecordEnvironmentCreateInvocation(_ context.Context, operationID, invocationID string, at time.Time) (workflows.EnvironmentCreateInvocation, error) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	fake.operationID, fake.invocationID, fake.at = operationID, invocationID, at
 	fake.events = append(fake.events, "record")
-	return nil
+	return workflows.EnvironmentCreateInvocation{
+		OwnerUserID: "user-1", EnvironmentID: "environment-1", ProjectSeedID: "project-seed-1",
+	}, nil
 }
 
 func (fake *completionFake) CompleteEnvironmentCreation(_ context.Context, operationID string, at time.Time) error {
@@ -935,7 +1094,7 @@ func (ids *workflowIDs) NewID() string {
 }
 
 type legacyEnvironmentCreationActions interface {
-	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error
+	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) (workflows.EnvironmentCreateInvocation, error)
 	InventoryEnvironmentState(context.Context, string, domain.EnvironmentStateReservation) (string, error)
 	ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (string, error)
 	CompleteEnvironmentCreation(context.Context, string, time.Time) error
@@ -954,7 +1113,7 @@ func environmentCreateDefinition(dataVolumes provider.DataVolumeProvider, action
 	guest := testEnvironmentGuest{}
 	return workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
 		Provider: providerAdapter, Actions: wrapped, Capsules: capsules,
-		SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
 		Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
 		IDs: ids, Now: now, ImageVersion: imageVersion,
 		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
@@ -1003,6 +1162,10 @@ func (fake *environmentCreateProviderAdapter) EnsureRuntime(_ context.Context, r
 	return runtime, nil
 }
 
+func (fake *environmentCreateProviderAdapter) EnsureRuntimeDataVolumeAttachment(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return fake.ObserveRuntime(ctx, request)
+}
+
 func (fake *environmentCreateProviderAdapter) ObserveRuntime(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -1042,11 +1205,15 @@ func (testEnvironmentGuest) WaitForRuntimeReady(_ context.Context, request workf
 	return workflows.RuntimeGuestReadiness{BootID: "boot-1", PrivateIPv4: request.PrivateIPv4, DataMounted: true}, nil
 }
 
-func (testEnvironmentGuest) ApplyEnvironmentProjectSeed(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+func (testEnvironmentGuest) ReconcileRuntimeSSHKeys(context.Context, workflows.RuntimeGuestReadinessRequest) error {
 	return nil
 }
 
-func (testEnvironmentGuest) MaterializeEnvironmentCapsule(_ context.Context, request workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+func (testEnvironmentGuest) EnsureEnvironmentProjectSeedApplied(context.Context, workflows.EnvironmentProjectSeedRequest) error {
+	return nil
+}
+
+func (testEnvironmentGuest) EnsureEnvironmentCapsuleMaterialized(_ context.Context, request workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
 	return request.State.ApplyResults, nil
 }
 

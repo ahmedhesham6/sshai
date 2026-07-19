@@ -34,7 +34,7 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 		polarDeliverer: polarEventDelivererFake{}, polarStore: polarDeliveryStoreFake{}, now: time.Now,
 		environmentCreate: workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
 			Provider: testfixtures.NewProvider(), Actions: creationActions, Capsules: creationActions,
-			SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+			SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
 			Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
 			IDs: idGenerator{}, Now: time.Now, ImageVersion: "image-v1",
 		}),
@@ -58,6 +58,28 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 		if names[index] != name {
 			t.Fatalf("bound services = %v, want %v", names, want)
 		}
+	}
+}
+
+func TestLoadConfigUsesRatifiedInfrastructureDefaults(t *testing.T) {
+	for name, value := range map[string]string{
+		"DATABASE_URL": "postgres://example", "POLAR_EVENTS_ENDPOINT": "https://polar.example/events",
+		"POLAR_ACCESS_TOKEN": "token", "CAPSULE_BUCKET": "capsules", "RUNTIME_ENVIRONMENT_NAME": "devm",
+		"RUNTIME_AMI": "ami-1", "RUNTIME_SUBNET_ID": "subnet-1", "RUNTIME_SECURITY_GROUP_ID": "sg-1",
+		"RUNTIME_PRESETS": "standard=m7i.large", "IMAGE_VERSION": "image-v1",
+	} {
+		t.Setenv(name, value)
+	}
+	for _, name := range []string{"DEFAULT_REGION", "DATA_VOLUME_SIZE_GIB", "RUNTIME_SYSTEM_VOLUME_GIB"} {
+		t.Setenv(name, "")
+	}
+
+	config, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig(): %v", err)
+	}
+	if config.defaultRegion != "eu-central-1" || config.dataVolumeSizeGiB != 100 || config.runtimeSystemVolumeGiB != 30 {
+		t.Fatalf("infrastructure defaults = region:%q data:%d system:%d", config.defaultRegion, config.dataVolumeSizeGiB, config.runtimeSystemVolumeGiB)
 	}
 }
 

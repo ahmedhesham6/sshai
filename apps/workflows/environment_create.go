@@ -25,12 +25,21 @@ const (
 )
 
 type EnvironmentCreationActions interface {
-	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error
+	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) (EnvironmentCreateInvocation, error)
 	InventoryEnvironmentState(context.Context, string, domain.EnvironmentStateReservation) (string, error)
 	ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (string, error)
 	PersistEnvironmentCreateRuntimeTransition(context.Context, string, int64, domain.RuntimeSnapshot) error
 	RecordEnvironmentCreateOutcome(context.Context, string, EnvironmentCreateOperationOutcome, time.Time) error
 	CompleteEnvironmentCreation(context.Context, string, time.Time) error
+}
+
+// EnvironmentCreateInvocation is the authoritative owner and Project Seed
+// state loaded while claiming an environment.create Operation. Guest-side
+// requests must use this state rather than trusting dispatch input.
+type EnvironmentCreateInvocation struct {
+	OwnerUserID   string `json:"ownerUserId"`
+	EnvironmentID string `json:"environmentId"`
+	ProjectSeedID string `json:"projectSeedId"`
 }
 
 type EnvironmentCreateOutcomeKind string
@@ -108,9 +117,15 @@ func (actions *environmentCreationActionsWithCapsules) PersistEnvironmentCapsule
 	return actions.capsuleActions.PersistEnvironmentCapsuleState(ctx, operationID, state)
 }
 
-func (actions *environmentCreationActions) RecordEnvironmentCreateInvocation(ctx context.Context, operationID, invocationID string, at time.Time) error {
-	_, err := actions.repository.RecordEnvironmentCreateInvocation(ctx, operationID, invocationID, at)
-	return err
+func (actions *environmentCreationActions) RecordEnvironmentCreateInvocation(ctx context.Context, operationID, invocationID string, at time.Time) (EnvironmentCreateInvocation, error) {
+	creation, err := actions.repository.RecordEnvironmentCreateInvocation(ctx, operationID, invocationID, at)
+	if err != nil {
+		return EnvironmentCreateInvocation{}, err
+	}
+	environment := creation.Environment().Snapshot()
+	return EnvironmentCreateInvocation{
+		OwnerUserID: environment.OwnerUserID, EnvironmentID: environment.ID, ProjectSeedID: creation.ProjectSeedID(),
+	}, nil
 }
 
 func (actions *environmentCreationActions) InventoryEnvironmentState(ctx context.Context, operationID string, reservation domain.EnvironmentStateReservation) (string, error) {
@@ -166,11 +181,22 @@ type EnvironmentCreateGuestRequest struct {
 }
 
 type EnvironmentSSHIdentityRestorer interface {
+	// RestoreEnvironmentSSHIdentity restores only the Environment-owned SSH
+	// host identity. Active user public keys are reconciled through the shared
+	// RuntimeSSHKeyReconciler seam after guest readiness.
 	RestoreEnvironmentSSHIdentity(context.Context, EnvironmentCreateGuestRequest) error
 }
 
+type EnvironmentProjectSeedRequest struct {
+	Guest         EnvironmentCreateGuestRequest `json:"guest"`
+	ProjectSeedID string                        `json:"projectSeedId"`
+}
+
 type EnvironmentProjectSeedApplicator interface {
-	ApplyEnvironmentProjectSeed(context.Context, EnvironmentCreateGuestRequest) error
+	// EnsureEnvironmentProjectSeedApplied must be idempotent for the stable
+	// Operation and Project Seed identities in request. A retry must never
+	// overwrite user-owned content produced by the first attempt.
+	EnsureEnvironmentProjectSeedApplied(context.Context, EnvironmentProjectSeedRequest) error
 }
 
 type EnvironmentCapsuleMaterializationRequest struct {
@@ -179,7 +205,10 @@ type EnvironmentCapsuleMaterializationRequest struct {
 }
 
 type EnvironmentCapsuleMaterializer interface {
-	MaterializeEnvironmentCapsule(context.Context, EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error)
+	// EnsureEnvironmentCapsuleMaterialized must replay the same converged result
+	// for a stable Operation ID and Capsule Lock digest after an ambiguous
+	// transport failure.
+	EnsureEnvironmentCapsuleMaterialized(context.Context, EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error)
 }
 
 type EnvironmentCredentialBindingStatus string
@@ -218,6 +247,7 @@ type EnvironmentCreateDependencies struct {
 	Capsules             EnvironmentCreationCapsuleActions
 	SSHIdentity          EnvironmentSSHIdentityRestorer
 	GuestReadiness       RuntimeGuestReadinessSource
+	SSHKeys              RuntimeSSHKeyReconciler
 	ProjectSeed          EnvironmentProjectSeedApplicator
 	Materializer         EnvironmentCapsuleMaterializer
 	Credentials          EnvironmentCredentialBinder
@@ -254,7 +284,7 @@ func legacyEnvironmentCreateDependencies(providerAdapter EnvironmentCreateProvid
 	guest := legacyEnvironmentCreateGuest{}
 	return EnvironmentCreateDependencies{
 		Provider: providerAdapter, Actions: actions, Capsules: actions,
-		SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+		SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
 		Credentials: NoProjectCredentialBinder{}, Toolchain: guest,
 		IDs: ids, Now: now, ImageVersion: imageVersion,
 	}
@@ -270,11 +300,15 @@ func (legacyEnvironmentCreateGuest) WaitForRuntimeReady(_ context.Context, reque
 	return RuntimeGuestReadiness{BootID: "foundation-boot", PrivateIPv4: request.PrivateIPv4, DataMounted: true}, nil
 }
 
-func (legacyEnvironmentCreateGuest) ApplyEnvironmentProjectSeed(context.Context, EnvironmentCreateGuestRequest) error {
+func (legacyEnvironmentCreateGuest) ReconcileRuntimeSSHKeys(context.Context, RuntimeGuestReadinessRequest) error {
 	return nil
 }
 
-func (legacyEnvironmentCreateGuest) MaterializeEnvironmentCapsule(_ context.Context, request EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+func (legacyEnvironmentCreateGuest) EnsureEnvironmentProjectSeedApplied(context.Context, EnvironmentProjectSeedRequest) error {
+	return nil
+}
+
+func (legacyEnvironmentCreateGuest) EnsureEnvironmentCapsuleMaterialized(_ context.Context, request EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
 	return request.State.ApplyResults, nil
 }
 
@@ -290,9 +324,16 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	if dependencies.Actions == nil || dependencies.Now == nil {
 		return EnvironmentCreateOutput{}, restate.TerminalErrorf("Environment create workflow projection dependencies are incomplete")
 	}
-	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
-		return classifyDurableError(dependencies.Actions.RecordEnvironmentCreateInvocation(runCtx, input.OperationID, runCtx.Request().ID, dependencies.Now()))
-	}, restate.WithName("record-invocation")); err != nil {
+	invocation, recordErr := restate.Run(ctx, func(runCtx restate.RunContext) (EnvironmentCreateInvocation, error) {
+		invocation, recordErr := dependencies.Actions.RecordEnvironmentCreateInvocation(runCtx, input.OperationID, runCtx.Request().ID, dependencies.Now())
+		return invocation, classifyDurableError(recordErr)
+	}, restate.WithName("record-invocation"))
+	if recordErr != nil {
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, nil, EnvironmentCreateOperationOutcome{
+			Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: recordErr.Error(),
+		}, dependencies.Now)
+	}
+	if err := validateEnvironmentCreateInvocation(input, invocation); err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, nil, EnvironmentCreateOperationOutcome{
 			Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error(),
 		}, dependencies.Now)
@@ -420,6 +461,20 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 			Kind: EnvironmentCreateOutcomeFailed, Code: string(provider.ErrorCodeResourceDiverged), Message: fmt.Sprintf("provisioned Runtime state is %q", ensured.Runtime.State),
 		}, dependencies.Now)
 	}
+	attached, durableErr := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
+		observed, attachErr := dependencies.Provider.EnsureRuntimeDataVolumeAttachment(runCtx, lifecycleRequest)
+		outcome, outcomeErr := providerOutcome(observed, attachErr)
+		return timestampProviderOutcome(outcome, outcomeErr, dependencies.Now())
+	}, restate.WithName("ensure-runtime-data-volume-attachment"))
+	if durableErr != nil {
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: durableErr.Error()}, dependencies.Now)
+	}
+	if attached.Failure != "" {
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: attached.FailureCode, Message: attached.Failure}, dependencies.Now)
+	}
+	if err := validateProviderRuntimeIdentity(attached.Runtime, lifecycleRequest); err != nil {
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: string(provider.ErrorCodeResourceDiverged), Message: err.Error()}, dependencies.Now)
+	}
 	starting, err := provisioning.BeginStart(dependencies.Now())
 	if err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
@@ -441,7 +496,8 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	guestRequest := EnvironmentCreateGuestRequest{
 		OperationID: input.OperationID,
 		RuntimeGuestReadinessRequest: RuntimeGuestReadinessRequest{
-			EnvironmentID: input.EnvironmentID, RuntimeID: runtimeID, ProviderID: running.Runtime.ProviderID, PrivateIPv4: running.Runtime.PrivateIPv4,
+			OwnerUserID: invocation.OwnerUserID, EnvironmentID: input.EnvironmentID, RuntimeID: runtimeID,
+			ProviderID: running.Runtime.ProviderID, PrivateIPv4: running.Runtime.PrivateIPv4,
 		},
 	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
@@ -455,7 +511,12 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 	}
 	guestRequest.PrivateIPv4 = ready.PrivateIPv4
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
-		return classifyDurableError(dependencies.ProjectSeed.ApplyEnvironmentProjectSeed(runCtx, guestRequest))
+		return classifyDurableError(dependencies.SSHKeys.ReconcileRuntimeSSHKeys(runCtx, guestRequest.RuntimeGuestReadinessRequest))
+	}, restate.WithName("reconcile-environment-ssh-keys")); err != nil {
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: EnvironmentCreateFailed, Message: err.Error()}, dependencies.Now)
+	}
+	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
+		return classifyDurableError(dependencies.ProjectSeed.EnsureEnvironmentProjectSeedApplied(runCtx, EnvironmentProjectSeedRequest{Guest: guestRequest, ProjectSeedID: invocation.ProjectSeedID}))
 	}, restate.WithName("apply-project-seed")); err != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: "PROJECT_SEED_INVALID", Message: err.Error()}, dependencies.Now)
 	}
@@ -473,11 +534,14 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: "PROFILE_INCOMPATIBLE", Message: err.Error()}, dependencies.Now)
 	}
 	applyResults, durableErr := restate.Run(ctx, func(runCtx restate.RunContext) ([]profile.ProfileMaterializationResult, error) {
-		results, materializeErr := dependencies.Materializer.MaterializeEnvironmentCapsule(runCtx, EnvironmentCapsuleMaterializationRequest{Guest: guestRequest, State: state})
+		results, materializeErr := dependencies.Materializer.EnsureEnvironmentCapsuleMaterialized(runCtx, EnvironmentCapsuleMaterializationRequest{Guest: guestRequest, State: state})
 		return results, classifyDurableError(materializeErr)
 	}, restate.WithName("materialize-capsule-lock"))
 	if durableErr != nil {
 		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: "PROFILE_CONFLICT", Message: durableErr.Error()}, dependencies.Now)
+	}
+	if err := validateEnvironmentMaterializationResults(state.CapsuleLock, applyResults); err != nil {
+		return EnvironmentCreateOutput{}, failEnvironmentCreation(ctx, dependencies.Actions, input.OperationID, &runtimeState, EnvironmentCreateOperationOutcome{Kind: EnvironmentCreateOutcomeFailed, Code: "PROFILE_CONFLICT", Message: err.Error()}, dependencies.Now)
 	}
 	state.ApplyResults = applyResults
 	state.Materializations = InstalledMaterializationsFromApplyResults(applyResults)
@@ -529,10 +593,18 @@ func (workflow *environmentCreateWorkflow) Run(ctx restate.WorkflowContext, inpu
 
 func validateEnvironmentCreateDependencies(dependencies EnvironmentCreateDependencies) error {
 	if dependencies.Provider == nil || dependencies.Actions == nil || dependencies.Capsules == nil ||
-		dependencies.SSHIdentity == nil || dependencies.GuestReadiness == nil || dependencies.ProjectSeed == nil ||
+		dependencies.SSHIdentity == nil || dependencies.GuestReadiness == nil || dependencies.SSHKeys == nil || dependencies.ProjectSeed == nil ||
 		dependencies.Materializer == nil || dependencies.Credentials == nil || dependencies.Toolchain == nil ||
 		dependencies.IDs == nil || dependencies.Now == nil || strings.TrimSpace(dependencies.ImageVersion) == "" {
 		return errors.New("Environment create workflow dependencies are incomplete")
+	}
+	return nil
+}
+
+func validateEnvironmentCreateInvocation(input domain.EnvironmentCreateDispatch, invocation EnvironmentCreateInvocation) error {
+	if strings.TrimSpace(invocation.OwnerUserID) == "" || strings.TrimSpace(invocation.ProjectSeedID) == "" ||
+		invocation.EnvironmentID != input.EnvironmentID {
+		return errors.New("Environment create invocation ownership or Project Seed diverged")
 	}
 	return nil
 }
@@ -677,6 +749,50 @@ func validateEnvironmentCapsuleState(input domain.EnvironmentCreateDispatch, sta
 	}
 	if !state.UpgradePolicy.Valid() {
 		return fmt.Errorf("Environment Capsule state has invalid upgrade policy %q", state.UpgradePolicy)
+	}
+	return nil
+}
+
+func validateEnvironmentMaterializationResults(lock domain.CapsuleLockSnapshot, results []profile.ProfileMaterializationResult) error {
+	if len(results) != len(lock.ResolvedComponents) {
+		return fmt.Errorf("Capsule Lock materialization returned %d results for %d resolved Components", len(results), len(lock.ResolvedComponents))
+	}
+	seen := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		component, ok := lock.ResolvedComponents[result.ComponentID]
+		if !ok {
+			return fmt.Errorf("Capsule Lock materialization returned unknown Component %q", result.ComponentID)
+		}
+		if _, duplicate := seen[result.ComponentID]; duplicate {
+			return fmt.Errorf("Capsule Lock materialization returned duplicate Component %q", result.ComponentID)
+		}
+		seen[result.ComponentID] = struct{}{}
+		if result.ID == "" || result.LockID != lock.ID || result.LockDigest != lock.Digest ||
+			result.CapsuleDigest != component.CapsuleDigest || result.ComponentDigest != component.ComponentDigest ||
+			result.Scope != component.Scope {
+			return fmt.Errorf("Capsule Lock materialization identity diverged for Component %q", result.ComponentID)
+		}
+		switch result.Operation {
+		case profile.OperationCreate, profile.OperationUpdate, profile.OperationSkip:
+		default:
+			return fmt.Errorf("Capsule Lock materialization did not converge for Component %q: operation %q", result.ComponentID, result.Operation)
+		}
+		if result.ApprovalRequired {
+			return fmt.Errorf("Capsule Lock materialization still requires approval for Component %q", result.ComponentID)
+		}
+		switch result.Mode {
+		case profile.MaterializationManaged, profile.MaterializationSeeded:
+		case profile.MaterializationReferenced:
+			if result.Operation != profile.OperationSkip || result.RequirementState != profile.RequirementBound {
+				return fmt.Errorf("referenced Capsule Lock materialization did not bind Component %q", result.ComponentID)
+			}
+			continue
+		default:
+			return fmt.Errorf("Capsule Lock materialization returned invalid mode %q for Component %q", result.Mode, result.ComponentID)
+		}
+		if result.DesiredDigest == "" || result.LastAppliedDigest != result.DesiredDigest || result.ObservedDigest != result.DesiredDigest {
+			return fmt.Errorf("Capsule Lock materialization digests did not converge for Component %q", result.ComponentID)
+		}
 	}
 	return nil
 }

@@ -67,6 +67,16 @@ func (fake *Provider) EnsureRuntime(_ context.Context, request provider.EnsureRu
 	return runtime, nil
 }
 
+func (fake *Provider) EnsureRuntimeDataVolumeAttachment(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	runtime, ok := fake.runtimes[request.RuntimeID]
+	if !ok || runtime.ProviderID != request.ProviderID || runtime.RuntimeSpec != request.RuntimeSpec {
+		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Runtime attachment identity diverged", nil)
+	}
+	return runtime, nil
+}
+
 func (fake *Provider) ObserveRuntime(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()

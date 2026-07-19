@@ -40,6 +40,16 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	assertSameRuntime(t, replayed, ensured)
 
 	request := provider.RuntimeLifecycleRequest{RuntimeSpec: harness.Request.RuntimeSpec, ProviderID: ensured.ProviderID}
+	attached, err := harness.Adapter.EnsureRuntimeDataVolumeAttachment(ctx, request)
+	if err != nil {
+		t.Fatalf("EnsureRuntimeDataVolumeAttachment(): %v", err)
+	}
+	assertSameRuntime(t, attached, ensured)
+	replayed, err = harness.Adapter.EnsureRuntimeDataVolumeAttachment(ctx, request)
+	if err != nil {
+		t.Fatalf("EnsureRuntimeDataVolumeAttachment() replay: %v", err)
+	}
+	assertSameRuntime(t, replayed, attached)
 	diverged := request
 	diverged.Sequence++
 	if _, err := harness.Adapter.ObserveRuntime(ctx, diverged); !hasCode(err, provider.ErrorCodeResourceDiverged) {

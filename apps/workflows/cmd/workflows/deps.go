@@ -333,11 +333,11 @@ func (unavailableGuestTransport) RestoreEnvironmentSSHIdentity(context.Context, 
 	return unavailableGuestTransportError{operation: "Environment SSH identity restoration"}
 }
 
-func (unavailableGuestTransport) ApplyEnvironmentProjectSeed(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+func (unavailableGuestTransport) EnsureEnvironmentProjectSeedApplied(context.Context, workflows.EnvironmentProjectSeedRequest) error {
 	return unavailableGuestTransportError{operation: "Project Seed application"}
 }
 
-func (unavailableGuestTransport) MaterializeEnvironmentCapsule(context.Context, workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+func (unavailableGuestTransport) EnsureEnvironmentCapsuleMaterialized(context.Context, workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
 	return nil, unavailableGuestTransportError{operation: "Capsule Lock materialization"}
 }
 

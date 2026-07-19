@@ -18,6 +18,7 @@ type recordingEC2 struct {
 	runInput    *ec2.RunInstancesInput
 	attachInput *ec2.AttachVolumeInput
 	runErr      error
+	attachErr   error
 }
 
 type divergentRuntimeEC2 struct {
@@ -99,6 +100,12 @@ func (client *recordingEC2) DescribeVolumes(_ context.Context, _ *ec2.DescribeVo
 }
 
 func (client *recordingEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+	if client.runInput != nil {
+		instance := ownedInstanceForTest("i-runtime", "runtime-1")
+		instance.State.Name = types.InstanceStateNamePending
+		instance.PrivateIpAddress = nil
+		return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{instance}}}}, nil
+	}
 	return &ec2.DescribeInstancesOutput{}, nil
 }
 
@@ -115,10 +122,13 @@ func (client *recordingEC2) RunInstances(_ context.Context, input *ec2.RunInstan
 
 func (client *recordingEC2) AttachVolume(_ context.Context, input *ec2.AttachVolumeInput, _ ...func(*ec2.Options)) (*ec2.AttachVolumeOutput, error) {
 	client.attachInput = input
+	if client.attachErr != nil {
+		return nil, client.attachErr
+	}
 	return &ec2.AttachVolumeOutput{DeleteOnTermination: aws.Bool(false)}, nil
 }
 
-func TestEnsureRuntimeLaunchesPrivateOwnedRuntimeAndAttachesPersistentData(t *testing.T) {
+func TestEnsureRuntimeInventoriesAllocationBeforeAttachingPersistentData(t *testing.T) {
 	client := &recordingEC2{}
 	adapter, err := newProvider(client, Config{
 		Region: "us-east-1", Environment: "development", SizeGiB: 100,
@@ -139,8 +149,35 @@ func TestEnsureRuntimeLaunchesPrivateOwnedRuntimeAndAttachesPersistentData(t *te
 		t.Fatalf("Runtime = %#v", runtime)
 	}
 	assertRuntimeLaunchInput(t, client.runInput)
+	if client.attachInput != nil {
+		t.Fatalf("EnsureRuntime attached Data Volume before allocation was inventoried: %#v", client.attachInput)
+	}
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	if _, err := adapter.EnsureRuntimeDataVolumeAttachment(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: runtime.ProviderID}); err != nil {
+		t.Fatalf("EnsureRuntimeDataVolumeAttachment(): %v", err)
+	}
 	if client.attachInput == nil || aws.ToString(client.attachInput.InstanceId) != "i-runtime" || aws.ToString(client.attachInput.VolumeId) != "vol-data" || aws.ToString(client.attachInput.Device) != "/dev/sdf" {
 		t.Fatalf("AttachVolume input = %#v", client.attachInput)
+	}
+}
+
+func TestRuntimeAttachmentFailureDoesNotHideAllocatedIdentity(t *testing.T) {
+	client := &recordingEC2{attachErr: &smithy.GenericAPIError{Code: "InternalError", Message: "attach failed"}}
+	adapter, err := newProvider(client, Config{
+		Region: "us-east-1", Environment: "development", SizeGiB: 100,
+		Runtime: RuntimeConfig{AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"}, SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 30},
+	})
+	if err != nil {
+		t.Fatalf("newProvider(): %v", err)
+	}
+	request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+	runtime, err := adapter.EnsureRuntime(t.Context(), request)
+	if err != nil || runtime.ProviderID != "i-runtime" {
+		t.Fatalf("allocated Runtime = %#v error:%v", runtime, err)
+	}
+	_, err = adapter.EnsureRuntimeDataVolumeAttachment(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: runtime.ProviderID})
+	if err == nil || runtime.ProviderID == "" {
+		t.Fatalf("attachment error = %v after allocation %#v", err, runtime)
 	}
 }
 
@@ -238,11 +275,15 @@ func TestRuntimeReplacementRetiresOldBeforeReattachingPersistentData(t *testing.
 	if err != nil {
 		t.Fatalf("EnsureRuntime(): %v", err)
 	}
+	oldLifecycle := provider.RuntimeLifecycleRequest{RuntimeSpec: oldRequest.RuntimeSpec, ProviderID: old.ProviderID}
+	if _, err := adapter.EnsureRuntimeDataVolumeAttachment(t.Context(), oldLifecycle); err != nil {
+		t.Fatalf("attach old Runtime Data Volume: %v", err)
+	}
 	newRequest := runtimeRequest("runtime-2", 2, "image-v2", volume.ProviderID)
 	if _, err := adapter.EnsureRuntime(t.Context(), newRequest); err == nil {
 		t.Fatal("EnsureRuntime() attached replacement before retiring old Runtime")
 	}
-	lifecycle := provider.RuntimeLifecycleRequest{RuntimeSpec: oldRequest.RuntimeSpec, ProviderID: old.ProviderID}
+	lifecycle := oldLifecycle
 	if _, err := adapter.StartRuntime(t.Context(), lifecycle); err != nil {
 		t.Fatalf("StartRuntime(): %v", err)
 	}
@@ -258,6 +299,9 @@ func TestRuntimeReplacementRetiresOldBeforeReattachingPersistentData(t *testing.
 	}
 	if replacement.ProviderID == old.ProviderID || replacement.RuntimeID != "runtime-2" {
 		t.Fatalf("replacement Runtime = %#v; old = %#v", replacement, old)
+	}
+	if _, err := adapter.EnsureRuntimeDataVolumeAttachment(t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: newRequest.RuntimeSpec, ProviderID: replacement.ProviderID}); err != nil {
+		t.Fatalf("attach replacement Runtime Data Volume: %v", err)
 	}
 	volumes := describeVolumes(t, ec2Client)
 	if len(volumes) != 1 || len(volumes[0].Attachments) != 1 || aws.ToString(volumes[0].Attachments[0].InstanceId) != replacement.ProviderID || aws.ToBool(volumes[0].Attachments[0].DeleteOnTermination) {

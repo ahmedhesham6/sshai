@@ -126,7 +126,7 @@ func run(ctx context.Context) error {
 		polarDeliverer: polarClient, polarStore: store, now: time.Now,
 		environmentCreate: workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
 			Provider: runtimeProvider, Actions: creationActions, Capsules: creationActions,
-			SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+			SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
 			Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
 			IDs: idGenerator{}, Now: time.Now, ImageVersion: config.imageVersion,
 		}),
@@ -200,11 +200,11 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	dataVolumeSizeGiB, err := int32OrDefault("DATA_VOLUME_SIZE_GIB", 20)
+	dataVolumeSizeGiB, err := int32OrDefault("DATA_VOLUME_SIZE_GIB", 100)
 	if err != nil {
 		return config{}, err
 	}
-	runtimeSystemVolumeGiB, err := int32OrDefault("RUNTIME_SYSTEM_VOLUME_GIB", 20)
+	runtimeSystemVolumeGiB, err := int32OrDefault("RUNTIME_SYSTEM_VOLUME_GIB", 30)
 	if err != nil {
 		return config{}, err
 	}
@@ -215,7 +215,7 @@ func loadConfig() (config, error) {
 		listenAddress:       valueOrDefault("LISTEN_ADDR", ":9080"),
 		restateIngressURL:   valueOrDefault("RESTATE_INGRESS_URL", "http://localhost:8080"),
 
-		defaultRegion: valueOrDefault("DEFAULT_REGION", "us-east-1"),
+		defaultRegion: valueOrDefault("DEFAULT_REGION", "eu-central-1"),
 		s3EndpointURL: os.Getenv("AWS_ENDPOINT_URL_S3"),
 		capsuleBucket: os.Getenv("CAPSULE_BUCKET"),
 

@@ -803,6 +803,9 @@ type runtimeProviderFake struct {
 func (fake *runtimeProviderFake) EnsureRuntime(context.Context, provider.EnsureRuntimeRequest) (provider.Runtime, error) {
 	return provider.Runtime{}, errors.New("unexpected EnsureRuntime")
 }
+func (fake *runtimeProviderFake) EnsureRuntimeDataVolumeAttachment(context.Context, provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return provider.Runtime{}, errors.New("unexpected EnsureRuntimeDataVolumeAttachment")
+}
 func (fake *runtimeProviderFake) StartRuntime(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
 	fake.startCalls++
 	if request.RuntimeSpec != fake.runtime.RuntimeSpec || request.ProviderID != fake.runtime.ProviderID {

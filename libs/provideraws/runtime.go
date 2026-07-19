@@ -44,13 +44,6 @@ func (adapter *Provider) EnsureRuntime(ctx context.Context, request provider.Ens
 		if err := adapter.validateSoleActiveRuntime(ctx, request.EnvironmentID, observation.ProviderID); err != nil {
 			return provider.Runtime{}, err
 		}
-		volume, err := adapter.dataVolume(ctx, request.RuntimeSpec)
-		if err != nil {
-			return provider.Runtime{}, err
-		}
-		if err := adapter.ensureDataVolumeAttachment(ctx, request.DataVolumeProviderID, instance, volume); err != nil {
-			return provider.Runtime{}, err
-		}
 		return observation, nil
 	}
 	active, err := adapter.findActiveRuntimes(ctx, request.EnvironmentID)
@@ -77,11 +70,26 @@ func (adapter *Provider) EnsureRuntime(ctx context.Context, request provider.Ens
 	if len(output.Instances) != 1 {
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "provider returned an invalid Runtime allocation", nil)
 	}
-	instance := output.Instances[0]
-	if err := adapter.ensureDataVolumeAttachment(ctx, request.DataVolumeProviderID, instance, volume); err != nil {
+	return runtimeObservation(request.RuntimeSpec, output.Instances[0])
+}
+
+// EnsureRuntimeDataVolumeAttachment idempotently attaches the persistent Data
+// Volume to an already-inventoried Runtime. Allocation deliberately lives in
+// EnsureRuntime so callers can durably record provider identity before this
+// second side effect begins.
+func (adapter *Provider) EnsureRuntimeDataVolumeAttachment(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	observation, err := adapter.ObserveRuntime(ctx, request)
+	if err != nil {
 		return provider.Runtime{}, err
 	}
-	return runtimeObservation(request.RuntimeSpec, instance)
+	volume, err := adapter.dataVolume(ctx, request.RuntimeSpec)
+	if err != nil {
+		return provider.Runtime{}, err
+	}
+	if err := adapter.ensureDataVolumeAttachment(ctx, request.DataVolumeProviderID, types.Instance{InstanceId: aws.String(request.ProviderID)}, volume); err != nil {
+		return provider.Runtime{}, err
+	}
+	return observation, nil
 }
 
 func (adapter *Provider) StartRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {

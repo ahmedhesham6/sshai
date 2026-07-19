@@ -16,6 +16,12 @@ func (store *Store) PersistEnvironmentCreateRuntimeTransition(ctx context.Contex
 	if operationID == "" || expectedVersion < 1 || next.ID == "" || next.EnvironmentID == "" {
 		return permanent(errors.New("persist Environment create Runtime transition: Operation, Runtime, Environment, and version are required"))
 	}
+	if _, err := domain.RestoreRuntime(next); err != nil {
+		return permanent(fmt.Errorf("persist Environment create Runtime transition: validate next Runtime: %w", err))
+	}
+	if next.Version != expectedVersion+1 {
+		return permanent(fmt.Errorf("persist Environment create Runtime transition: next version %d does not follow expected version %d", next.Version, expectedVersion))
+	}
 	result, err := store.pool.Exec(ctx, `
 		UPDATE runtimes runtime
 		SET status = $4, provider_instance_ref = $5, private_address = $6, boot_id = $7,
@@ -23,18 +29,54 @@ func (store *Store) PersistEnvironmentCreateRuntimeTransition(ctx context.Contex
 		    updated_at = $11, version = $12
 		FROM environments environment, operations operation
 		WHERE operation.id = $1 AND operation.type = 'environment.create'
+		  AND operation.status IN ('queued', 'running')
 		  AND operation.environment_id = environment.id
 		  AND environment.current_runtime_id = runtime.id
 		  AND runtime.id = $2 AND runtime.environment_id = $3
-		  AND runtime.version = $13`,
+		  AND runtime.version = $13
+		  AND runtime.sequence = $14 AND runtime.runtime_preset = $15
+		  AND runtime.region = $16 AND runtime.availability_zone = $17
+		  AND runtime.image_version = $18 AND runtime.created_at = $19`,
 		operationID, next.ID, next.EnvironmentID, string(next.Status), next.ProviderInstanceRef,
 		next.PrivateAddress, next.BootID, next.StartedAt, next.StoppedAt, next.RetiredAt,
-		next.UpdatedAt, next.Version, expectedVersion)
+		next.UpdatedAt, next.Version, expectedVersion, next.Sequence, next.RuntimePreset,
+		next.Region, next.AvailabilityZone, next.ImageVersion, next.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("persist Environment create Runtime transition: %w", err)
 	}
 	if result.RowsAffected() != 1 {
-		return permanent(domain.ErrStaleRuntimeObservation)
+		var replayed bool
+		if err := store.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM runtimes runtime
+				JOIN environments environment ON environment.current_runtime_id = runtime.id
+				JOIN operations operation ON operation.environment_id = environment.id
+				WHERE operation.id = $1 AND operation.type = 'environment.create'
+				  AND operation.status IN ('queued', 'running')
+				  AND runtime.id = $2 AND runtime.environment_id = $3
+				  AND runtime.status = $4
+				  AND runtime.provider_instance_ref IS NOT DISTINCT FROM $5::text
+				  AND runtime.private_address IS NOT DISTINCT FROM $6::text
+				  AND runtime.boot_id IS NOT DISTINCT FROM $7::text
+				  AND runtime.started_at IS NOT DISTINCT FROM $8::timestamptz
+				  AND runtime.stopped_at IS NOT DISTINCT FROM $9::timestamptz
+				  AND runtime.retired_at IS NOT DISTINCT FROM $10::timestamptz
+				  AND runtime.updated_at = $11 AND runtime.version = $12
+				  AND runtime.sequence = $13 AND runtime.runtime_preset = $14
+				  AND runtime.region = $15 AND runtime.availability_zone = $16
+				  AND runtime.image_version = $17 AND runtime.created_at = $18
+			)`,
+			operationID, next.ID, next.EnvironmentID, string(next.Status), next.ProviderInstanceRef,
+			next.PrivateAddress, next.BootID, next.StartedAt, next.StoppedAt, next.RetiredAt,
+			next.UpdatedAt, next.Version, next.Sequence, next.RuntimePreset,
+			next.Region, next.AvailabilityZone, next.ImageVersion, next.CreatedAt,
+		).Scan(&replayed); err != nil {
+			return fmt.Errorf("persist Environment create Runtime transition: load replay: %w", err)
+		}
+		if !replayed {
+			return permanent(domain.ErrStaleRuntimeObservation)
+		}
 	}
 	return nil
 }

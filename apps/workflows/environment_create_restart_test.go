@@ -4,6 +4,7 @@ package workflows_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -147,7 +148,7 @@ func newResumableCreationActions(gate *terminationGate) *resumableCreationAction
 	return &resumableCreationActions{gate: gate}
 }
 
-func (actions *resumableCreationActions) RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error {
+func (actions *resumableCreationActions) RecordEnvironmentCreateInvocation(_ context.Context, operationID string, _ string, _ time.Time) (workflows.EnvironmentCreateInvocation, error) {
 	actions.mu.Lock()
 	actions.recordAttempts++
 	if !actions.recorded {
@@ -156,7 +157,9 @@ func (actions *resumableCreationActions) RecordEnvironmentCreateInvocation(conte
 	}
 	actions.mu.Unlock()
 	actions.gate.hit("record")
-	return nil
+	return workflows.EnvironmentCreateInvocation{
+		OwnerUserID: "user-1", EnvironmentID: strings.Replace(operationID, "operation", "environment", 1), ProjectSeedID: "project-seed-1",
+	}, nil
 }
 
 func (actions *resumableCreationActions) InventoryEnvironmentState(_ context.Context, _ string, reservation domain.EnvironmentStateReservation) (string, error) {
