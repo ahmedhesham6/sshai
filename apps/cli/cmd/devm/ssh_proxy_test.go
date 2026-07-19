@@ -170,6 +170,11 @@ func TestSSHProxyCommandRendersProgressUntilReadyThenBridgesBinary(t *testing.T)
 		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: "advisory", Message: "ignored"})
 		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "waiting-for-guest", Message: peerMessage})
 		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "resolving-route", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "dialing-runtime", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "credits-blocked", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "operation-conflict", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "client-protocol", Message: peerMessage})
+		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "intent-invalid", Message: peerMessage})
 		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlProgress, Step: "future-step", Message: peerMessage})
 		writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlReady})
 		messageType, content, err := socket.Read(ctx)
@@ -197,9 +202,116 @@ func TestSSHProxyCommandRendersProgressUntilReadyThenBridgesBinary(t *testing.T)
 	wantProgress := "devm: starting-runtime: Starting Runtime\n" +
 		"devm: waiting-for-guest: Waiting for SSH readiness\n" +
 		"devm: resolving-route: Resolving the Runtime route\n" +
+		"devm: dialing-runtime: Connecting to Runtime SSH\n" +
+		"devm: credits-blocked: Checking Credit Balance\n" +
+		"devm: operation-conflict: Checking active Environment Operations\n" +
+		"devm: client-protocol: Negotiating the SSH connection\n" +
+		"devm: intent-invalid: Validating the Connection Intent\n" +
 		"devm: Preparing SSH connection\n"
 	if stderr.String() != wantProgress {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), wantProgress)
+	}
+}
+
+func TestSSHProxyCommandMapsEveryKnownControlFailureToClientOwnedText(t *testing.T) {
+	for _, test := range []struct {
+		step connection.Step
+		want string
+	}{
+		{step: connection.StepStartingRuntime, want: "the Runtime could not be started"},
+		{step: connection.StepWaitingForGuest, want: "SSH readiness could not be confirmed"},
+		{step: connection.StepResolvingRoute, want: "the Runtime route could not be resolved"},
+		{step: connection.StepDialingRuntime, want: "the Runtime was reached but its SSH service was not connectable"},
+		{step: connection.StepCreditsBlocked, want: creditsBlockedText},
+		{step: connection.StepOperationConflict, want: "another Environment Operation prevented the Runtime connection"},
+		{step: connection.StepClientProtocol, want: "the client and regional proxy connection protocol was rejected"},
+		{step: connection.StepIntentInvalid, want: "the Connection Intent was no longer valid; retry the connection"},
+	} {
+		t.Run(string(test.step), func(t *testing.T) {
+			const peerMessage = "PEER_MESSAGE_MUST_NOT_BE_PRINTED"
+			server := newProxyControlServer(t, "ACCESS_SECRET", "env_01", func(ctx context.Context, socket *websocket.Conn) {
+				writeControlFrame(t, ctx, socket, connection.ControlFrame{Type: connection.ControlFailed, Step: test.step, Message: peerMessage})
+			})
+			defer server.Close()
+			command := sshProxyCommand{
+				controlPlaneURL: server.URL + "/v1", httpClient: server.Client(),
+				tokens: staticAccessTokenSource{token: "ACCESS_SECRET"}, attempt: "attempt-01",
+				input: bytes.NewReader(nil), output: io.Discard, now: time.Now,
+			}
+			message := fmt.Sprint(command.run(context.Background(), "env_01"))
+			if !strings.Contains(message, test.want) || strings.Contains(message, peerMessage) {
+				t.Fatalf("failure text = %q, want client text %q", message, test.want)
+			}
+		})
+	}
+}
+
+func TestSSHProxyCommandRetriesTransientConnectionIntentWithSameKey(t *testing.T) {
+	const token = "ACCESS_SECRET"
+	var server *httptest.Server
+	var calls int
+	var keys []string
+	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", request.Header.Get("Authorization"))
+		}
+		switch request.URL.Path {
+		case "/v1/environments/env_01/connection-intents":
+			calls++
+			keys = append(keys, request.Header.Get("Idempotency-Key"))
+			if calls < 3 {
+				http.Error(response, "transient", http.StatusServiceUnavailable)
+				return
+			}
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(response).Encode(contracts.ConnectionIntent{
+				Id: "intent-01", EnvironmentId: "env_01", LogicalHostname: "env_01",
+				ProxyUrl:  strings.Replace(server.URL, "https://", "wss://", 1) + "/v1/environments/env_01/ssh",
+				ExpiresAt: time.Now().Add(time.Minute),
+			})
+		case "/v1/environments/env_01/ssh":
+			socket, err := websocket.Accept(response, request, nil)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer socket.CloseNow()
+			writeControlFrame(t, request.Context(), socket, connection.ControlFrame{Type: connection.ControlReady})
+			_ = socket.Close(websocket.StatusNormalClosure, "")
+		default:
+			http.NotFound(response, request)
+		}
+	})
+	server = httptest.NewTLSServer(handler)
+	defer server.Close()
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(), tokens: staticAccessTokenSource{token: token},
+		attempt: "attempt-01", input: bytes.NewReader(nil), output: io.Discard, now: time.Now,
+	}
+	if err := command.run(context.Background(), "env_01"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || len(keys) != 3 || keys[0] == "" || keys[0] != keys[1] || keys[1] != keys[2] {
+		t.Fatalf("intent retries = calls:%d keys:%q", calls, keys)
+	}
+}
+
+func TestSSHProxyCommandDoesNotRetryConnectionIntent4xx(t *testing.T) {
+	var calls int
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		calls++
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusBadRequest)
+		_, _ = response.Write([]byte(`{"malformed"`))
+	}))
+	defer server.Close()
+	command := sshProxyCommand{
+		controlPlaneURL: server.URL + "/v1", httpClient: server.Client(), tokens: staticAccessTokenSource{token: "ACCESS_SECRET"},
+		attempt: "attempt-01", input: bytes.NewReader(nil), output: io.Discard, now: time.Now,
+	}
+	if err := command.run(context.Background(), "env_01"); err == nil || calls != 1 {
+		t.Fatalf("4xx retry result = calls:%d error:%v", calls, err)
 	}
 }
 

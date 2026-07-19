@@ -10,6 +10,7 @@ import (
 	sshproxy "github.com/ahmedhesham6/sshai/apps/ssh-proxy"
 	"github.com/ahmedhesham6/sshai/libs/auth"
 	dbstore "github.com/ahmedhesham6/sshai/libs/db"
+	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -53,24 +54,40 @@ type postgresIntentStore struct {
 	now   func() time.Time
 }
 
+func (store postgresIntentStore) Validate(ctx context.Context, subject auth.Subject, intentID, environmentID string) error {
+	if store.store == nil || store.now == nil {
+		return errors.New("validate Connection Intent: store is unavailable")
+	}
+	_, err := store.store.ValidateConnectionIntent(ctx, subject.WorkOSUserID, intentID, environmentID, store.now().UTC())
+	return mapConnectionIntentError(err)
+}
+
 func (store postgresIntentStore) Consume(ctx context.Context, subject auth.Subject, intentID, environmentID string) (sshproxy.ConnectionIntentAttempt, error) {
 	if store.store == nil || store.now == nil {
 		return sshproxy.ConnectionIntentAttempt{}, errors.New("consume Connection Intent: store is unavailable")
 	}
 	record, err := store.store.ConsumeConnectionIntent(ctx, subject.WorkOSUserID, intentID, environmentID, store.now().UTC())
 	if err != nil {
-		switch {
-		case errors.Is(err, dbstore.ErrConnectionIntentNotFound):
-			return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentNotFound
-		case errors.Is(err, dbstore.ErrConnectionIntentExpired):
-			return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentExpired
-		case errors.Is(err, dbstore.ErrConnectionIntentUsed):
-			return sshproxy.ConnectionIntentAttempt{}, sshproxy.ErrConnectionIntentUsed
-		default:
-			return sshproxy.ConnectionIntentAttempt{}, err
-		}
+		return sshproxy.ConnectionIntentAttempt{}, mapConnectionIntentError(err)
 	}
 	return sshproxy.ConnectionIntentAttempt{OperationID: record.OperationID}, nil
+}
+
+func mapConnectionIntentError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, dbstore.ErrConnectionIntentNotFound):
+		return sshproxy.ErrConnectionIntentNotFound
+	case errors.Is(err, dbstore.ErrConnectionIntentExpired):
+		return sshproxy.ErrConnectionIntentExpired
+	case errors.Is(err, dbstore.ErrConnectionIntentUsed):
+		return sshproxy.ErrConnectionIntentUsed
+	case errors.Is(err, dbstore.ErrConnectionIntentInvariant):
+		return sshproxy.ErrConnectionIntentInvalid
+	default:
+		return err
+	}
 }
 
 func (store postgresRouteStore) ResolveSSH(ctx context.Context, subject auth.Subject, environmentID string) (sshproxy.EnvironmentSSHRoute, error) {
@@ -85,10 +102,10 @@ func (store postgresRouteStore) ResolveSSH(ctx context.Context, subject auth.Sub
 	if err != nil {
 		return sshproxy.EnvironmentSSHRoute{}, fmt.Errorf("resolve Environment SSH route: %w", err)
 	}
-	if status != nil && *status == "error" {
+	if status != nil && domain.RuntimeStatus(*status) == domain.RuntimeError {
 		return sshproxy.EnvironmentSSHRoute{}, sshproxy.ErrRuntimeStartFailed
 	}
-	if runtimeID == nil || status == nil || *status != "ready" || privateAddress == nil || bootID == nil || version == nil || *version < 1 || *bootID == "" {
+	if runtimeID == nil || status == nil || domain.RuntimeStatus(*status) != domain.RuntimeReady || privateAddress == nil || bootID == nil || version == nil || *version < 1 || *bootID == "" {
 		return sshproxy.EnvironmentSSHRoute{}, sshproxy.ErrRuntimeNotReady
 	}
 	return sshproxy.EnvironmentSSHRoute{

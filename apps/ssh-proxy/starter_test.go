@@ -27,7 +27,7 @@ func TestControlPlaneRuntimeStarterReturnsTypedActiveOperationConflict(t *testin
 		response.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(response).Encode(map[string]any{
 			"requestId": "request-1",
-			"error":     map[string]any{"code": "OPERATION_CONFLICT", "message": "active"},
+			"error":     map[string]any{"code": "OPERATION_CONFLICT", "message": "active", "operationId": "operation-active"},
 		})
 	}))
 	defer server.Close()
@@ -38,7 +38,7 @@ func TestControlPlaneRuntimeStarterReturnsTypedActiveOperationConflict(t *testin
 		t.Fatal(err)
 	}
 	operationID, err := starter.EnsureStarted(context.Background(), bearer, "env-1", "connection-1")
-	if !errors.Is(err, sshproxy.ErrRuntimeOperationConflict) || operationID != "" {
+	if !errors.Is(err, sshproxy.ErrRuntimeOperationConflict) || operationID != "operation-active" {
 		t.Fatalf("active start = Operation:%q error:%v", operationID, err)
 	}
 	if len(idempotencyKey) < 16 || len(idempotencyKey) > 40 {

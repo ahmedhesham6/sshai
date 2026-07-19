@@ -32,7 +32,7 @@ func (server *server) handleRuntimeCommand(response http.ResponseWriter, request
 	}
 	detail, err := server.environmentReads.GetOwnedEnvironment(request.Context(), user.ID, environmentID)
 	if err != nil {
-		server.writeRuntimeCommandError(response, request, err)
+		server.writeRuntimeCommandError(response, request, err, nil)
 		return
 	}
 	input := application.RuntimeCommandInput{
@@ -45,7 +45,7 @@ func (server *server) handleRuntimeCommand(response http.ResponseWriter, request
 		command, err = server.runtimeCommands.StopRuntime(request.Context(), input)
 	}
 	if err != nil {
-		server.writeRuntimeCommandError(response, request, err)
+		server.writeRuntimeCommandError(response, request, err, detail.ActiveOperationID)
 		return
 	}
 	operation := command.Operation().Snapshot()
@@ -85,7 +85,7 @@ func (server *server) UpdateAutoStopPolicy(response http.ResponseWriter, request
 	}
 	detail, err := server.environmentReads.GetOwnedEnvironment(request.Context(), user.ID, string(environmentID))
 	if err != nil {
-		server.writeRuntimeCommandError(response, request, err)
+		server.writeRuntimeCommandError(response, request, err, nil)
 		return
 	}
 	policyID := detail.Environment.Snapshot().AutoStopPolicyID
@@ -95,7 +95,7 @@ func (server *server) UpdateAutoStopPolicy(response http.ResponseWriter, request
 		IdempotencyKey: params.IdempotencyKey,
 	})
 	if err != nil {
-		server.writeRuntimeCommandError(response, request, err)
+		server.writeRuntimeCommandError(response, request, err, detail.ActiveOperationID)
 		return
 	}
 	if update.Applied() {
@@ -112,7 +112,7 @@ func (server *server) UpdateAutoStopPolicy(response http.ResponseWriter, request
 	}
 }
 
-func (server *server) writeRuntimeCommandError(response http.ResponseWriter, request *http.Request, err error) {
+func (server *server) writeRuntimeCommandError(response http.ResponseWriter, request *http.Request, err error, activeOperationID *string) {
 	switch {
 	case errors.Is(err, application.ErrInvalidRuntimeCommand), errors.Is(err, application.ErrInvalidAutoStopPolicyUpdate):
 		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", "The command input is invalid.")
@@ -123,7 +123,7 @@ func (server *server) writeRuntimeCommandError(response http.ResponseWriter, req
 	case errors.Is(err, db.ErrIdempotencyConflict):
 		writeError(response, request, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "The idempotency key was already used with different input.")
 	case errors.Is(err, db.ErrOperationConflict):
-		writeError(response, request, http.StatusConflict, "OPERATION_CONFLICT", "The Environment already has an active Operation.")
+		writeErrorWithOperation(response, request, http.StatusConflict, "OPERATION_CONFLICT", "The Environment already has an active Operation.", activeOperationID)
 	case errors.Is(err, domain.ErrRuntimeCommandState):
 		writeError(response, request, http.StatusUnprocessableEntity, "RUNTIME_COMMAND_INVALID_STATE", "The Runtime command cannot be applied to its current state.")
 	default:

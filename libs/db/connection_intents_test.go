@@ -165,14 +165,10 @@ func TestStoreConsumesOwnedConnectionIntentExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	store, pool := openTestStoreAndPool(t, ctx)
 	now := time.Now().Truncate(time.Microsecond).UTC()
-	insertReadyConnectionIntentState(t, ctx, pool, now)
+	insertRuntimeOperationState(t, ctx, pool, now)
 	operationID := "operation-start"
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO operations (
-			id, environment_id, type, status, requested_by_user_id, idempotency_key,
-			restate_invocation_id, input, created_at, completed_at
-		) VALUES ($1, 'environment-1', 'runtime.start', 'succeeded', 'user-1',
-			'system:connection-start:consumed', 'invocation-start', '{}', $2, $2)`, operationID, now); err != nil {
+	start := runtimeOperationCandidate(t, operationID, "environment-1", domain.OperationRuntimeStart, "system:connection-start:consumed", []byte(`{}`), now.Add(time.Second))
+	if _, err := store.ReserveRuntimeOperation(ctx, start); err != nil {
 		t.Fatal(err)
 	}
 	created, err := store.CreateOrReplayConnectionIntent(
@@ -196,6 +192,195 @@ func TestStoreConsumesOwnedConnectionIntentExactlyOnce(t *testing.T) {
 	}
 	if _, err := store.ConsumeConnectionIntent(ctx, "workos-1", created.IntentID, "environment-2", now.Add(2*time.Second)); !errors.Is(err, dbstore.ErrConnectionIntentNotFound) {
 		t.Fatalf("wrong-Environment Connection Intent error = %v", err)
+	}
+}
+
+func TestStoreConsumeConnectionIntentClampsProxyClockBeforeCreation(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Now().Truncate(time.Microsecond).UTC()
+	insertReadyConnectionIntentState(t, ctx, pool, createdAt)
+	created, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", createdAt, createdAt.Add(time.Minute),
+		func(context.Context) (*string, error) { return nil, nil }, func() string { return "intent-1" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intentCreatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT created_at FROM connection_intent_idempotency WHERE intent_id = $1`, created.IntentID).Scan(&intentCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	consumed, err := store.ConsumeConnectionIntent(ctx, "workos-1", created.IntentID, "environment-1", createdAt.Add(-time.Minute))
+	if err != nil || consumed.UsedAt == nil || !consumed.UsedAt.Equal(intentCreatedAt) {
+		t.Fatalf("clock-skew consume = %#v error:%v", consumed, err)
+	}
+}
+
+func TestStoreConsumeConnectionIntentClassifiesCheckViolation(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertReadyConnectionIntentState(t, ctx, pool, now)
+	created, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", now, now.Add(time.Minute),
+		func(context.Context) (*string, error) { return nil, nil }, func() string { return "intent-1" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		ALTER TABLE connection_intent_idempotency
+		DROP CONSTRAINT connection_intent_used_before_expiry_check,
+		ADD CONSTRAINT connection_intent_used_before_expiry_check CHECK (used_at IS NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeConnectionIntent(ctx, "workos-1", created.IntentID, "environment-1", now.Add(time.Second)); !errors.Is(err, dbstore.ErrConnectionIntentInvariant) {
+		t.Fatalf("CHECK violation classification = %v", err)
+	}
+}
+
+func TestStoreConnectionIntentRejectsPreparedStartThatTurnsTerminalBeforePersist(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertRuntimeOperationState(t, ctx, pool, now)
+	mintCalls := 0
+	_, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", now, now.Add(time.Minute),
+		func(prepareCtx context.Context) (*string, error) {
+			start := runtimeOperationCandidate(t, "operation-start", "environment-1", domain.OperationRuntimeStart, "system:connection-start:terminal", []byte(`{}`), now.Add(time.Second))
+			command, reserveErr := store.ReserveRuntimeOperation(prepareCtx, start)
+			if reserveErr != nil {
+				return nil, reserveErr
+			}
+			operationID := command.Operation().Snapshot().ID
+			if _, updateErr := pool.Exec(prepareCtx, `
+				UPDATE operations
+				SET status = 'failed', error_code = 'START_FAILED', error_message = 'failed', completed_at = $2
+				WHERE id = $1`, operationID, now.Add(2*time.Second)); updateErr != nil {
+				return nil, updateErr
+			}
+			return &operationID, nil
+		},
+		func() string { mintCalls++; return "intent-unused" },
+	)
+	if !errors.Is(err, dbstore.ErrOperationConflict) || mintCalls != 0 {
+		t.Fatalf("terminal prepared start = error:%v mint calls:%d", err, mintCalls)
+	}
+}
+
+func TestStoreConnectionIntentLocksPreparedStartThroughMintAndCommit(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertRuntimeOperationState(t, ctx, pool, now)
+	start := runtimeOperationCandidate(t, "operation-start", "environment-1", domain.OperationRuntimeStart, "system:connection-start:locked", []byte(`{}`), now.Add(time.Second))
+	command, err := store.ReserveRuntimeOperation(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID := command.Operation().Snapshot().ID
+	updateStarted := make(chan struct{})
+	updateFinished := make(chan error, 1)
+	created, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", now, now.Add(time.Minute),
+		func(context.Context) (*string, error) { return &operationID, nil },
+		func() string {
+			go func() {
+				close(updateStarted)
+				_, updateErr := pool.Exec(ctx, `
+					UPDATE operations
+					SET status = 'failed', error_code = 'START_FAILED', error_message = 'failed', completed_at = $2
+					WHERE id = $1`, operationID, now.Add(2*time.Second))
+				updateFinished <- updateErr
+			}()
+			<-updateStarted
+			select {
+			case updateErr := <-updateFinished:
+				t.Fatalf("prepared Operation terminalized before Intent commit: %v", updateErr)
+			case <-time.After(50 * time.Millisecond):
+			}
+			return "intent-1"
+		},
+	)
+	if err != nil || created.OperationID == nil || *created.OperationID != operationID {
+		t.Fatalf("created Connection Intent = %#v error:%v", created, err)
+	}
+	select {
+	case updateErr := <-updateFinished:
+		if updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal Operation update remained blocked after Intent commit")
+	}
+}
+
+func TestStoreConnectionIntentRejectsReadyRuntimeThatStopsBeforeLockedPersist(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertReadyConnectionIntentState(t, ctx, pool, now)
+	mintCalls := 0
+	_, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", now, now.Add(time.Minute),
+		func(prepareCtx context.Context) (*string, error) {
+			stoppedAt := now.Add(3 * time.Minute)
+			_, updateErr := pool.Exec(prepareCtx, `
+				UPDATE runtimes
+				SET status = 'stopped', private_address = NULL, boot_id = NULL,
+				    stopped_at = $2, updated_at = $2, version = version + 1
+				WHERE id = $1`, "runtime-1", stoppedAt)
+			return nil, updateErr
+		},
+		func() string { mintCalls++; return "intent-unused" },
+	)
+	if !errors.Is(err, domain.ErrRuntimeCommandState) || mintCalls != 0 {
+		t.Fatalf("ready-to-stopped window = error:%v mint calls:%d", err, mintCalls)
+	}
+}
+
+func TestStoreConnectionIntentLocksReadyRuntimeThroughMintAndCommit(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	now := time.Now().Truncate(time.Microsecond).UTC()
+	insertReadyConnectionIntentState(t, ctx, pool, now)
+	updateStarted := make(chan struct{})
+	updateFinished := make(chan error, 1)
+	created, err := store.CreateOrReplayConnectionIntent(
+		ctx, "user-1", "connection-key-0001", "environment-1", now, now.Add(time.Minute),
+		func(context.Context) (*string, error) { return nil, nil },
+		func() string {
+			go func() {
+				close(updateStarted)
+				stoppedAt := now.Add(3 * time.Minute)
+				_, updateErr := pool.Exec(ctx, `
+					UPDATE runtimes
+					SET status = 'stopped', private_address = NULL, boot_id = NULL,
+					    stopped_at = $2, updated_at = $2, version = version + 1
+					WHERE id = $1`, "runtime-1", stoppedAt)
+				updateFinished <- updateErr
+			}()
+			<-updateStarted
+			select {
+			case updateErr := <-updateFinished:
+				t.Fatalf("ready Runtime stopped before Intent commit: %v", updateErr)
+			case <-time.After(50 * time.Millisecond):
+			}
+			return "intent-1"
+		},
+	)
+	if err != nil || created.OperationID != nil {
+		t.Fatalf("created ready-runtime Intent = %#v error:%v", created, err)
+	}
+	select {
+	case updateErr := <-updateFinished:
+		if updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Runtime transition remained blocked after Intent commit")
 	}
 }
 

@@ -21,6 +21,7 @@ func TestLoadConfigUsesBoundedProductionDefaults(t *testing.T) {
 	for _, name := range []string{
 		"LISTEN_ADDR", "WORKOS_ISSUER", "WORKOS_JWKS_URL", "DIAL_TIMEOUT", "IDLE_TIMEOUT",
 		"START_WAIT_TIMEOUT", "START_SETTLE_TIMEOUT", "ROUTE_POLL_INTERVAL", "CONTROL_WRITE_TIMEOUT", "BRIDGE_BUFFER_BYTES",
+		"MAX_WAITING_CONNECTIONS", "MAX_WAITING_CONNECTIONS_PER_ENVIRONMENT",
 	} {
 		t.Setenv(name, "")
 	}
@@ -29,7 +30,8 @@ func TestLoadConfigUsesBoundedProductionDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if config.listenAddress != ":8082" || config.startTimeout != 10*time.Minute || config.settleTimeout != 15*time.Second || config.pollInterval != 2*time.Second ||
-		config.dialTimeout != 10*time.Second || config.idleTimeout != 2*time.Minute || config.bufferBytes != 32*1024 {
+		config.dialTimeout != 10*time.Second || config.idleTimeout != 2*time.Minute || config.bufferBytes != 32*1024 ||
+		config.maxWaitingConnections != 64 || config.maxWaitingConnectionsPerEnvironment != 4 {
 		t.Fatalf("proxy defaults = %#v", config)
 	}
 }
@@ -53,6 +55,8 @@ func (verifierStub) Verify(context.Context, string) (auth.Subject, error) {
 type routeStub struct{}
 
 type intentStub struct{}
+
+func (intentStub) Validate(context.Context, auth.Subject, string, string) error { return nil }
 
 func (intentStub) Consume(context.Context, auth.Subject, string, string) (sshproxy.ConnectionIntentAttempt, error) {
 	return sshproxy.ConnectionIntentAttempt{}, nil

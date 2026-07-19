@@ -360,8 +360,13 @@ func bearerToken(authorization string) (string, bool) {
 }
 
 func writeError(response http.ResponseWriter, request *http.Request, status int, code, message string) {
+	writeErrorWithOperation(response, request, status, code, message, nil)
+}
+
+func writeErrorWithOperation(response http.ResponseWriter, request *http.Request, status int, code, message string, operationID *string) {
 	body := contracts.ErrorResponse{RequestId: requestIDFromContext(request.Context())}
 	body.Error.Code, body.Error.Message = code, message
+	body.Error.OperationId = operationID
 	response.Header().Set("Content-Type", "application/json")
 	response.Header().Set("X-Request-ID", body.RequestId)
 	response.WriteHeader(status)

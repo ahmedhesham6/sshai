@@ -28,6 +28,8 @@ const (
 	defaultRoutePollInterval   = 2 * time.Second
 	defaultControlWriteTimeout = 10 * time.Second
 	defaultBufferBytes         = 32 * 1024
+	defaultMaxWaiting          = 64
+	defaultMaxWaitingPerEnv    = 4
 	preBridgeReadLimit         = 1 << 20
 )
 
@@ -38,6 +40,7 @@ var (
 	ErrConnectionIntentNotFound = errors.New("Connection Intent not found")
 	ErrConnectionIntentExpired  = errors.New("Connection Intent expired")
 	ErrConnectionIntentUsed     = errors.New("Connection Intent already used")
+	ErrConnectionIntentInvalid  = errors.New("Connection Intent is invalid")
 )
 
 type BearerVerifier interface {
@@ -61,9 +64,10 @@ type ConnectionIntentAttempt struct {
 	OperationID *string
 }
 
-// ConnectionIntentAuthorizer atomically consumes an owner- and
-// Environment-scoped Connection Intent before the WebSocket is upgraded.
+// ConnectionIntentAuthorizer validates before upgrade and atomically consumes
+// an owner- and Environment-scoped Connection Intent immediately afterward.
 type ConnectionIntentAuthorizer interface {
+	Validate(context.Context, auth.Subject, string, string) error
 	Consume(context.Context, auth.Subject, string, string) (ConnectionIntentAttempt, error)
 }
 
@@ -92,6 +96,11 @@ type Config struct {
 	PollInterval   time.Duration
 	ControlTimeout time.Duration
 	BufferBytes    int
+	// MaxWaitingConnections bounds sockets admitted into readiness work.
+	// MaxWaitingConnectionsPerEnvironment prevents one Environment from
+	// consuming the global budget. Defaults are 64 and 4 respectively.
+	MaxWaitingConnections               int
+	MaxWaitingConnectionsPerEnvironment int
 }
 
 type proxy struct {
@@ -108,6 +117,15 @@ type proxy struct {
 	pollInterval   time.Duration
 	controlTimeout time.Duration
 	bufferBytes    int
+	waiting        *waitingAdmissions
+}
+
+type waitingAdmissions struct {
+	mu             sync.Mutex
+	global         int
+	byEnvironment  map[string]int
+	maxGlobal      int
+	maxEnvironment int
 }
 
 func NewHandler(config Config) (http.Handler, error) {
@@ -135,11 +153,18 @@ func NewHandler(config Config) (http.Handler, error) {
 	if config.BufferBytes == 0 {
 		config.BufferBytes = defaultBufferBytes
 	}
+	if config.MaxWaitingConnections == 0 {
+		config.MaxWaitingConnections = defaultMaxWaiting
+	}
+	if config.MaxWaitingConnectionsPerEnvironment == 0 {
+		config.MaxWaitingConnectionsPerEnvironment = defaultMaxWaitingPerEnv
+	}
 	if config.StreamContext == nil {
 		config.StreamContext = context.Background()
 	}
 	if config.DialTimeout < 0 || config.IdleTimeout < 0 || config.StartTimeout < 0 || config.SettleTimeout < 0 ||
-		config.PollInterval < 0 || config.ControlTimeout < 0 || config.BufferBytes < 1 {
+		config.PollInterval < 0 || config.ControlTimeout < 0 || config.BufferBytes < 1 ||
+		config.MaxWaitingConnections < 1 || config.MaxWaitingConnectionsPerEnvironment < 1 {
 		return nil, errors.New("create SSH proxy: timeouts and buffer size must be positive")
 	}
 	handler := &proxy{
@@ -147,6 +172,10 @@ func NewHandler(config Config) (http.Handler, error) {
 		stream:      config.StreamContext,
 		dialTimeout: config.DialTimeout, idleTimeout: config.IdleTimeout, startTimeout: config.StartTimeout,
 		settleTimeout: config.SettleTimeout, pollInterval: config.PollInterval, controlTimeout: config.ControlTimeout, bufferBytes: config.BufferBytes,
+		waiting: &waitingAdmissions{
+			byEnvironment: make(map[string]int), maxGlobal: config.MaxWaitingConnections,
+			maxEnvironment: config.MaxWaitingConnectionsPerEnvironment,
+		},
 	}
 	router := http.NewServeMux()
 	router.HandleFunc("GET /v1/environments/{environment_id}/ssh", handler.serveSSH)
@@ -170,30 +199,48 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 		http.Error(response, "Connection Intent is required", http.StatusBadRequest)
 		return
 	}
-	attempt, err := proxy.intents.Consume(request.Context(), subject, intentID, environmentID)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrConnectionIntentNotFound):
-			http.Error(response, "Connection Intent not found", http.StatusNotFound)
-		case errors.Is(err, ErrConnectionIntentExpired):
-			http.Error(response, "Connection Intent expired", http.StatusGone)
-		case errors.Is(err, ErrConnectionIntentUsed):
-			http.Error(response, "Connection Intent already used", http.StatusConflict)
-		default:
-			http.Error(response, "Connection Intent unavailable", http.StatusServiceUnavailable)
-		}
+	if err := proxy.intents.Validate(request.Context(), subject, intentID, environmentID); err != nil {
+		writeIntentHTTPError(response, err)
 		return
 	}
-	route, err := proxy.routes.ResolveSSH(request.Context(), subject, environmentID)
+	preflightRoute, err := proxy.routes.ResolveSSH(request.Context(), subject, environmentID)
 	if errors.Is(err, ErrEnvironmentNotFound) {
 		http.Error(response, "Environment not found", http.StatusNotFound)
 		return
 	}
-	notReady := errors.Is(err, ErrRuntimeNotReady)
-	if (!notReady && err != nil) || (!notReady && !validSSHRoute(route)) {
+	preflightNotReady := errors.Is(err, ErrRuntimeNotReady)
+	if (!preflightNotReady && err != nil) || (!preflightNotReady && !validSSHRoute(preflightRoute)) {
 		http.Error(response, "Environment SSH route unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	releaseWaiting := func() {}
+	waitingAdmitted := false
+	if preflightNotReady {
+		var admitted bool
+		releaseWaiting, admitted = proxy.waiting.acquire(environmentID)
+		if !admitted {
+			http.Error(response, "SSH proxy busy; retry the connection shortly", http.StatusServiceUnavailable)
+			return
+		}
+		waitingAdmitted = true
+	}
+	releaseWaitingAdmission := func() {
+		if waitingAdmitted {
+			releaseWaiting()
+			waitingAdmitted = false
+			releaseWaiting = func() {}
+		}
+	}
+	ensureWaitingAdmission := func() bool {
+		if waitingAdmitted {
+			return true
+		}
+		var admitted bool
+		releaseWaiting, admitted = proxy.waiting.acquire(environmentID)
+		waitingAdmitted = admitted
+		return admitted
+	}
+	defer releaseWaitingAdmission()
 
 	connection, err := websocket.Accept(response, request, &websocket.AcceptOptions{
 		CompressionMode: websocket.CompressionDisabled,
@@ -203,9 +250,15 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 	}
 	defer connection.CloseNow()
 	connection.SetReadLimit(preBridgeReadLimit)
+	attempt, err := proxy.intents.Consume(request.Context(), subject, intentID, environmentID)
+	if err != nil {
+		proxy.failControl(connection, "", connectionprotocol.StepIntentInvalid, "The Connection Intent is no longer valid. Request a new connection.")
+		_ = connection.Close(websocket.StatusPolicyViolation, "Connection Intent invalid")
+		return
+	}
 	connectionAttempt, err := newConnectionAttempt()
 	if err != nil {
-		proxy.failControl(connection, "", "starting-runtime", "The Runtime connection attempt could not be created safely. Persistent Environment state is intact.")
+		proxy.failControl(connection, "", connectionprotocol.StepStartingRuntime, "The Runtime connection attempt could not be created safely. Persistent Environment state is intact.")
 		return
 	}
 
@@ -218,6 +271,10 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 		cancelSocket()
 	}()
 	guard := watchPreBridgeClient(socketContext, connection)
+	route, notReady := preflightRoute, preflightNotReady
+	if !notReady {
+		releaseWaitingAdmission()
+	}
 
 	operationID := ""
 	if attempt.OperationID != nil {
@@ -226,7 +283,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 	if notReady {
 		if operationID == "" {
 			if !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
-				Type: connectionprotocol.ControlProgress, Step: "starting-runtime", Message: "Requesting Runtime start.",
+				Type: connectionprotocol.ControlProgress, Step: connectionprotocol.StepStartingRuntime, Message: "Requesting Runtime start.",
 			}) {
 				return
 			}
@@ -242,7 +299,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 						route, notReady = settled, false
 					case errors.Is(resolveErr, ErrRuntimeNotReady):
 						if !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
-							Type: connectionprotocol.ControlProgress, Step: "waiting-for-guest", Message: "Waiting for a settling Runtime start.",
+							Type: connectionprotocol.ControlProgress, Step: connectionprotocol.StepWaitingForGuest, Message: "Waiting for a settling Runtime start.",
 						}) {
 							return
 						}
@@ -272,7 +329,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 			}
 		}
 		if notReady && !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
-			Type: connectionprotocol.ControlProgress, OperationID: operationID, Step: "waiting-for-guest", Message: "Waiting for Runtime readiness.",
+			Type: connectionprotocol.ControlProgress, OperationID: operationID, Step: connectionprotocol.StepWaitingForGuest, Message: "Waiting for Runtime readiness.",
 		}) {
 			return
 		}
@@ -287,8 +344,11 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 			proxy.failControl(connection, operationID, step, message)
 			return
 		}
+		if !notReady || err == nil {
+			releaseWaitingAdmission()
+		}
 	}
-	route, err = proxy.confirmRouteBeforeDial(waitContext, guard, connection, subject, environmentID, operationID, route)
+	route, err = proxy.confirmRouteBeforeDial(waitContext, guard, connection, subject, environmentID, operationID, route, ensureWaitingAdmission)
 	if err != nil {
 		if errors.Is(err, errClientFrameBeforeReady) {
 			return
@@ -297,6 +357,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 		proxy.failControl(connection, operationID, step, message)
 		return
 	}
+	releaseWaitingAdmission()
 
 	// This final owner-scoped read prevents a route that changed during the
 	// readiness wait from being dialed. A Runtime transition can still begin in
@@ -308,7 +369,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 	runtime, err := proxy.dialRuntime(waitContext, guard, route.PrivateAddress)
 	if err != nil {
 		if !errors.Is(err, errClientFrameBeforeReady) {
-			proxy.failControl(connection, operationID, "dialing-runtime", "The Runtime SSH service is unavailable. Persistent Environment state is intact.")
+			proxy.failControl(connection, operationID, connectionprotocol.StepDialingRuntime, "The Runtime SSH service is unavailable. Persistent Environment state is intact.")
 		}
 		return
 	}
@@ -322,7 +383,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 	default:
 	}
 	if !proxy.writeControl(waitContext, connection, connectionprotocol.ControlFrame{
-		Type: connectionprotocol.ControlReady, OperationID: operationID, Step: "ready", Message: "Runtime SSH is ready.",
+		Type: connectionprotocol.ControlReady, OperationID: operationID, Step: connectionprotocol.StepReady, Message: "Runtime SSH is ready.",
 	}) {
 		return
 	}
@@ -338,6 +399,7 @@ func (proxy *proxy) serveSSH(response http.ResponseWriter, request *http.Request
 }
 
 var errClientFrameBeforeReady = errors.New("client frame received before ready")
+var errWaitingAdmissionBusy = errors.New("SSH proxy waiting admission is full")
 
 type preBridgeGuard struct {
 	result <-chan clientFrame
@@ -430,12 +492,12 @@ func newConnectionAttempt() (string, error) {
 }
 
 func (proxy *proxy) waitForRoute(ctx context.Context, guard *preBridgeGuard, socket *websocket.Conn, subject auth.Subject, environmentID, operationID string) (EnvironmentSSHRoute, error) {
+	if !proxy.writeControl(ctx, socket, connectionprotocol.ControlFrame{
+		Type: connectionprotocol.ControlProgress, OperationID: operationID, Step: connectionprotocol.StepResolvingRoute, Message: "Checking current-boot SSH readiness.",
+	}) {
+		return EnvironmentSSHRoute{}, context.Cause(ctx)
+	}
 	for {
-		if !proxy.writeControl(ctx, socket, connectionprotocol.ControlFrame{
-			Type: connectionprotocol.ControlProgress, OperationID: operationID, Step: "resolving-route", Message: "Checking current-boot SSH readiness.",
-		}) {
-			return EnvironmentSSHRoute{}, context.Cause(ctx)
-		}
 		route, err := proxy.resolveRoute(ctx, guard, subject, environmentID)
 		if err == nil {
 			if !validSSHRoute(route) {
@@ -447,7 +509,7 @@ func (proxy *proxy) waitForRoute(ctx context.Context, guard *preBridgeGuard, soc
 			return EnvironmentSSHRoute{}, err
 		}
 		if !proxy.writeControl(ctx, socket, connectionprotocol.ControlFrame{
-			Type: connectionprotocol.ControlProgress, OperationID: operationID, Step: "waiting-for-guest", Message: "Runtime is not ready yet.",
+			Type: connectionprotocol.ControlProgress, OperationID: operationID, Step: connectionprotocol.StepWaitingForGuest, Message: "Runtime is not ready yet.",
 		}) {
 			return EnvironmentSSHRoute{}, context.Cause(ctx)
 		}
@@ -464,7 +526,7 @@ func (proxy *proxy) waitForRoute(ctx context.Context, guard *preBridgeGuard, soc
 	}
 }
 
-func (proxy *proxy) confirmRouteBeforeDial(ctx context.Context, guard *preBridgeGuard, socket *websocket.Conn, subject auth.Subject, environmentID, operationID string, candidate EnvironmentSSHRoute) (EnvironmentSSHRoute, error) {
+func (proxy *proxy) confirmRouteBeforeDial(ctx context.Context, guard *preBridgeGuard, socket *websocket.Conn, subject auth.Subject, environmentID, operationID string, candidate EnvironmentSSHRoute, ensureWaitingAdmission func() bool) (EnvironmentSSHRoute, error) {
 	for {
 		confirmed, err := proxy.resolveRoute(ctx, guard, subject, environmentID)
 		if err == nil && validSSHRoute(confirmed) && sameSSHRoute(candidate, confirmed) {
@@ -472,6 +534,9 @@ func (proxy *proxy) confirmRouteBeforeDial(ctx context.Context, guard *preBridge
 		}
 		if err != nil && !errors.Is(err, ErrRuntimeNotReady) {
 			return EnvironmentSSHRoute{}, err
+		}
+		if !ensureWaitingAdmission() {
+			return EnvironmentSSHRoute{}, errWaitingAdmissionBusy
 		}
 		candidate, err = proxy.waitForRoute(ctx, guard, socket, subject, environmentID, operationID)
 		if err != nil {
@@ -557,7 +622,7 @@ func (proxy *proxy) writeControl(ctx context.Context, socket *websocket.Conn, fr
 	return socket.Write(writeContext, websocket.MessageText, payload) == nil
 }
 
-func (proxy *proxy) failControl(socket *websocket.Conn, operationID, step, message string) {
+func (proxy *proxy) failControl(socket *websocket.Conn, operationID string, step connectionprotocol.Step, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), proxy.controlTimeout)
 	defer cancel()
 	_ = proxy.writeControl(ctx, socket, connectionprotocol.ControlFrame{
@@ -574,30 +639,70 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-func startFailure(err error) (string, string) {
+func startFailure(err error) (connectionprotocol.Step, string) {
 	switch {
 	case errors.Is(err, ErrCreditsPolicyBlocked):
-		return "credits-blocked", "The Runtime cannot start because the Credit Balance is depleted. Add credits and try again."
+		return connectionprotocol.StepCreditsBlocked, "The Runtime cannot start because the Credit Balance is depleted. Add credits and try again."
 	case errors.Is(err, ErrStartAuthorization):
-		return "starting-runtime", "Runtime start authorization failed. Persistent Environment state is intact."
+		return connectionprotocol.StepStartingRuntime, "Runtime start authorization failed. Persistent Environment state is intact."
 	case errors.Is(err, ErrRuntimeOperationConflict):
-		return "operation-conflict", "Another Environment Operation prevents this Runtime start. Persistent Environment state is intact."
+		return connectionprotocol.StepOperationConflict, "Another Environment Operation prevents this Runtime start. Persistent Environment state is intact."
 	default:
-		return "starting-runtime", "The Runtime could not be started. Persistent Environment state is intact."
+		return connectionprotocol.StepStartingRuntime, "The Runtime could not be started. Persistent Environment state is intact."
 	}
 }
 
-func routeFailure(err error) (string, string) {
+func routeFailure(err error) (connectionprotocol.Step, string) {
 	switch {
 	case errors.Is(err, errClientFrameBeforeReady):
-		return "client-protocol", "Client frames are not accepted before Runtime readiness."
+		return connectionprotocol.StepClientProtocol, "Client frames are not accepted before Runtime readiness."
+	case errors.Is(err, errWaitingAdmissionBusy):
+		return connectionprotocol.StepResolvingRoute, "The SSH proxy is busy waiting for this Environment. Retry the connection shortly."
 	case errors.Is(err, context.DeadlineExceeded):
-		return "waiting-for-guest", "Runtime readiness timed out. Persistent Environment state is intact."
+		return connectionprotocol.StepWaitingForGuest, "Runtime readiness timed out. Persistent Environment state is intact."
 	case errors.Is(err, ErrRuntimeStartFailed):
-		return "waiting-for-guest", "Runtime start failed. Persistent Environment state is intact."
+		return connectionprotocol.StepWaitingForGuest, "Runtime start failed. Persistent Environment state is intact."
 	default:
-		return "resolving-route", "The current-boot SSH route could not be resolved. Persistent Environment state is intact."
+		return connectionprotocol.StepResolvingRoute, "The current-boot SSH route could not be resolved. Persistent Environment state is intact."
 	}
+}
+
+func writeIntentHTTPError(response http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrConnectionIntentNotFound):
+		http.Error(response, "Connection Intent not found", http.StatusNotFound)
+	case errors.Is(err, ErrConnectionIntentExpired):
+		http.Error(response, "Connection Intent expired", http.StatusGone)
+	case errors.Is(err, ErrConnectionIntentUsed):
+		http.Error(response, "Connection Intent already used", http.StatusConflict)
+	case errors.Is(err, ErrConnectionIntentInvalid):
+		http.Error(response, "Connection Intent invalid", http.StatusConflict)
+	default:
+		http.Error(response, "Connection Intent unavailable", http.StatusServiceUnavailable)
+	}
+}
+
+func (admissions *waitingAdmissions) acquire(environmentID string) (func(), bool) {
+	admissions.mu.Lock()
+	if admissions.global >= admissions.maxGlobal || admissions.byEnvironment[environmentID] >= admissions.maxEnvironment {
+		admissions.mu.Unlock()
+		return nil, false
+	}
+	admissions.global++
+	admissions.byEnvironment[environmentID]++
+	admissions.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			admissions.mu.Lock()
+			defer admissions.mu.Unlock()
+			admissions.global--
+			admissions.byEnvironment[environmentID]--
+			if admissions.byEnvironment[environmentID] == 0 {
+				delete(admissions.byEnvironment, environmentID)
+			}
+		})
+	}, true
 }
 
 func bearerToken(authorization string) (string, bool) {

@@ -317,9 +317,11 @@ type environmentReaderFake struct {
 	list            []db.EnvironmentDetail
 	events          map[string][]db.EnvironmentEvent
 	err             error
+	getCalls        int
 }
 
 func (fake *environmentReaderFake) GetOwnedEnvironment(_ context.Context, ownerID, environmentID string) (db.EnvironmentDetail, error) {
+	fake.getCalls++
 	if err := requireOwner("GetOwnedEnvironment", ownerID, fake.expectedOwnerID); err != nil {
 		return db.EnvironmentDetail{}, err
 	}

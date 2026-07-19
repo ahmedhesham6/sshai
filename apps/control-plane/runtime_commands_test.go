@@ -72,6 +72,10 @@ func TestRuntimeCommandHTTPMapsOwnershipAndCommandErrors(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			detail := runtimeEnvironmentDetail(t)
+			if test.repository == db.ErrOperationConflict {
+				activeOperationID := "operation-active"
+				detail.ActiveOperationID = &activeOperationID
+			}
 			repository := &runtimeCommandHTTPRepositoryFake{
 				expectedOwnerID: "user-1", environment: detail.Environment, runtime: *detail.Runtime, err: test.repository,
 			}
@@ -86,6 +90,15 @@ func TestRuntimeCommandHTTPMapsOwnershipAndCommandErrors(t *testing.T) {
 
 			if response.Code != test.wantStatus || !bytes.Contains(response.Body.Bytes(), []byte(`"code":"`+test.wantCode+`"`)) {
 				t.Fatalf("response = status:%d body:%s", response.Code, response.Body.String())
+			}
+			if test.repository == db.ErrOperationConflict {
+				var body contracts.ErrorResponse
+				if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body.Error.OperationId == nil || *body.Error.OperationId != "operation-active" {
+					t.Fatalf("Operation conflict response = %#v", body)
+				}
 			}
 			if test.missing && repository.calls != 0 {
 				t.Fatalf("foreign Environment reserved %d Operations", repository.calls)
@@ -201,18 +214,33 @@ func TestUpdateAutoStopPolicyHTTP(t *testing.T) {
 }
 
 type runtimeCommandHTTPRepositoryFake struct {
-	expectedOwnerID string
-	environment     domain.Environment
-	runtime         domain.Runtime
-	operation       domain.Operation
-	replay          domain.Operation
-	err             error
-	calls           int
+	expectedOwnerID         string
+	environment             domain.Environment
+	runtime                 domain.Runtime
+	operation               domain.Operation
+	replay                  domain.Operation
+	err                     error
+	calls                   int
+	replayCalls             int
+	reserveCalls            int
+	operations              map[string]domain.Operation
+	reads                   *environmentReaderFake
+	operationReads          *operationReaderFake
+	publishActiveOnConflict bool
 }
 
 func (fake *runtimeCommandHTTPRepositoryFake) ReplayRuntimeOperation(_ context.Context, operation domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error) {
+	fake.replayCalls++
 	if err := requireOwner("ReplayRuntimeOperation", operation.Snapshot().RequestedByUserID, fake.expectedOwnerID); err != nil {
 		return domain.EnvironmentRuntimeOperation{}, false, err
+	}
+	if fake.operations != nil {
+		replayed, present := fake.operations[operation.Snapshot().IdempotencyKey]
+		if !present {
+			return domain.EnvironmentRuntimeOperation{}, false, nil
+		}
+		command, err := domain.RestoreEnvironmentRuntimeOperation(fake.environment, fake.runtime, replayed)
+		return command, true, err
 	}
 	if fake.replay.Snapshot().ID == "" {
 		return domain.EnvironmentRuntimeOperation{}, false, nil
@@ -223,8 +251,19 @@ func (fake *runtimeCommandHTTPRepositoryFake) ReplayRuntimeOperation(_ context.C
 
 func (fake *runtimeCommandHTTPRepositoryFake) ReserveRuntimeOperation(_ context.Context, operation domain.Operation) (domain.EnvironmentRuntimeOperation, error) {
 	fake.calls++
+	fake.reserveCalls++
 	if err := requireOwner("ReserveRuntimeOperation", operation.Snapshot().RequestedByUserID, fake.expectedOwnerID); err != nil {
 		return domain.EnvironmentRuntimeOperation{}, err
+	}
+	current := fake.operation.Snapshot()
+	if current.ID != "" && (current.Status == domain.OperationQueued || current.Status == domain.OperationRunning) {
+		if fake.reads != nil {
+			detail := fake.reads.environments[operation.Snapshot().EnvironmentID]
+			operationID := current.ID
+			detail.ActiveOperationID = &operationID
+			fake.reads.environments[operation.Snapshot().EnvironmentID] = detail
+		}
+		return domain.EnvironmentRuntimeOperation{}, db.ErrOperationConflict
 	}
 	fake.operation = operation
 	if fake.replay.Snapshot().ID != "" {
@@ -232,6 +271,18 @@ func (fake *runtimeCommandHTTPRepositoryFake) ReserveRuntimeOperation(_ context.
 	}
 	if fake.err != nil {
 		return domain.EnvironmentRuntimeOperation{}, fake.err
+	}
+	if fake.operations != nil {
+		fake.operations[operation.Snapshot().IdempotencyKey] = fake.operation
+	}
+	if fake.reads != nil && !fake.publishActiveOnConflict {
+		detail := fake.reads.environments[operation.Snapshot().EnvironmentID]
+		operationID := operation.Snapshot().ID
+		detail.ActiveOperationID = &operationID
+		fake.reads.environments[operation.Snapshot().EnvironmentID] = detail
+	}
+	if fake.operationReads != nil {
+		fake.operationReads.operations[operation.Snapshot().ID] = db.OperationDetail{Operation: fake.operation}
 	}
 	return domain.NewEnvironmentRuntimeOperation(fake.environment, fake.runtime, fake.operation)
 }
@@ -284,10 +335,13 @@ func (fake *runtimeCommandHTTPDispatcherFake) DispatchRuntimeOperation(_ context
 	return nil
 }
 
-type runtimeCommandBalanceHTTPFake struct{}
+type runtimeCommandBalanceHTTPFake struct{ credits int64 }
 
-func (runtimeCommandBalanceHTTPFake) CreditBalance(_ context.Context, ownerID string) (db.CreditBalanceProjection, error) {
-	return db.CreditBalanceProjection{UserID: ownerID, Credits: 1}, nil
+func (fake runtimeCommandBalanceHTTPFake) CreditBalance(_ context.Context, ownerID string) (db.CreditBalanceProjection, error) {
+	if err := requireOwner("CreditBalance", ownerID, "user-1"); err != nil {
+		return db.CreditBalanceProjection{}, err
+	}
+	return db.CreditBalanceProjection{UserID: ownerID, Credits: fake.credits}, nil
 }
 
 type autoStopRefreshFake struct{}
@@ -325,7 +379,7 @@ func runtimeCommandHandler(detail db.EnvironmentDetail, repository application.R
 func runtimeCommandHandlerWithReads(reads controlplane.EnvironmentReader, repository application.RuntimeOperationRepository, dispatcher application.RuntimeOperationDispatcher, autoStopPolicies *application.AutoStopPolicyService) http.Handler {
 	var runtimeCommands *application.RuntimeCommandService
 	if repository != nil {
-		runtimeCommands = application.NewRuntimeCommandService(repository, dispatcher, runtimeCommandBalanceHTTPFake{}, &idsFake{values: []string{"operation-1"}}, fixedNow)
+		runtimeCommands = application.NewRuntimeCommandService(repository, dispatcher, runtimeCommandBalanceHTTPFake{credits: 1}, &idsFake{values: []string{"operation-1"}}, fixedNow)
 	}
 	return controlplane.NewHandler(controlplane.Config{
 		RuntimeCommands: runtimeCommands, AutoStopPolicies: autoStopPolicies, EnvironmentReads: reads,

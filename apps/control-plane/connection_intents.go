@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/application"
+	"github.com/ahmedhesham6/sshai/libs/connection"
 	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
@@ -27,7 +28,7 @@ func (server *server) CreateConnectionIntent(response http.ResponseWriter, reque
 	}
 	detail, err := server.environmentReads.GetOwnedEnvironment(request.Context(), user.ID, string(environmentID))
 	if err != nil {
-		server.writeRuntimeCommandError(response, request, err)
+		server.writeRuntimeCommandError(response, request, err, nil)
 		return
 	}
 	proxyBase, present := server.regionalProxyURLs[detail.Environment.Snapshot().Region]
@@ -44,19 +45,19 @@ func (server *server) CreateConnectionIntent(response http.ResponseWriter, reque
 	record, err := server.connectionIntents.CreateOrReplayConnectionIntent(
 		request.Context(), user.ID, string(params.IdempotencyKey), string(environmentID), now, expiresAt,
 		func(ctx context.Context) (*string, error) {
-			return server.prepareConnectionIntentStart(ctx, user.ID, string(environmentID), string(params.IdempotencyKey), expiresAt)
+			return server.prepareConnectionIntentStart(ctx, user.ID, detail, string(params.IdempotencyKey), expiresAt)
 		},
 		server.connectionIntentIDs.NewID,
 	)
 	if err != nil {
-		server.writeRuntimeCommandError(response, request, err)
+		server.writeRuntimeCommandError(response, request, err, detail.ActiveOperationID)
 		return
 	}
 	result := contracts.CreateConnectionIntent201JSONResponse{
 		Headers: contracts.CreateConnectionIntent201ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
 		Body: contracts.ConnectionIntent{
 			Id: record.IntentID, EnvironmentId: string(environmentID),
-			LogicalHostname: string(environmentID), ProxyUrl: connectionProxyURL(proxyBase, string(environmentID)),
+			LogicalHostname: string(environmentID), ProxyUrl: connection.ProxyURL(proxyBase, string(environmentID)),
 			OperationId: record.OperationID, ExpiresAt: record.ExpiresAt,
 		},
 	}
@@ -65,11 +66,8 @@ func (server *server) CreateConnectionIntent(response http.ResponseWriter, reque
 	}
 }
 
-func (server *server) prepareConnectionIntentStart(ctx context.Context, ownerID, environmentID, clientKey string, expiresAt time.Time) (*string, error) {
-	detail, err := server.environmentReads.GetOwnedEnvironment(ctx, ownerID, environmentID)
-	if err != nil {
-		return nil, err
-	}
+func (server *server) prepareConnectionIntentStart(ctx context.Context, ownerID string, detail db.EnvironmentDetail, clientKey string, expiresAt time.Time) (*string, error) {
+	environmentID := detail.Environment.Snapshot().ID
 	if detail.ActiveOperationID != nil {
 		return server.joinConnectionStart(ctx, ownerID, environmentID, *detail.ActiveOperationID)
 	}
@@ -124,13 +122,6 @@ func (server *server) joinConnectionStart(ctx context.Context, ownerID, environm
 func connectionStartIdempotencyKey(ownerID, environmentID, clientKey string, expiresAt time.Time) string {
 	digest := sha256.Sum256([]byte(ownerID + "\x00" + environmentID + "\x00" + clientKey + "\x00" + expiresAt.UTC().Format(time.RFC3339Nano)))
 	return domain.SystemIdempotencyKeyPrefix + "connection-start:" + hex.EncodeToString(digest[:])
-}
-
-func connectionProxyURL(base *url.URL, environmentID string) string {
-	proxyURL := *base
-	proxyURL.Path = "/v1/environments/" + environmentID + "/ssh"
-	proxyURL.RawPath = ""
-	return proxyURL.String()
 }
 
 // ValidateRegionalProxyURLs checks the syntax of configured regional WSS

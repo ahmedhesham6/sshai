@@ -19,13 +19,15 @@ import (
 )
 
 const (
-	proxyRequestTimeout  = 15 * time.Second
-	proxyBufferBytes     = 32 << 10
-	proxyReadLimitBytes  = 1 << 20
-	maxIntentBodyBytes   = 64 << 10
-	connectionKeyPrefix  = "ssh-"
-	connectionKeyHexSize = 24
-	creditsBlockedText   = "The Runtime cannot start because the Credit Balance is depleted. Add credits and try again."
+	proxyRequestTimeout      = 15 * time.Second
+	proxyBufferBytes         = 32 << 10
+	proxyReadLimitBytes      = 1 << 20
+	maxIntentBodyBytes       = 64 << 10
+	connectionKeyPrefix      = "ssh-"
+	connectionKeyHexSize     = 24
+	connectionIntentAttempts = 3
+	connectionIntentBackoff  = 50 * time.Millisecond
+	creditsBlockedText       = "The Runtime cannot start because the Credit Balance is depleted. Add credits and try again."
 )
 
 type accessTokenSource interface {
@@ -63,17 +65,7 @@ func (command sshProxyCommand) run(ctx context.Context, environmentID string) er
 	if err != nil {
 		return err
 	}
-	requestContext, cancelRequest := context.WithTimeout(ctx, proxyRequestTimeout)
-	response, err := api.CreateConnectionIntentWithResponse(
-		requestContext,
-		contracts.EnvironmentID(environmentID),
-		&contracts.CreateConnectionIntentParams{IdempotencyKey: contracts.IdempotencyKey(idempotencyKey)},
-		func(_ context.Context, request *http.Request) error {
-			request.Header.Set("Authorization", "Bearer "+accessToken)
-			return nil
-		},
-	)
-	cancelRequest()
+	response, err := createConnectionIntentWithRetry(ctx, api, environmentID, idempotencyKey, accessToken)
 	if err != nil {
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
@@ -174,16 +166,24 @@ type sshControlStep struct {
 	failure    string
 }
 
-func sshControlStepText(value string) (sshControlStep, bool) {
+func sshControlStepText(value connection.Step) (sshControlStep, bool) {
 	switch value {
-	case "credits-blocked":
+	case connection.StepCreditsBlocked:
 		return sshControlStep{identifier: "credits-blocked", progress: "Checking Credit Balance", failure: creditsBlockedText}, true
-	case "starting-runtime":
+	case connection.StepStartingRuntime:
 		return sshControlStep{identifier: "starting-runtime", progress: "Starting Runtime", failure: "the Runtime could not be started"}, true
-	case "waiting-for-guest":
+	case connection.StepWaitingForGuest:
 		return sshControlStep{identifier: "waiting-for-guest", progress: "Waiting for SSH readiness", failure: "SSH readiness could not be confirmed"}, true
-	case "resolving-route":
+	case connection.StepResolvingRoute:
 		return sshControlStep{identifier: "resolving-route", progress: "Resolving the Runtime route", failure: "the Runtime route could not be resolved"}, true
+	case connection.StepDialingRuntime:
+		return sshControlStep{identifier: "dialing-runtime", progress: "Connecting to Runtime SSH", failure: "the Runtime was reached but its SSH service was not connectable"}, true
+	case connection.StepOperationConflict:
+		return sshControlStep{identifier: "operation-conflict", progress: "Checking active Environment Operations", failure: "another Environment Operation prevented the Runtime connection"}, true
+	case connection.StepClientProtocol:
+		return sshControlStep{identifier: "client-protocol", progress: "Negotiating the SSH connection", failure: "the client and regional proxy connection protocol was rejected"}, true
+	case connection.StepIntentInvalid:
+		return sshControlStep{identifier: "intent-invalid", progress: "Validating the Connection Intent", failure: "the Connection Intent was no longer valid; retry the connection"}, true
 	default:
 		return sshControlStep{}, false
 	}
@@ -225,13 +225,67 @@ func validateConnectionIntent(intent contracts.ConnectionIntent, environmentID s
 	if intent.Id == "" || intent.EnvironmentId != environmentID || intent.LogicalHostname != environmentID || !intent.ExpiresAt.After(now) {
 		return nil, errors.New("request SSH connection: control plane returned an invalid connection intent")
 	}
-	proxyURL, err := url.Parse(intent.ProxyUrl)
-	expectedPath := "/v1/environments/" + environmentID + "/ssh"
-	if err != nil || proxyURL.Scheme != "wss" || proxyURL.Host == "" || proxyURL.User != nil ||
-		proxyURL.RawQuery != "" || proxyURL.ForceQuery || proxyURL.Fragment != "" || proxyURL.Path != expectedPath || proxyURL.RawPath != "" {
+	proxyURL, err := connection.ValidateProxyURL(intent.ProxyUrl, environmentID)
+	if err != nil {
 		return nil, errors.New("request SSH connection: control plane returned an unsafe regional proxy URL")
 	}
 	return proxyURL, nil
+}
+
+func createConnectionIntentWithRetry(
+	ctx context.Context,
+	api *contracts.ClientWithResponses,
+	environmentID, idempotencyKey, accessToken string,
+) (*contracts.CreateConnectionIntentResponse, error) {
+	requestContext, cancel := context.WithTimeout(ctx, proxyRequestTimeout)
+	defer cancel()
+	var response *contracts.CreateConnectionIntentResponse
+	var err error
+	for attempt := range connectionIntentAttempts {
+		rawResponse, requestErr := api.CreateConnectionIntent(
+			requestContext,
+			contracts.EnvironmentID(environmentID),
+			&contracts.CreateConnectionIntentParams{IdempotencyKey: contracts.IdempotencyKey(idempotencyKey)},
+			func(_ context.Context, request *http.Request) error {
+				request.Header.Set("Authorization", "Bearer "+accessToken)
+				return nil
+			},
+		)
+		if requestErr == nil && rawResponse == nil {
+			requestErr = errors.New("control plane returned no response")
+		}
+		if requestErr == nil {
+			response, err = contracts.ParseCreateConnectionIntentResponse(rawResponse)
+			if rawResponse.StatusCode < http.StatusInternalServerError {
+				return response, err
+			}
+		} else {
+			err = requestErr
+		}
+		if attempt == connectionIntentAttempts-1 {
+			break
+		}
+		timer := time.NewTimer(connectionIntentBackoff)
+		select {
+		case <-requestContext.Done():
+			stopTimer(timer)
+			return nil, context.Cause(requestContext)
+		case <-timer.C:
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
 }
 
 func cloneProxyHTTPClient(source *http.Client) *http.Client {

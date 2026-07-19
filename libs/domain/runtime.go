@@ -23,6 +23,23 @@ const (
 	RuntimeError        RuntimeStatus = "error"
 )
 
+var runtimeStatuses = [...]RuntimeStatus{
+	RuntimeAbsent,
+	RuntimeProvisioning,
+	RuntimeStarting,
+	RuntimeReady,
+	RuntimeStopping,
+	RuntimeStopped,
+	RuntimeReplacing,
+	RuntimeError,
+}
+
+// RuntimeStatuses returns every status accepted by the Runtime aggregate.
+// Consumers that map persisted Runtime states can use it as a drift guard.
+func RuntimeStatuses() []RuntimeStatus {
+	return append([]RuntimeStatus(nil), runtimeStatuses[:]...)
+}
+
 type RuntimeReservation struct {
 	ID               string
 	EnvironmentID    string
@@ -202,12 +219,12 @@ func validateRuntimeState(snapshot RuntimeSnapshot) error {
 func present(value *string) bool { return value != nil && strings.TrimSpace(*value) != "" }
 
 func (status RuntimeStatus) valid() bool {
-	switch status {
-	case RuntimeAbsent, RuntimeProvisioning, RuntimeStarting, RuntimeReady, RuntimeStopping, RuntimeStopped, RuntimeReplacing, RuntimeError:
-		return true
-	default:
-		return false
+	for _, candidate := range runtimeStatuses {
+		if status == candidate {
+			return true
+		}
 	}
+	return false
 }
 
 func (runtime Runtime) Snapshot() RuntimeSnapshot { return cloneRuntimeSnapshot(runtime.snapshot) }
