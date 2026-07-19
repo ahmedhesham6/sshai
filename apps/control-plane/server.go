@@ -39,6 +39,13 @@ type CapsuleOwnership interface {
 	OwnsCapsule(context.Context, string, string) (bool, error)
 }
 
+// CapsuleTagRepository stores and resolves owner-scoped mutable Capsule tag
+// pointers. Capsule content itself remains immutable and digest-addressed.
+type CapsuleTagRepository interface {
+	PutCapsuleTag(context.Context, string, string, string, string, time.Time) (db.CapsuleTag, error)
+	GetCapsuleTag(context.Context, string, string, string) (db.CapsuleTag, error)
+}
+
 // CapsuleObjectOwnership optionally verifies non-index OCI objects before a
 // pull grant is minted. Index ownership remains available through the
 // CapsuleOwnership seam for callers that only need Capsule-level checks.
@@ -110,6 +117,7 @@ type Config struct {
 	ConnectionIntentTTL time.Duration
 	CapsulePresigner    CapsulePresigner
 	CapsuleOwnership    CapsuleOwnership
+	CapsuleTags         CapsuleTagRepository
 	CapsuleBucket       string
 	CapsuleAccessTTL    time.Duration
 	EnvironmentReads    EnvironmentReader
@@ -129,6 +137,7 @@ type server struct {
 	sshKeys             *application.SSHKeyService
 	capsulePresigner    CapsulePresigner
 	capsuleOwnership    CapsuleOwnership
+	capsuleTags         CapsuleTagRepository
 	capsuleBucket       string
 	capsuleAccessTTL    time.Duration
 	now                 func() time.Time
@@ -158,7 +167,7 @@ func NewHandler(config Config) http.Handler {
 		createEnvironment: config.CreateEnvironment, registerProjectSeed: config.RegisterProjectSeed,
 		runtimeCommands: config.RuntimeCommands, autoStopPolicies: config.AutoStopPolicies,
 		profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys,
-		capsulePresigner: config.CapsulePresigner, capsuleOwnership: config.CapsuleOwnership,
+		capsulePresigner: config.CapsulePresigner, capsuleOwnership: config.CapsuleOwnership, capsuleTags: config.CapsuleTags,
 		capsuleBucket: config.CapsuleBucket, capsuleAccessTTL: config.CapsuleAccessTTL,
 		now: config.Now, connectionIntentIDs: config.ConnectionIntentIDs, connectionIntents: config.ConnectionIntents,
 		regionalProxyURLs: regionalProxyURLs, connectionIntentTTL: connectionIntentTTL,

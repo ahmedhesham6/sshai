@@ -3,11 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/ahmedhesham6/sshai/libs/capsule/oci"
+	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
@@ -86,6 +94,181 @@ func TestCLIRoutesCapsuleBuildFromSelectionsFile(t *testing.T) {
 	if !strings.Contains(output.String(), "manifest_digest sha256:") || !strings.Contains(output.String(), `component id="config:AGENTS.md" digest=sha256:`) {
 		t.Fatalf("capsule route output = %s", output.String())
 	}
+}
+
+func TestCapsulePublishInspectAndComponentDiffThroughHTTPGrants(t *testing.T) {
+	store := newCapsuleHTTPStore(t)
+	api, err := contracts.NewClientWithResponses(store.server.URL, contracts.WithHTTPClient(store.server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := capsuleGrantProvider{api: api, httpClient: store.server.Client(), token: "access-token"}
+	root := t.TempDir()
+	writeCLIProfileFile(t, root, "AGENTS.md", "Use Go.\n", 0o644)
+	selectors := []profile.Selector{{Path: "AGENTS.md", Selector: "$"}}
+	var output bytes.Buffer
+	command := capsuleRemoteCommand{api: api, grants: provider, ownerID: "user-1", token: "access-token", output: &output}
+	if err := command.publish(t.Context(), "agents:stable", root, selectors); err != nil {
+		t.Fatalf("publish stable: %v", err)
+	}
+	stableDigest := store.tagDigest("agents", "stable")
+	if stableDigest == "" || !strings.Contains(output.String(), contracts.FormatOwnedCapsuleTagRef("user-1", "agents", "stable")) {
+		t.Fatalf("publish output/tag = %q / %q", output.String(), stableDigest)
+	}
+	output.Reset()
+	if err := command.publish(t.Context(), "agents:stable", root, selectors); err != nil {
+		t.Fatalf("idempotent publish stable: %v", err)
+	}
+
+	output.Reset()
+	if err := command.inspect(t.Context(), "agents:stable"); err != nil {
+		t.Fatalf("inspect stable: %v", err)
+	}
+	if !strings.Contains(output.String(), "manifest name=\"agents\"") || !strings.Contains(output.String(), "component id=\"config:AGENTS.md\"") {
+		t.Fatalf("inspect output = %s", output.String())
+	}
+
+	writeCLIProfileFile(t, root, "AGENTS.md", "Use Go and run tests.\n", 0o644)
+	output.Reset()
+	if err := command.publish(t.Context(), "agents:next", root, selectors); err != nil {
+		t.Fatalf("publish next: %v", err)
+	}
+	output.Reset()
+	if err := command.diff(t.Context(), "agents:stable", "agents:next"); err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if !strings.Contains(output.String(), "changed id=\"config:AGENTS.md\" type=config scope=user from=sha256:") {
+		t.Fatalf("Component diff output = %s", output.String())
+	}
+}
+
+func TestCapsuleGrantErrorsDoNotLeakCapabilityURLs(t *testing.T) {
+	store := newCapsuleHTTPStore(t)
+	store.failReads = true
+	api, err := contracts.NewClientWithResponses(store.server.URL, contracts.WithHTTPClient(store.server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := capsuleGrantProvider{api: api, httpClient: store.server.Client(), token: "access-token"}
+	grant, err := provider.Grant(t.Context(), oci.GrantRequest{
+		OwnerID: "user-1", Key: oci.IndexKey("user-1", "sha256:"+strings.Repeat("a", 64)), Operation: oci.GrantRead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = grant.Read(t.Context())
+	if err == nil || strings.Contains(err.Error(), "CAPABILITY_SECRET") || strings.Contains(err.Error(), store.server.URL) {
+		t.Fatalf("read error leaked capability URL: %v", err)
+	}
+}
+
+type capsuleHTTPStore struct {
+	server    *httptest.Server
+	mu        sync.Mutex
+	objects   map[string][]byte
+	tags      map[string]contracts.CapsuleTag
+	failReads bool
+}
+
+func newCapsuleHTTPStore(t *testing.T) *capsuleHTTPStore {
+	t.Helper()
+	store := &capsuleHTTPStore{objects: make(map[string][]byte), tags: make(map[string]contracts.CapsuleTag)}
+	store.server = httptest.NewServer(http.HandlerFunc(store.serveHTTP))
+	t.Cleanup(store.server.Close)
+	return store
+}
+
+func (store *capsuleHTTPStore) serveHTTP(response http.ResponseWriter, request *http.Request) {
+	if strings.HasPrefix(request.URL.Path, "/objects/") {
+		store.serveObject(response, request)
+		return
+	}
+	if request.Header.Get("Authorization") != "Bearer access-token" {
+		http.Error(response, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	switch {
+	case request.Method == http.MethodPost && request.URL.Path == "/capsule-access":
+		var body contracts.CapsuleAccessRequest
+		if json.NewDecoder(request.Body).Decode(&body) != nil || len(body.Objects) != 1 {
+			http.Error(response, "bad request", http.StatusBadRequest)
+			return
+		}
+		object := body.Objects[0]
+		method := contracts.GET
+		if body.Intent == contracts.Push {
+			method = contracts.PUT
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(contracts.CapsuleAccessResponse{Grants: []contracts.CapsuleAccessGrant{{
+			Url:    store.server.URL + "/objects/" + string(object.Kind) + "/" + object.Digest + "?token=CAPABILITY_SECRET",
+			Method: method, Headers: map[string]string{}, ExpiresAt: time.Now().Add(time.Hour),
+		}}})
+	case strings.HasPrefix(request.URL.Path, "/capsules/"):
+		parts := strings.Split(strings.Trim(request.URL.Path, "/"), "/")
+		if len(parts) != 4 || parts[0] != "capsules" || parts[2] != "tags" {
+			http.NotFound(response, request)
+			return
+		}
+		key := parts[1] + ":" + parts[3]
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if request.Method == http.MethodPut {
+			var body contracts.PutCapsuleTagRequest
+			if json.NewDecoder(request.Body).Decode(&body) != nil {
+				http.Error(response, "bad request", http.StatusBadRequest)
+				return
+			}
+			if existing, exists := store.tags[key]; !exists || existing.Digest != body.Digest {
+				store.tags[key] = contracts.CapsuleTag{Name: parts[1], Tag: parts[3], Digest: body.Digest, UpdatedAt: time.Now().UTC()}
+			}
+		}
+		record, exists := store.tags[key]
+		if !exists {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(record)
+	default:
+		http.NotFound(response, request)
+	}
+}
+
+func (store *capsuleHTTPStore) serveObject(response http.ResponseWriter, request *http.Request) {
+	key := strings.TrimPrefix(request.URL.Path, "/objects/")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if request.Method == http.MethodPut {
+		if _, exists := store.objects[key]; exists {
+			response.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		content, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(response, "read", http.StatusBadRequest)
+			return
+		}
+		store.objects[key] = content
+		response.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if store.failReads {
+		http.Error(response, "CAPABILITY_SECRET", http.StatusInternalServerError)
+		return
+	}
+	content, exists := store.objects[key]
+	if !exists {
+		http.NotFound(response, request)
+		return
+	}
+	_, _ = response.Write(content)
+}
+
+func (store *capsuleHTTPStore) tagDigest(name, tag string) string {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.tags[name+":"+tag].Digest
 }
 
 func TestCaptureAndPlanRenderExecutableContentFlag(t *testing.T) {

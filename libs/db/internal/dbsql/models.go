@@ -33,6 +33,14 @@ type CapsuleLock struct {
 	CreatedAt            pgtype.Timestamptz
 }
 
+type CapsuleTag struct {
+	OwnerUserID string
+	Name        string
+	Tag         string
+	Digest      string
+	UpdatedAt   pgtype.Timestamptz
+}
+
 type ComputeUsageInterval struct {
 	ID                  string
 	UserID              string

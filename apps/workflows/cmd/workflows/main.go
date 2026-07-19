@@ -83,7 +83,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("construct Capsule grant provider: %w", err)
 	}
-	capsuleResolver := newCapsuleResolverAdapter(oci.NewResolver(grantProvider))
+	capsuleResolver := newCapsuleResolverAdapter(oci.NewResolverWithTagIndex(grantProvider, store))
 
 	pinnedResolver := newPinnedProfileVersionResolver(store, store, capsuleResolver, idGenerator{})
 	creationActions, err := workflows.NewEnvironmentCreationActions(store, pinnedResolver)

@@ -135,7 +135,7 @@ func run(ctx context.Context) error {
 	handler := controlplane.NewHandler(controlplane.Config{
 		CreateEnvironment: createEnvironment, RuntimeCommands: runtimeCommands, AutoStopPolicies: autoStopPolicies,
 		RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
-		Verifier: verifier, Users: store, CapsulePresigner: capsulePresigner, CapsuleOwnership: controlplane.NewS3CapsuleOwnership(capsuleClient, config.capsuleBucket), CapsuleBucket: config.capsuleBucket, CapsuleAccessTTL: 15 * time.Minute,
+		Verifier: verifier, Users: store, CapsulePresigner: capsulePresigner, CapsuleOwnership: controlplane.NewS3CapsuleOwnership(capsuleClient, config.capsuleBucket), CapsuleTags: store, CapsuleBucket: config.capsuleBucket, CapsuleAccessTTL: 15 * time.Minute,
 		UserIDs: ids, RequestIDs: ids, ConnectionIntentIDs: ids, ConnectionIntents: store, DefaultRegion: config.defaultRegion, Now: time.Now,
 		RegionalProxyURLs: config.regionalProxyURLs, ConnectionIntentTTL: config.connectionIntentTTL,
 		EnvironmentReads: store, OperationReads: store, ProfileReads: store, BillingReads: store,

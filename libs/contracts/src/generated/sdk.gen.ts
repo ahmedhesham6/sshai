@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { ApplyEnvironmentProfileData, ApplyEnvironmentProfileErrors, ApplyEnvironmentProfileResponses, CreateBillingPortalData, CreateBillingPortalErrors, CreateBillingPortalResponses, CreateCapsuleAccessData, CreateCapsuleAccessErrors, CreateCapsuleAccessResponses, CreateConnectionIntentData, CreateConnectionIntentErrors, CreateConnectionIntentResponses, CreateEnvironmentData, CreateEnvironmentErrors, CreateEnvironmentResponses, CreateProfileData, CreateProfileErrors, CreateProfileResponses, CreateProjectSeedData, CreateProjectSeedErrors, CreateProjectSeedResponses, CreateSshKeyData, CreateSshKeyErrors, CreateSshKeyResponses, CreateUploadIntentData, CreateUploadIntentErrors, CreateUploadIntentResponses, DeleteEnvironmentData, DeleteEnvironmentErrors, DeleteEnvironmentResponses, GetBillingSummaryData, GetBillingSummaryErrors, GetBillingSummaryResponses, GetCurrentUserData, GetCurrentUserErrors, GetCurrentUserResponses, GetEnvironmentData, GetEnvironmentErrors, GetEnvironmentResponses, GetOperationData, GetOperationErrors, GetOperationResponses, GetProfileData, GetProfileErrors, GetProfileResponses, GetProfileVersionData, GetProfileVersionErrors, GetProfileVersionResponses, ListEnvironmentEventsData, ListEnvironmentEventsErrors, ListEnvironmentEventsResponses, ListEnvironmentsData, ListEnvironmentsErrors, ListEnvironmentsResponses, ListProfilesData, ListProfilesErrors, ListProfilesResponses, ListSshKeysData, ListSshKeysErrors, ListSshKeysResponses, PublishProfileVersionData, PublishProfileVersionErrors, PublishProfileVersionResponses, ReplaceEnvironmentRuntimeData, ReplaceEnvironmentRuntimeErrors, ReplaceEnvironmentRuntimeResponses, RevokeSshKeyData, RevokeSshKeyErrors, RevokeSshKeyResponses, StartEnvironmentRuntimeData, StartEnvironmentRuntimeErrors, StartEnvironmentRuntimeResponses, StopEnvironmentRuntimeData, StopEnvironmentRuntimeErrors, StopEnvironmentRuntimeResponses, UpdateAutoStopPolicyData, UpdateAutoStopPolicyErrors, UpdateAutoStopPolicyResponses } from './types.gen';
+import type { ApplyEnvironmentProfileData, ApplyEnvironmentProfileErrors, ApplyEnvironmentProfileResponses, CreateBillingPortalData, CreateBillingPortalErrors, CreateBillingPortalResponses, CreateCapsuleAccessData, CreateCapsuleAccessErrors, CreateCapsuleAccessResponses, CreateConnectionIntentData, CreateConnectionIntentErrors, CreateConnectionIntentResponses, CreateEnvironmentData, CreateEnvironmentErrors, CreateEnvironmentResponses, CreateProfileData, CreateProfileErrors, CreateProfileResponses, CreateProjectSeedData, CreateProjectSeedErrors, CreateProjectSeedResponses, CreateSshKeyData, CreateSshKeyErrors, CreateSshKeyResponses, CreateUploadIntentData, CreateUploadIntentErrors, CreateUploadIntentResponses, DeleteEnvironmentData, DeleteEnvironmentErrors, DeleteEnvironmentResponses, GetBillingSummaryData, GetBillingSummaryErrors, GetBillingSummaryResponses, GetCapsuleTagData, GetCapsuleTagErrors, GetCapsuleTagResponses, GetCurrentUserData, GetCurrentUserErrors, GetCurrentUserResponses, GetEnvironmentData, GetEnvironmentErrors, GetEnvironmentResponses, GetOperationData, GetOperationErrors, GetOperationResponses, GetProfileData, GetProfileErrors, GetProfileResponses, GetProfileVersionData, GetProfileVersionErrors, GetProfileVersionResponses, ListEnvironmentEventsData, ListEnvironmentEventsErrors, ListEnvironmentEventsResponses, ListEnvironmentsData, ListEnvironmentsErrors, ListEnvironmentsResponses, ListProfilesData, ListProfilesErrors, ListProfilesResponses, ListSshKeysData, ListSshKeysErrors, ListSshKeysResponses, PublishProfileVersionData, PublishProfileVersionErrors, PublishProfileVersionResponses, PutCapsuleTagData, PutCapsuleTagErrors, PutCapsuleTagResponses, ReplaceEnvironmentRuntimeData, ReplaceEnvironmentRuntimeErrors, ReplaceEnvironmentRuntimeResponses, RevokeSshKeyData, RevokeSshKeyErrors, RevokeSshKeyResponses, StartEnvironmentRuntimeData, StartEnvironmentRuntimeErrors, StartEnvironmentRuntimeResponses, StopEnvironmentRuntimeData, StopEnvironmentRuntimeErrors, StopEnvironmentRuntimeResponses, UpdateAutoStopPolicyData, UpdateAutoStopPolicyErrors, UpdateAutoStopPolicyResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -51,6 +51,28 @@ export const createBillingPortal = <ThrowOnError extends boolean = false>(option
 export const createCapsuleAccess = <ThrowOnError extends boolean = false>(options: Options<CreateCapsuleAccessData, ThrowOnError>): RequestResult<CreateCapsuleAccessResponses, CreateCapsuleAccessErrors, ThrowOnError> => (options.client ?? client).post<CreateCapsuleAccessResponses, CreateCapsuleAccessErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/capsule-access',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Resolve an owned Capsule tag
+ */
+export const getCapsuleTag = <ThrowOnError extends boolean = false>(options: Options<GetCapsuleTagData, ThrowOnError>): RequestResult<GetCapsuleTagResponses, GetCapsuleTagErrors, ThrowOnError> => (options.client ?? client).get<GetCapsuleTagResponses, GetCapsuleTagErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/capsules/{name}/tags/{tag}',
+    ...options
+});
+
+/**
+ * Publish an owned Capsule tag
+ */
+export const putCapsuleTag = <ThrowOnError extends boolean = false>(options: Options<PutCapsuleTagData, ThrowOnError>): RequestResult<PutCapsuleTagResponses, PutCapsuleTagErrors, ThrowOnError> => (options.client ?? client).put<PutCapsuleTagResponses, PutCapsuleTagErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/capsules/{name}/tags/{tag}',
     ...options,
     headers: {
         'Content-Type': 'application/json',

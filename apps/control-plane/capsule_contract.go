@@ -13,6 +13,7 @@ import (
 
 	"github.com/ahmedhesham6/sshai/libs/capsule/oci"
 	"github.com/ahmedhesham6/sshai/libs/contracts"
+	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -175,6 +176,76 @@ func (server *server) CreateCapsuleAccess(response http.ResponseWriter, request 
 		Body:    contracts.CapsuleAccessResponse{Grants: grants},
 	}
 	if err := result.VisitCreateCapsuleAccessResponse(response); err != nil {
+		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
+	}
+}
+
+func (server *server) GetCapsuleTag(response http.ResponseWriter, request *http.Request, name, tag string) {
+	user, present := userFromContext(request.Context())
+	if !present {
+		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
+		return
+	}
+	if server.capsuleTags == nil {
+		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The Capsule tag index is unavailable.")
+		return
+	}
+	record, err := server.capsuleTags.GetCapsuleTag(request.Context(), user.ID, name, tag)
+	if err != nil {
+		if errors.Is(err, db.ErrReferenceNotOwned) {
+			writeError(response, request, http.StatusNotFound, "CAPSULE_TAG_NOT_FOUND", "The Capsule tag was not found.")
+		} else {
+			writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The Capsule tag could not be resolved safely.")
+		}
+		return
+	}
+	result := contracts.GetCapsuleTag200JSONResponse{
+		Headers: contracts.GetCapsuleTag200ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
+		Body:    contracts.CapsuleTag{Name: record.Name, Tag: record.Tag, Digest: record.Digest, UpdatedAt: record.UpdatedAt},
+	}
+	if err := result.VisitGetCapsuleTagResponse(response); err != nil {
+		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
+	}
+}
+
+func (server *server) PutCapsuleTag(response http.ResponseWriter, request *http.Request, name, tag string) {
+	var body contracts.PutCapsuleTagJSONRequestBody
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+		writeError(response, request, http.StatusBadRequest, "INVALID_REQUEST", "The request body is not valid JSON.")
+		return
+	}
+	user, present := userFromContext(request.Context())
+	if !present {
+		writeError(response, request, http.StatusUnauthorized, "AUTHORIZATION_FAILED", "Authentication is required.")
+		return
+	}
+	if server.capsuleTags == nil || server.capsuleOwnership == nil {
+		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The Capsule tag index is unavailable.")
+		return
+	}
+	owned, err := server.capsuleOwnership.OwnsCapsule(request.Context(), user.ID, body.Digest)
+	if err != nil {
+		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "Capsule ownership could not be verified safely.")
+		return
+	}
+	if !owned {
+		writeError(response, request, http.StatusNotFound, "CAPSULE_NOT_FOUND", "The Capsule was not found.")
+		return
+	}
+	now := time.Now().UTC()
+	if server.now != nil {
+		now = server.now().UTC()
+	}
+	record, err := server.capsuleTags.PutCapsuleTag(request.Context(), user.ID, name, tag, body.Digest, now)
+	if err != nil {
+		writeError(response, request, http.StatusServiceUnavailable, "COMMAND_UNAVAILABLE", "The Capsule tag could not be published safely.")
+		return
+	}
+	result := contracts.PutCapsuleTag200JSONResponse{
+		Headers: contracts.PutCapsuleTag200ResponseHeaders{XRequestID: requestIDFromContext(request.Context())},
+		Body:    contracts.CapsuleTag{Name: record.Name, Tag: record.Tag, Digest: record.Digest, UpdatedAt: record.UpdatedAt},
+	}
+	if err := result.VisitPutCapsuleTagResponse(response); err != nil {
 		writeError(response, request, http.StatusInternalServerError, "INTERNAL_ERROR", "The response could not be encoded.")
 	}
 }
