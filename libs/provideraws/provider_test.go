@@ -150,6 +150,7 @@ func (client miniStackEC2) RunInstances(ctx context.Context, input *ec2.RunInsta
 	if output != nil {
 		for index := range output.Instances {
 			addMiniStackPrivateIPv4(&output.Instances[index])
+			addMiniStackSystemVolume(&output.Instances[index])
 		}
 	}
 	return output, err
@@ -161,6 +162,7 @@ func (client miniStackEC2) DescribeInstances(ctx context.Context, input *ec2.Des
 		for reservationIndex := range output.Reservations {
 			for instanceIndex := range output.Reservations[reservationIndex].Instances {
 				addMiniStackPrivateIPv4(&output.Reservations[reservationIndex].Instances[instanceIndex])
+				addMiniStackSystemVolume(&output.Reservations[reservationIndex].Instances[instanceIndex])
 			}
 		}
 	}
@@ -171,6 +173,16 @@ func addMiniStackPrivateIPv4(instance *types.Instance) {
 	if instance.State != nil && instance.State.Name == types.InstanceStateNameRunning {
 		instance.PrivateIpAddress = aws.String("10.0.0.4")
 	}
+}
+
+func addMiniStackSystemVolume(instance *types.Instance) {
+	if aws.ToString(instance.InstanceId) == "" || len(instance.BlockDeviceMappings) != 0 {
+		return
+	}
+	instance.BlockDeviceMappings = []types.InstanceBlockDeviceMapping{{
+		DeviceName: aws.String("/dev/sda1"),
+		Ebs:        &types.EbsInstanceBlockDevice{VolumeId: aws.String("vol-system-" + strings.TrimPrefix(aws.ToString(instance.InstanceId), "i-"))},
+	}}
 }
 
 func setMiniStackCredentials(t *testing.T) {

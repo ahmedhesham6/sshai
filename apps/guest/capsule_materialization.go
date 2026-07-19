@@ -22,6 +22,14 @@ import (
 	orasoci "oras.land/oras-go/v2/content/oci"
 )
 
+// ErrCapsuleContentInvalid identifies deterministic disagreement between an
+// immutable Capsule and the Capsule Lock that selected it.
+var ErrCapsuleContentInvalid = errors.New("Capsule content does not match the Lock")
+
+func invalidCapsuleContent(message string, arguments ...any) error {
+	return fmt.Errorf("%w: %s", ErrCapsuleContentInvalid, fmt.Sprintf(message, arguments...))
+}
+
 // MaterializeCapsuleLock pulls or loads each Capsule referenced by the Lock,
 // verifies the resolved Component and its layer contents, lets the Claude
 // adapter translate those Components, then delegates all mutations to the
@@ -60,7 +68,7 @@ func MaterializeCapsuleLock(ctx context.Context, batch CapsuleLockMaterializatio
 	}
 	adapter, err := adapters.For(adapterID)
 	if err != nil {
-		return nil, fmt.Errorf("materialize Capsule Lock: %w", err)
+		return nil, invalidCapsuleContent("materialize Capsule Lock: select adapter: %v", err)
 	}
 
 	items := make([]ProfileMaterialization, 0, len(snapshot.ResolvedComponents))
@@ -77,7 +85,7 @@ func MaterializeCapsuleLock(ctx context.Context, batch CapsuleLockMaterializatio
 		}
 		item, err := adapter.Translate(snapshot, locked.CapsuleDigest, component, files, installed[componentID], installed[componentID].ComponentID != "", batch)
 		if err != nil {
-			return nil, fmt.Errorf("materialize Capsule Lock: translate Component %q: %w", componentID, err)
+			return nil, invalidCapsuleContent("materialize Capsule Lock: translate Component %q: %v", componentID, err)
 		}
 		items = append(items, item)
 	}
@@ -186,10 +194,10 @@ func loadOrPullCapsule(ctx context.Context, cache *orasoci.Store, capsuleDigest 
 	if _, err := cache.Resolve(ctx, capsuleDigest); err == nil {
 		value, err := capsuleoci.Parse(ctx, cache, capsuleDigest)
 		if err != nil {
-			return capsule.Capsule{}, fmt.Errorf("cached Capsule failed verification: %w", err)
+			return capsule.Capsule{}, invalidCapsuleContent("cached Capsule failed verification: %v", err)
 		}
 		if value.Digest != capsuleDigest {
-			return capsule.Capsule{}, errors.New("cached Capsule digest does not match the Lock")
+			return capsule.Capsule{}, invalidCapsuleContent("cached Capsule digest does not match the Lock")
 		}
 		return value, nil
 	}
@@ -202,10 +210,13 @@ func loadOrPullCapsule(ctx context.Context, cache *orasoci.Store, capsuleDigest 
 	}
 	value, err := client.Pull(ctx, capsuleDigest, cache, nil)
 	if err != nil {
+		if errors.Is(err, capsuleoci.ErrContentInvalid) {
+			return capsule.Capsule{}, invalidCapsuleContent("pulled Capsule failed verification: %v", err)
+		}
 		return capsule.Capsule{}, err
 	}
 	if value.Digest != capsuleDigest {
-		return capsule.Capsule{}, errors.New("pulled Capsule digest does not match the Lock")
+		return capsule.Capsule{}, invalidCapsuleContent("pulled Capsule digest does not match the Lock")
 	}
 	if batch.Metrics != nil {
 		batch.Metrics.AddCounter(domain.MetricCapsulePullsTotal, 1)
@@ -224,7 +235,7 @@ func resolvedComponentContent(capsules map[string]capsule.Capsule, locked domain
 	for index, source := range sources {
 		value, present := capsules[source.CapsuleDigest]
 		if !present {
-			return capsule.Component{}, nil, fmt.Errorf("source Capsule %q is absent from the Lock", source.CapsuleDigest)
+			return capsule.Component{}, nil, invalidCapsuleContent("source Capsule %q is absent from the Lock", source.CapsuleDigest)
 		}
 		sourceLock := locked
 		sourceLock.CapsuleDigest = source.CapsuleDigest
@@ -236,17 +247,17 @@ func resolvedComponentContent(capsules map[string]capsule.Capsule, locked domain
 		if index == 0 {
 			firstFiles = files
 		} else if len(files) != len(firstFiles) {
-			return capsule.Component{}, nil, errors.New("merged Component source file shapes do not match")
+			return capsule.Component{}, nil, invalidCapsuleContent("merged Component source file shapes do not match")
 		}
 		for fileIndex, file := range files {
 			if file.Path != firstFiles[fileIndex].Path {
-				return capsule.Component{}, nil, errors.New("merged Component source paths do not match")
+				return capsule.Component{}, nil, invalidCapsuleContent("merged Component source paths do not match")
 			}
 		}
 		components = append(components, component)
 		if len(sources) > 1 {
 			if component.Type != capsule.ComponentTypeConfig || len(files) != 1 {
-				return capsule.Component{}, nil, errors.New("only single-file config Components can be merged")
+				return capsule.Component{}, nil, invalidCapsuleContent("only single-file config Components can be merged")
 			}
 			contents = append(contents, files[0].Content)
 		}
@@ -256,17 +267,17 @@ func resolvedComponentContent(capsules map[string]capsule.Capsule, locked domain
 	if len(components) > 1 {
 		merged, err := domain.MergeConfigContents(component.MediaType, contents...)
 		if err != nil {
-			return capsule.Component{}, nil, fmt.Errorf("merge source config: %w", err)
+			return capsule.Component{}, nil, invalidCapsuleContent("merge source config: %v", err)
 		}
 		if domain.ContentDigest(merged) != locked.ComponentDigest {
-			return capsule.Component{}, nil, errors.New("merged Component digest does not match the Lock")
+			return capsule.Component{}, nil, invalidCapsuleContent("merged Component digest does not match the Lock")
 		}
 		component.Digest = locked.ComponentDigest
 		component.SizeBytes = int64(len(merged))
 		firstFiles[0].Content = merged
 		firstFiles[0].Mode = os.FileMode(0o644)
 	} else if component.Digest != locked.ComponentDigest {
-		return capsule.Component{}, nil, errors.New("Component digest does not match the Lock")
+		return capsule.Component{}, nil, invalidCapsuleContent("Component digest does not match the Lock")
 	}
 	effectiveScope := capsule.ScopeUser
 	for _, source := range components {
@@ -275,7 +286,7 @@ func resolvedComponentContent(capsules map[string]capsule.Capsule, locked domain
 		}
 	}
 	if effectiveScope != capsule.Scope(locked.Scope) {
-		return capsule.Component{}, nil, errors.New("Component effective scope does not match the Lock")
+		return capsule.Component{}, nil, invalidCapsuleContent("Component effective scope does not match the Lock")
 	}
 	component.Scope = effectiveScope
 	component.TrustClass = capsule.TrustClass(locked.TrustClass)
@@ -284,7 +295,7 @@ func resolvedComponentContent(capsules map[string]capsule.Capsule, locked domain
 
 func resolvedSourceComponentContent(value capsule.Capsule, locked domain.ResolvedComponent) (capsule.Component, []capsuleFile, error) {
 	if value.Digest != locked.CapsuleDigest {
-		return capsule.Component{}, nil, errors.New("Capsule digest does not match the Lock")
+		return capsule.Component{}, nil, invalidCapsuleContent("Capsule digest does not match the Lock")
 	}
 	index := -1
 	for i, component := range value.Manifest.Components {
@@ -294,19 +305,19 @@ func resolvedSourceComponentContent(value capsule.Capsule, locked domain.Resolve
 		}
 	}
 	if index < 0 || index >= len(value.Layers) {
-		return capsule.Component{}, nil, errors.New("Component is absent from the pulled Capsule")
+		return capsule.Component{}, nil, invalidCapsuleContent("Component is absent from the pulled Capsule")
 	}
 	component := value.Manifest.Components[index]
 	if component.Digest != locked.ComponentDigest || (locked.Type != "" && component.Type != capsule.ComponentType(locked.Type)) || capsule.TrustClass(component.TrustClass) != capsule.TrustClass(locked.TrustClass) {
-		return capsule.Component{}, nil, errors.New("Component metadata does not match the Lock")
+		return capsule.Component{}, nil, invalidCapsuleContent("Component metadata does not match the Lock")
 	}
 	layer := value.Layers[index]
 	if layer.ComponentID != component.ID || layer.Digest != component.Digest || materializationContentDigest(layer.Bytes) != layer.Digest {
-		return capsule.Component{}, nil, errors.New("Component layer digest verification failed")
+		return capsule.Component{}, nil, invalidCapsuleContent("Component layer digest verification failed")
 	}
 	files, err := extractCapsuleLayer(layer)
 	if err != nil {
-		return capsule.Component{}, nil, err
+		return capsule.Component{}, nil, invalidCapsuleContent("extract Component layer: %v", err)
 	}
 	return component, files, nil
 }

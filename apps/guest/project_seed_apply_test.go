@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +45,26 @@ func TestProjectSeedApplicationChecksOutTheExactBaseAndReplaysSafely(t *testing.
 	}
 	if content, err := os.ReadFile(filepath.Join(workspace, "tracked.txt")); err != nil || string(content) != "remote authority\n" {
 		t.Fatalf("replay changed authoritative workspace content = %q, %v", content, err)
+	}
+}
+
+func TestProjectSeedApplicationSeedsBootstrapCreatedEmptyWorkspace(t *testing.T) {
+	repository, base := seedRepository(t)
+	application, err := guest.NewProjectSeedApplication(guest.ProjectSeedApplicationInput{
+		RepositoryURL: repositoryURL(repository), BaseRevision: base, Manifest: seedArtifact([]byte("[]")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Apply(context.Background(), workspace); err != nil {
+		t.Fatalf("seed bootstrap-created empty workspace: %v", err)
+	}
+	if head := strings.TrimSpace(seedRunGit(t, workspace, "rev-parse", "HEAD")); head != base {
+		t.Fatalf("workspace HEAD = %q, want %q", head, base)
 	}
 }
 
@@ -162,6 +183,21 @@ func TestProjectSeedApplicationRejectsANonArrayManifest(t *testing.T) {
 		Manifest:      seedArtifact([]byte("null")),
 	}); err == nil {
 		t.Fatal("non-array Project Seed manifest was accepted")
+	}
+}
+
+func TestProjectSeedApplicationClassifiesMalformedBundleAsImmutableInput(t *testing.T) {
+	remote, base := seedRepository(t)
+	application, err := guest.NewProjectSeedApplication(guest.ProjectSeedApplicationInput{
+		RepositoryURL: repositoryURL(remote), BaseRevision: base,
+		GitBundle: seedArtifact([]byte("not a Git bundle")), Manifest: seedArtifact([]byte("[]")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = application.Apply(t.Context(), filepath.Join(t.TempDir(), "workspace"))
+	if !errors.Is(err, guest.ErrProjectSeedContentInvalid) {
+		t.Fatalf("malformed bundle error = %T %v, want ErrProjectSeedContentInvalid", err, err)
 	}
 }
 

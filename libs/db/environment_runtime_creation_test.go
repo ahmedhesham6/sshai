@@ -81,6 +81,58 @@ func TestStoreRejectsInitialRuntimeBeforeStateInventory(t *testing.T) {
 	}
 }
 
+func TestPersistEnvironmentCreateRuntimeTransitionAcceptsExactReplay(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	insertCreationPrerequisites(t, ctx, pool)
+	createdAt := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	if _, err := store.ReserveEnvironmentCreation(ctx, newEnvironmentCreation(t, "environment-1", "policy-1", "operation-1", []byte(`{}`), createdAt)); err != nil {
+		t.Fatalf("reserve Environment creation: %v", err)
+	}
+	if _, err := store.InventoryEnvironmentState(ctx, "operation-1", environmentStateReservation(createdAt.Add(30*time.Second), "volume-1")); err != nil {
+		t.Fatalf("inventory Environment State: %v", err)
+	}
+	runtime, err := store.ReserveInitialRuntime(ctx, "operation-1", initialRuntimeReservation(createdAt.Add(time.Minute)))
+	if err != nil {
+		t.Fatalf("reserve initial Runtime: %v", err)
+	}
+	provisioned, err := runtime.Provision("instance-1", createdAt.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("provision Runtime: %v", err)
+	}
+	next := provisioned.Snapshot()
+
+	if err := store.PersistEnvironmentCreateRuntimeTransition(ctx, "operation-1", 1, next); err != nil {
+		t.Fatalf("persist Runtime transition: %v", err)
+	}
+	if err := store.PersistEnvironmentCreateRuntimeTransition(ctx, "operation-1", 1, next); err != nil {
+		t.Fatalf("replay committed Runtime transition: %v", err)
+	}
+	var status, providerID string
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT status, provider_instance_ref, version FROM runtimes WHERE id = 'runtime-1'`).Scan(&status, &providerID, &version); err != nil {
+		t.Fatalf("read persisted Runtime: %v", err)
+	}
+	if status != "provisioning" || providerID != "instance-1" || version != 2 {
+		t.Fatalf("persisted Runtime = %q/%q version %d", status, providerID, version)
+	}
+}
+
+func TestPersistEnvironmentCreateRuntimeTransitionValidatesNextSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store, _ := openTestStoreAndPool(t, ctx)
+	invalid := domain.RuntimeSnapshot{
+		ID: "runtime-1", EnvironmentID: "environment-1", Sequence: 1, Status: domain.RuntimeProvisioning,
+		RuntimePreset: "standard", Region: "us-east-1", AvailabilityZone: "us-east-1a", ImageVersion: "image-v1",
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(), Version: 2,
+	}
+	err := store.PersistEnvironmentCreateRuntimeTransition(ctx, "operation-1", 1, invalid)
+	if err == nil {
+		t.Fatal("invalid next Runtime snapshot persisted")
+	}
+	requirePermanentRepositoryError(t, err)
+}
+
 func initialRuntimeReservation(createdAt time.Time) domain.RuntimeReservation {
 	return domain.RuntimeReservation{
 		ID: "runtime-1", EnvironmentID: "environment-1", Sequence: 1,

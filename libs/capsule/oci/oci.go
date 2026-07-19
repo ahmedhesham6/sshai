@@ -140,16 +140,16 @@ func Parse(ctx context.Context, store oras.ReadOnlyTarget, reference string) (ca
 	}
 	var imageManifest ocispec.Manifest
 	if err := json.Unmarshal(manifestBytes, &imageManifest); err != nil {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: decode OCI manifest: %w", err)
+		return capsule.Capsule{}, invalidContent("parse capsule: decode OCI manifest: %v", err)
 	}
 	if imageManifest.MediaType != ocispec.MediaTypeImageManifest {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: OCI manifest media type %q is invalid", imageManifest.MediaType)
+		return capsule.Capsule{}, invalidContent("parse capsule: OCI manifest media type %q is invalid", imageManifest.MediaType)
 	}
 	if imageManifest.ArtifactType != capsule.ArtifactMediaType {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: artifact type %q is invalid", imageManifest.ArtifactType)
+		return capsule.Capsule{}, invalidContent("parse capsule: artifact type %q is invalid", imageManifest.ArtifactType)
 	}
 	if imageManifest.Config.MediaType != ConfigMediaType {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: config media type %q is invalid", imageManifest.Config.MediaType)
+		return capsule.Capsule{}, invalidContent("parse capsule: config media type %q is invalid", imageManifest.Config.MediaType)
 	}
 
 	configBytes, err := fetchVerified(ctx, store, imageManifest.Config)
@@ -158,31 +158,31 @@ func Parse(ctx context.Context, store oras.ReadOnlyTarget, reference string) (ca
 	}
 	var manifest capsule.Manifest
 	if err := json.Unmarshal(configBytes, &manifest); err != nil {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: decode Capsule manifest: %w", err)
+		return capsule.Capsule{}, invalidContent("parse capsule: decode Capsule manifest: %v", err)
 	}
 	canonicalManifest, err := manifest.CanonicalJSON()
 	if err != nil {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: validate Capsule manifest: %w", err)
+		return capsule.Capsule{}, invalidContent("parse capsule: validate Capsule manifest: %v", err)
 	}
 	if !bytes.Equal(configBytes, canonicalManifest) {
-		return capsule.Capsule{}, errors.New("parse capsule: config blob is not canonical Capsule manifest JSON")
+		return capsule.Capsule{}, invalidContent("parse capsule: config blob is not canonical Capsule manifest JSON")
 	}
 	computedCapsuleDigest, err := capsule.ComputeCapsuleDigest(manifest)
 	if err != nil {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: compute Capsule digest: %w", err)
+		return capsule.Capsule{}, invalidContent("parse capsule: compute Capsule digest: %v", err)
 	}
 	if reference != manifestDescriptor.Digest.String() && reference != computedCapsuleDigest {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: reference %q does not match Capsule digest %q", reference, computedCapsuleDigest)
+		return capsule.Capsule{}, invalidContent("parse capsule: reference %q does not match Capsule digest %q", reference, computedCapsuleDigest)
 	}
 	if len(imageManifest.Layers) != len(manifest.Components) {
-		return capsule.Capsule{}, fmt.Errorf("parse capsule: layer count %d does not match component count %d", len(imageManifest.Layers), len(manifest.Components))
+		return capsule.Capsule{}, invalidContent("parse capsule: layer count %d does not match component count %d", len(imageManifest.Layers), len(manifest.Components))
 	}
 
 	layers := make([]capsule.Layer, len(imageManifest.Layers))
 	for index, descriptor := range imageManifest.Layers {
 		component := manifest.Components[index]
 		if err := validateLayerDescriptor(descriptor, component); err != nil {
-			return capsule.Capsule{}, fmt.Errorf("parse capsule: component %q: %w", component.ID, err)
+			return capsule.Capsule{}, invalidContent("parse capsule: component %q: %v", component.ID, err)
 		}
 		layerBytes, err := fetchVerified(ctx, store, descriptor)
 		if err != nil {
@@ -190,7 +190,7 @@ func Parse(ctx context.Context, store oras.ReadOnlyTarget, reference string) (ca
 		}
 		indexEntries, err := parseLayerIndex(layerBytes)
 		if err != nil {
-			return capsule.Capsule{}, fmt.Errorf("parse capsule: component %q: %w", component.ID, err)
+			return capsule.Capsule{}, invalidContent("parse capsule: component %q: %v", component.ID, err)
 		}
 		layers[index] = capsule.Layer{
 			ComponentID: component.ID,
@@ -288,10 +288,10 @@ func fetchVerified(ctx context.Context, store content.Fetcher, descriptor ocispe
 		return nil, err
 	}
 	if int64(len(data)) != descriptor.Size {
-		return nil, fmt.Errorf("blob %s size %d does not match expected %d", descriptor.Digest, len(data), descriptor.Size)
+		return nil, invalidContent("blob %s size %d does not match expected %d", descriptor.Digest, len(data), descriptor.Size)
 	}
 	if digest.FromBytes(data) != descriptor.Digest {
-		return nil, fmt.Errorf("blob digest mismatch: got %s, want %s", digest.FromBytes(data), descriptor.Digest)
+		return nil, invalidContent("blob digest mismatch: got %s, want %s", digest.FromBytes(data), descriptor.Digest)
 	}
 	return data, nil
 }

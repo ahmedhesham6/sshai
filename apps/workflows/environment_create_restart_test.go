@@ -4,6 +4,7 @@ package workflows_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestEnvironmentCreateWorkflowResumesAfterHandlerTerminationAtEveryDurableBo
 			actions := newResumableCreationActions(gate)
 			dataVolumes := &resumableDataVolumeProvider{gate: gate, provider: testfixtures.NewProvider()}
 			ids := &resumableIDs{gate: gate, values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
-			environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, actions, ids, time.Now, "image-v1"))
+			environment := testfixtures.StartRestate(t, environmentCreateDefinition(dataVolumes, actions, ids, time.Now, "image-v1"))
 			input := domain.EnvironmentCreateDispatch{
 				OperationID: "operation-" + boundary, EnvironmentID: "environment-" + boundary,
 				Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
@@ -147,7 +148,7 @@ func newResumableCreationActions(gate *terminationGate) *resumableCreationAction
 	return &resumableCreationActions{gate: gate}
 }
 
-func (actions *resumableCreationActions) RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error {
+func (actions *resumableCreationActions) RecordEnvironmentCreateInvocation(_ context.Context, operationID string, _ string, _ time.Time) (workflows.EnvironmentCreateInvocation, error) {
 	actions.mu.Lock()
 	actions.recordAttempts++
 	if !actions.recorded {
@@ -156,7 +157,9 @@ func (actions *resumableCreationActions) RecordEnvironmentCreateInvocation(conte
 	}
 	actions.mu.Unlock()
 	actions.gate.hit("record")
-	return nil
+	return workflows.EnvironmentCreateInvocation{
+		OwnerUserID: "user-1", EnvironmentID: strings.Replace(operationID, "operation", "environment", 1), ProjectSeedID: "project-seed-1",
+	}, nil
 }
 
 func (actions *resumableCreationActions) InventoryEnvironmentState(_ context.Context, _ string, reservation domain.EnvironmentStateReservation) (string, error) {

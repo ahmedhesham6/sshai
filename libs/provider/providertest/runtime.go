@@ -32,7 +32,7 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if err != nil {
 		t.Fatalf("EnsureRuntime(): %v", err)
 	}
-	assertRuntimeOwnership(t, ensured, harness.Request.RuntimeSpec)
+	assertRuntimeAllocationOwnership(t, ensured, harness.Request.RuntimeSpec)
 	replayed, err := harness.Adapter.EnsureRuntime(ctx, harness.Request)
 	if err != nil {
 		t.Fatalf("EnsureRuntime() replay: %v", err)
@@ -40,6 +40,19 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	assertSameRuntime(t, replayed, ensured)
 
 	request := provider.RuntimeLifecycleRequest{RuntimeSpec: harness.Request.RuntimeSpec, ProviderID: ensured.ProviderID}
+	attached, err := harness.Adapter.EnsureRuntimeDataVolumeAttachment(ctx, request)
+	if err != nil {
+		t.Fatalf("EnsureRuntimeDataVolumeAttachment(): %v", err)
+	}
+	assertRuntimeOwnership(t, attached, harness.Request.RuntimeSpec)
+	if attached.Provider != ensured.Provider || attached.ProviderID != ensured.ProviderID || attached.RuntimeSpec != ensured.RuntimeSpec {
+		t.Fatalf("attached Runtime changed allocation identity = before %#v, after %#v", ensured, attached)
+	}
+	replayed, err = harness.Adapter.EnsureRuntimeDataVolumeAttachment(ctx, request)
+	if err != nil {
+		t.Fatalf("EnsureRuntimeDataVolumeAttachment() replay: %v", err)
+	}
+	assertSameRuntime(t, replayed, attached)
 	diverged := request
 	diverged.Sequence++
 	if _, err := harness.Adapter.ObserveRuntime(ctx, diverged); !hasCode(err, provider.ErrorCodeResourceDiverged) {
@@ -86,6 +99,7 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if err != nil {
 		t.Fatalf("RetireRuntime(): %v", err)
 	}
+	retired = awaitTerminated(t, ctx, harness.Adapter, request, retired)
 	if retired.State != provider.RuntimeStateTerminated || retired.PrivateIPv4 != "" {
 		t.Fatalf("retired Runtime = %#v", retired)
 	}
@@ -102,6 +116,36 @@ func RunRuntimeLifecycle(t *testing.T, factory RuntimeFactory) {
 	if harness.AssertDataVolumePreserved != nil {
 		harness.AssertDataVolumePreserved(t)
 	}
+}
+
+func awaitTerminated(
+	t *testing.T,
+	ctx context.Context,
+	adapter provider.RuntimeProvider,
+	request provider.RuntimeLifecycleRequest,
+	observation provider.Runtime,
+) provider.Runtime {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for observation.State != provider.RuntimeStateTerminated {
+		if observation.State != provider.RuntimeStateStopping {
+			t.Fatalf("retiring Runtime = %#v", observation)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("observe retiring Runtime: %v", ctx.Err())
+		case <-deadline.C:
+			t.Fatalf("Runtime remained terminating: %#v", observation)
+		case <-time.After(10 * time.Millisecond):
+		}
+		var err error
+		observation, err = adapter.ObserveRuntime(ctx, request)
+		if err != nil {
+			t.Fatalf("ObserveRuntime() after retirement: %v", err)
+		}
+	}
+	return observation
 }
 
 func awaitRunning(
@@ -144,12 +188,28 @@ func awaitRunning(
 
 func assertRuntimeOwnership(t *testing.T, runtime provider.Runtime, spec provider.RuntimeSpec) {
 	t.Helper()
-	if runtime.ProviderID == "" || runtime.RuntimeID != spec.RuntimeID || runtime.EnvironmentID != spec.EnvironmentID ||
+	if runtime.SystemVolumeProviderID == "" {
+		t.Fatalf("attached Runtime has no system volume identity: %#v", runtime)
+	}
+	assertRuntimeIdentity(t, runtime, spec)
+}
+
+func assertRuntimeIdentity(t *testing.T, runtime provider.Runtime, spec provider.RuntimeSpec) {
+	t.Helper()
+	if runtime.Provider == "" || runtime.ProviderID == "" || runtime.RuntimeID != spec.RuntimeID || runtime.EnvironmentID != spec.EnvironmentID ||
 		runtime.Sequence != spec.Sequence || runtime.Region != spec.Region || runtime.AvailabilityZone != spec.AvailabilityZone ||
 		runtime.RuntimePreset != spec.RuntimePreset || runtime.ImageVersion != spec.ImageVersion ||
 		runtime.DataVolumeProviderID != spec.DataVolumeProviderID || (runtime.PrivateIPv4 != "" && !privateIPv4(runtime.PrivateIPv4)) {
 		t.Fatalf("Runtime ownership = %#v, want %#v", runtime, spec)
 	}
+}
+
+func assertRuntimeAllocationOwnership(t *testing.T, runtime provider.Runtime, spec provider.RuntimeSpec) {
+	t.Helper()
+	if runtime.SystemVolumeProviderID != "" {
+		t.Fatalf("allocation-only Runtime unexpectedly resolved system volume identity: %#v", runtime)
+	}
+	assertRuntimeIdentity(t, runtime, spec)
 }
 
 func hasCode(err error, code provider.ErrorCode) bool {

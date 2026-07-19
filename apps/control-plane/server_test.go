@@ -275,6 +275,32 @@ func TestCreateProjectSeedMapsUploadVerificationErrorsSafely(t *testing.T) {
 	}
 }
 
+func TestCreateProjectSeedRejectsContentAboveGuestTransportLimitClearly(t *testing.T) {
+	repository := &projectSeedHTTPRepositoryFake{}
+	handler := controlplane.NewHandler(controlplane.Config{
+		RegisterProjectSeed: application.NewRegisterProjectSeedService(
+			repository, &successfulUploadVerifier{size: application.ProjectSeedTransportMaximumRawBytes + 1}, &idsFake{values: []string{"seed-1"}}, time.Now,
+		),
+		Verifier: verifierFake{}, Users: &usersFake{}, UserIDs: &idsFake{values: []string{"user-1"}},
+		RequestIDs: &idsFake{values: []string{"request-seed-limit"}}, DefaultRegion: "us-east-1", Now: time.Now,
+	})
+	body := []byte(`{"repositoryUrl":"https://github.com/example/project.git","baseRevision":"abc123","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifestDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/project-seeds", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer valid-token")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "project-seed-key-1")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge || !bytes.Contains(response.Body.Bytes(), []byte(`"code":"PROJECT_SEED_TOO_LARGE"`)) || !bytes.Contains(response.Body.Bytes(), []byte("700 MiB")) {
+		t.Fatalf("oversize response = status:%d body:%s", response.Code, response.Body.String())
+	}
+	if repository.seed.Snapshot().ID != "" {
+		t.Fatal("oversize Project Seed reached persistence")
+	}
+}
+
 type verifierFake struct{}
 
 func (verifierFake) Verify(_ context.Context, token string) (auth.Subject, error) {

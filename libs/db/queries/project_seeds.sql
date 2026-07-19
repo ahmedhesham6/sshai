@@ -42,6 +42,23 @@ FROM project_seeds
 WHERE owner_user_id = sqlc.arg(owner_user_id)
   AND digest = sqlc.arg(digest);
 
+-- name: GetEnvironmentProjectSeed :one
+SELECT
+    id,
+    owner_user_id,
+    repository_url,
+    base_revision,
+    digest,
+    git_bundle_digest,
+    tracked_patch_digest,
+    untracked_bundle_digest,
+    manifest_digest,
+    created_at
+FROM project_seeds
+WHERE id = sqlc.arg(id)
+  AND owner_user_id = sqlc.arg(owner_user_id)
+  AND environment_id = sqlc.arg(environment_id);
+
 -- name: InsertProjectSeed :one
 INSERT INTO project_seeds (
     id,

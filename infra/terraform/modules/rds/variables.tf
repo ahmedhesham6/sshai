@@ -34,6 +34,11 @@ variable "instance_class" {
   default     = "db.t4g.micro"
 }
 
+variable "multi_az" {
+  description = "Required environment-specific RDS topology choice; decision-register item 13 remains open for production."
+  type        = bool
+}
+
 variable "tags" {
   description = "Tags applied to database resources."
   type        = map(string)

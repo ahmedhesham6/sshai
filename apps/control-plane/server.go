@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -188,6 +189,8 @@ func (server *server) CreateProjectSeed(response http.ResponseWriter, request *h
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, application.ErrProjectSeedTransportLimit):
+			writeError(response, request, http.StatusRequestEntityTooLarge, "PROJECT_SEED_TOO_LARGE", fmt.Sprintf("The Project Seed uploads exceed the %d MiB guest transport limit.", application.ProjectSeedTransportMaximumRawBytes>>20))
 		case errors.Is(err, application.ErrUploadNotVerified):
 			writeError(response, request, http.StatusBadRequest, "INVALID_UPLOAD", "A Project Seed upload is not valid.")
 		case errors.Is(err, application.ErrUploadObjectNotFound), errors.Is(err, db.ErrReferenceNotOwned):

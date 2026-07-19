@@ -13,6 +13,20 @@
 | Profile compiler ↔ local files | Local-only discovery before selection |
 | Runtime user ↔ guest | User has development privileges; guest telemetry is evidence, not billing authority |
 
+Guest control certificates are provisioned per Environment. Each guest server
+certificate covers that Runtime's current private IPv4 address (or its pinned
+internal server name), and the workflow client certificate URI SAN ends in
+`/environment/<environment-id>`. The guest verifies that claim against both its
+configured Environment and every request Target. A CA-valid certificate for a
+different Environment is never sufficient authorization. Workflow clients dial
+the current Runtime observation's private address per request; there is no
+process-global guest endpoint.
+
+Guest file-fed desired state and Activity Snapshot samples carry the complete
+current Runtime Target. Producers publish a trusted-owner `0600` regular file
+by atomic rename; the supervisor refuses symlinks, target mismatch, stale
+activity, and sequence regression.
+
 ## Identity and authorization
 
 - Hosted WorkOS AuthKit handles web sign-in and CLI device authorization.

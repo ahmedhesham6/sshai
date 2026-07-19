@@ -29,13 +29,20 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 		t.Fatalf("construct Environment creation actions: %v", err)
 	}
 	profileResolveActions := workflows.NewProfileResolveActions(&profileResolveRepositoryFake{})
+	guest := unavailableGuestTransport{}
 	services := buildServices(serviceDependencies{
 		polarDeliverer: polarEventDelivererFake{}, polarStore: polarDeliveryStoreFake{}, now: time.Now,
-		environmentCreate: workflows.EnvironmentCreateDefinition(testfixtures.NewProvider(), creationActions, idGenerator{}, time.Now, "image-v1"),
-		profileResolve:    workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolverFake{}, idGenerator{}, time.Now),
-		autoStop:          workflows.AutoStopDefinition(nil, nil),
-		runtimeStart:      workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{}),
-		runtimeStop:       workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{}),
+		environmentCreate: workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
+			Provider: testfixtures.NewProvider(), Actions: creationActions, Capsules: creationActions,
+			SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
+			Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
+			IDs: idGenerator{}, Now: time.Now, ImageVersion: "image-v1",
+		}),
+		profileResolve: workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolverFake{}, idGenerator{}, time.Now),
+		autoStop:       workflows.AutoStopDefinition(nil, nil),
+		runtimeStart:   workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{}),
+		runtimeStop:    workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{}),
+		runtimeReplace: workflows.RuntimeReplaceDefinition(workflows.RuntimeReplaceDependencies{}),
 	})
 	names := make([]string, len(services))
 	for index, service := range services {
@@ -43,7 +50,7 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 	}
 	want := []string{
 		workflows.BillingDeliveryService, workflows.EnvironmentCreateService, workflows.ProfileResolveService,
-		workflows.AutoStopService, workflows.RuntimeStartService, workflows.RuntimeStopService,
+		workflows.AutoStopService, workflows.RuntimeStartService, workflows.RuntimeStopService, workflows.RuntimeReplaceService,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("bound services = %v, want %v", names, want)
@@ -52,6 +59,28 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 		if names[index] != name {
 			t.Fatalf("bound services = %v, want %v", names, want)
 		}
+	}
+}
+
+func TestLoadConfigUsesRatifiedInfrastructureDefaults(t *testing.T) {
+	for name, value := range map[string]string{
+		"DATABASE_URL": "postgres://example", "POLAR_EVENTS_ENDPOINT": "https://polar.example/events",
+		"POLAR_ACCESS_TOKEN": "token", "CAPSULE_BUCKET": "capsules", "RUNTIME_ENVIRONMENT_NAME": "devm",
+		"RUNTIME_AMI": "ami-1", "RUNTIME_SUBNET_ID": "subnet-1", "RUNTIME_SECURITY_GROUP_ID": "sg-1",
+		"RUNTIME_PRESETS": "standard=m7i.large", "IMAGE_VERSION": "image-v1",
+	} {
+		t.Setenv(name, value)
+	}
+	for _, name := range []string{"DEFAULT_REGION", "DATA_VOLUME_SIZE_GIB", "RUNTIME_SYSTEM_VOLUME_GIB"} {
+		t.Setenv(name, "")
+	}
+
+	config, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig(): %v", err)
+	}
+	if config.defaultRegion != "eu-central-1" || config.dataVolumeSizeGiB != 100 || config.runtimeSystemVolumeGiB != 30 {
+		t.Fatalf("infrastructure defaults = region:%q data:%d system:%d", config.defaultRegion, config.dataVolumeSizeGiB, config.runtimeSystemVolumeGiB)
 	}
 }
 
@@ -81,6 +110,14 @@ func (environmentCreationRepositoryFake) InventoryEnvironmentState(context.Conte
 
 func (environmentCreationRepositoryFake) ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (domain.Runtime, error) {
 	return domain.Runtime{}, nil
+}
+
+func (environmentCreationRepositoryFake) PersistEnvironmentCreateRuntimeTransition(context.Context, string, int64, domain.RuntimeSnapshot) error {
+	return nil
+}
+
+func (environmentCreationRepositoryFake) FinishEnvironmentCreateOperation(context.Context, string, domain.OperationStatus, string, string, time.Time) error {
+	return nil
 }
 
 func (environmentCreationRepositoryFake) CompleteEnvironmentCreation(context.Context, string, time.Time) (domain.EnvironmentCreation, error) {

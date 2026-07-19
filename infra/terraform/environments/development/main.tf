@@ -38,5 +38,6 @@ module "postgres" {
     control_plane = module.regional_cell.ecs_service_security_group_ids.control_plane
     workflows     = module.regional_cell.ecs_service_security_group_ids.workflows
   }
-  tags = local.common_tags
+  multi_az = false
+  tags     = local.common_tags
 }

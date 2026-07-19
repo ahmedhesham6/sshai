@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,7 +28,16 @@ const (
 	maxRemoteObjectSize = 256 << 20
 )
 
-var errExpiredGrant = errors.New("read grant is expired")
+var (
+	errExpiredGrant = errors.New("read grant is expired")
+	// ErrContentInvalid identifies deterministic corruption or metadata
+	// disagreement in immutable Capsule OCI content.
+	ErrContentInvalid = errors.New("Capsule OCI content is invalid")
+)
+
+func invalidContent(message string, arguments ...any) error {
+	return fmt.Errorf("%w: %s", ErrContentInvalid, fmt.Sprintf(message, arguments...))
+}
 
 // GrantOperation identifies the object operation requested from the control
 // plane's grant provider.
@@ -55,8 +65,67 @@ type Grant struct {
 	// ExpiresAt is the capability expiry, when the provider knows it. A zero
 	// value means the provider did not supply expiry metadata.
 	ExpiresAt time.Time
-	Read      func(context.Context) (io.ReadCloser, error)
-	Write     func(context.Context, io.Reader, int64) error
+	// URL carries a serializable read capability when the provider is backed by
+	// a presigned URL. Callers must never include it in errors or logs.
+	URL   string
+	Read  func(context.Context) (io.ReadCloser, error)
+	Write func(context.Context, io.Reader, int64) error
+}
+
+// CapsuleReadKeys resolves the exact owner-scoped index and blob keys needed
+// to pull the requested Capsule digests. It reads only each bounded index and
+// image manifest; config and layer content remains guest-fetched through the
+// returned per-object capabilities.
+func CapsuleReadKeys(ctx context.Context, ownerID string, capsuleDigests []string, grants GrantProvider) ([]string, error) {
+	client, err := NewClient(ownerID, grants)
+	if err != nil {
+		return nil, err
+	}
+	seenCapsules := make(map[string]struct{}, len(capsuleDigests))
+	seenKeys := make(map[string]struct{})
+	for _, capsuleDigest := range capsuleDigests {
+		if _, duplicate := seenCapsules[capsuleDigest]; duplicate {
+			continue
+		}
+		seenCapsules[capsuleDigest] = struct{}{}
+		target, err := parseSHA256Digest(capsuleDigest)
+		if err != nil {
+			return nil, invalidContent("discover Capsule read keys: target digest: %v", err)
+		}
+		indexKey := IndexKey(ownerID, target.String())
+		indexBytes, err := client.readObject(ctx, indexKey, maxIndexSize)
+		if err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: fetch OCI index: %w", err)
+		}
+		manifestDescriptor, err := findManifestDescriptor(indexBytes, target.String())
+		if err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: resolve target %s: %w", target, err)
+		}
+		manifestKey := ManifestKey(ownerID, manifestDescriptor.Digest.String())
+		manifestBytes, err := client.readObjectAsBlob(ctx, manifestKey, manifestDescriptor)
+		if err != nil {
+			return nil, fmt.Errorf("discover Capsule read keys: fetch image manifest: %w", err)
+		}
+		var imageManifest ocispec.Manifest
+		if err := json.Unmarshal(manifestBytes, &imageManifest); err != nil {
+			return nil, invalidContent("discover Capsule read keys: decode image manifest: %v", err)
+		}
+		if imageManifest.MediaType != ocispec.MediaTypeImageManifest || imageManifest.ArtifactType != capsule.ArtifactMediaType || imageManifest.Config.MediaType != ConfigMediaType {
+			return nil, invalidContent("discover Capsule read keys: remote object is not a Capsule image manifest")
+		}
+		seenKeys[indexKey] = struct{}{}
+		seenKeys[manifestKey] = struct{}{}
+		seenKeys[BlobKey(ownerID, imageManifest.Config.Digest.String())] = struct{}{}
+		for _, layer := range imageManifest.Layers {
+			seenKeys[BlobKey(ownerID, layer.Digest.String())] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(seenKeys))
+	for key := range seenKeys {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 // GrantProvider mints one short-lived capability for an owner-scoped object.
@@ -223,7 +292,7 @@ func (client *Client) Pull(ctx context.Context, targetDigest string, destination
 	}
 	target, err := parseSHA256Digest(targetDigest)
 	if err != nil {
-		return capsule.Capsule{}, fmt.Errorf("pull capsule: target digest: %w", err)
+		return capsule.Capsule{}, invalidContent("pull capsule: target digest: %v", err)
 	}
 	indexBytes, err := client.readObject(ctx, IndexKey(client.ownerID, target.String()), maxIndexSize)
 	if err != nil {
@@ -240,13 +309,13 @@ func (client *Client) Pull(ctx context.Context, targetDigest string, destination
 	}
 	var imageManifest ocispec.Manifest
 	if err := json.Unmarshal(manifestBytes, &imageManifest); err != nil {
-		return capsule.Capsule{}, fmt.Errorf("pull capsule: decode image manifest: %w", err)
+		return capsule.Capsule{}, invalidContent("pull capsule: decode image manifest: %v", err)
 	}
 	if imageManifest.MediaType != ocispec.MediaTypeImageManifest || imageManifest.ArtifactType != capsule.ArtifactMediaType {
-		return capsule.Capsule{}, errors.New("pull capsule: remote object is not a Capsule image manifest")
+		return capsule.Capsule{}, invalidContent("pull capsule: remote object is not a Capsule image manifest")
 	}
 	if imageManifest.Config.MediaType != ConfigMediaType {
-		return capsule.Capsule{}, fmt.Errorf("pull capsule: config media type %q is invalid", imageManifest.Config.MediaType)
+		return capsule.Capsule{}, invalidContent("pull capsule: config media type %q is invalid", imageManifest.Config.MediaType)
 	}
 	configBytes, err := client.fetchBlob(ctx, destination, imageManifest.Config)
 	if err != nil {
@@ -254,14 +323,14 @@ func (client *Client) Pull(ctx context.Context, targetDigest string, destination
 	}
 	var capsuleManifest capsule.Manifest
 	if err := json.Unmarshal(configBytes, &capsuleManifest); err != nil {
-		return capsule.Capsule{}, fmt.Errorf("pull capsule: decode config for target verification: %w", err)
+		return capsule.Capsule{}, invalidContent("pull capsule: decode config for target verification: %v", err)
 	}
 	computedCapsuleDigest, err := capsule.ComputeCapsuleDigest(capsuleManifest)
 	if err != nil {
-		return capsule.Capsule{}, fmt.Errorf("pull capsule: compute target Capsule digest: %w", err)
+		return capsule.Capsule{}, invalidContent("pull capsule: compute target Capsule digest: %v", err)
 	}
 	if computedCapsuleDigest != target.String() {
-		return capsule.Capsule{}, fmt.Errorf("pull capsule: manifest %s digest mismatch: resolves Capsule digest %s, want %s", manifestDescriptor.Digest, computedCapsuleDigest, target)
+		return capsule.Capsule{}, invalidContent("pull capsule: manifest %s digest mismatch: resolves Capsule digest %s, want %s", manifestDescriptor.Digest, computedCapsuleDigest, target)
 	}
 	if err := pushLocalBlob(ctx, destination, imageManifest.Config, configBytes); err != nil {
 		return capsule.Capsule{}, fmt.Errorf("pull capsule: store config: %w", err)
@@ -356,11 +425,14 @@ func (client *Client) readBlob(ctx context.Context, descriptor ocispec.Descripto
 }
 
 func (client *Client) readObjectAsBlob(ctx context.Context, key string, descriptor ocispec.Descriptor) ([]byte, error) {
+	if key == "" || descriptor.Digest.Validate() != nil {
+		return nil, invalidContent("remote blob descriptor has an invalid digest %q", descriptor.Digest)
+	}
 	if descriptor.Size < 0 {
-		return nil, fmt.Errorf("blob %s has invalid negative size %d", key, descriptor.Size)
+		return nil, invalidContent("blob %s has invalid negative size %d", key, descriptor.Size)
 	}
 	if descriptor.Size > maxRemoteObjectSize {
-		return nil, fmt.Errorf("blob %s declared size %d exceeds maximum remote object size %d", key, descriptor.Size, maxRemoteObjectSize)
+		return nil, invalidContent("blob %s declared size %d exceeds maximum remote object size %d", key, descriptor.Size, maxRemoteObjectSize)
 	}
 	data, err := client.readObject(ctx, key, descriptor.Size)
 	if err != nil {
@@ -368,10 +440,10 @@ func (client *Client) readObjectAsBlob(ctx context.Context, key string, descript
 	}
 	actual := digest.FromBytes(data)
 	if actual != descriptor.Digest {
-		return nil, fmt.Errorf("blob %s digest mismatch: got %s, want %s", key, actual, descriptor.Digest)
+		return nil, invalidContent("blob %s digest mismatch: got %s, want %s", key, actual, descriptor.Digest)
 	}
 	if int64(len(data)) != descriptor.Size {
-		return nil, fmt.Errorf("blob %s size %d does not match expected %d", key, len(data), descriptor.Size)
+		return nil, invalidContent("blob %s size %d does not match expected %d", key, len(data), descriptor.Size)
 	}
 	return data, nil
 }
@@ -421,7 +493,7 @@ func (client *Client) readObjectOnce(ctx context.Context, key string, maxSize in
 		return nil, closeErr
 	}
 	if int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("object %s exceeds maximum size %d bytes", key, maxSize)
+		return nil, invalidContent("object %s exceeds maximum size %d bytes", key, maxSize)
 	}
 	return data, nil
 }
@@ -496,14 +568,14 @@ func pushLocalBlob(ctx context.Context, store *orasoci.Store, descriptor ocispec
 func findManifestDescriptor(indexBytes []byte, target string) (ocispec.Descriptor, error) {
 	var index ocispec.Index
 	if err := json.Unmarshal(indexBytes, &index); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("decode OCI index: %w", err)
+		return ocispec.Descriptor{}, invalidContent("decode OCI index: %v", err)
 	}
 	for _, descriptor := range index.Manifests {
 		if descriptor.Annotations[ocispec.AnnotationRefName] == target {
 			return descriptor, nil
 		}
 	}
-	return ocispec.Descriptor{}, errors.New("Capsule digest is not present in OCI index")
+	return ocispec.Descriptor{}, invalidContent("Capsule digest is not present in OCI index")
 }
 
 func parseSHA256Digest(value string) (digest.Digest, error) {

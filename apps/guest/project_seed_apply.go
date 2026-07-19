@@ -108,7 +108,7 @@ func (application *ProjectSeedApplication) Apply(ctx context.Context, workspace 
 	if application == nil {
 		return errors.New("Project Seed application is not initialized")
 	}
-	if replayed, err := application.replayed(workspace); replayed || err != nil {
+	if replayed, err := application.prepareWorkspace(workspace); replayed || err != nil {
 		return err
 	}
 	parent := filepath.Dir(workspace)
@@ -152,6 +152,32 @@ func (application *ProjectSeedApplication) Apply(ctx context.Context, workspace 
 	return nil
 }
 
+// prepareWorkspace preserves the remote-authority guard while allowing the
+// empty directory created by persistent-state bootstrap to be initialized.
+// Removing an empty directory is race-safe: os.Remove fails if another actor
+// publishes content between ReadDir and Remove, and that failure is surfaced.
+func (application *ProjectSeedApplication) prepareWorkspace(workspace string) (bool, error) {
+	replayed, err := application.replayed(workspace)
+	if replayed || err == nil {
+		return replayed, err
+	}
+	if !errors.Is(err, ErrProjectSeedWorkspaceDiverged) {
+		return false, err
+	}
+	info, statErr := os.Lstat(workspace)
+	if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, err
+	}
+	entries, readErr := os.ReadDir(workspace)
+	if readErr != nil || len(entries) != 0 {
+		return false, err
+	}
+	if removeErr := os.Remove(workspace); removeErr != nil {
+		return false, fmt.Errorf("remove empty bootstrap workspace: %w", removeErr)
+	}
+	return false, nil
+}
+
 func (application *ProjectSeedApplication) applyBundle(ctx context.Context, workspace string) error {
 	bundlePath := filepath.Join(workspace, ".git", "sshai-project-seed.bundle")
 	if err := os.WriteFile(bundlePath, application.bundle, 0o600); err != nil {
@@ -159,11 +185,17 @@ func (application *ProjectSeedApplication) applyBundle(ctx context.Context, work
 	}
 	defer os.Remove(bundlePath)
 	if err := runSeedGit(ctx, workspace, "bundle", "verify", bundlePath); err != nil {
-		return fmt.Errorf("verify Project Seed Git bundle: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: verify Git bundle: %v", ErrProjectSeedContentInvalid, err)
 	}
 	heads, err := runSeedGitOutput(ctx, workspace, "bundle", "list-heads", bundlePath)
 	if err != nil {
-		return fmt.Errorf("inspect Project Seed Git bundle refs: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: inspect Git bundle refs: %v", ErrProjectSeedContentInvalid, err)
 	}
 	refspecs, bundledHead, err := projectSeedBundleRefspecs(heads)
 	if err != nil {
@@ -171,13 +203,22 @@ func (application *ProjectSeedApplication) applyBundle(ctx context.Context, work
 	}
 	fetchArguments := append([]string{"fetch", "--force", "--no-tags", bundlePath}, refspecs...)
 	if err := runSeedGit(ctx, workspace, fetchArguments...); err != nil {
-		return fmt.Errorf("import Project Seed Git bundle: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: import Git bundle: %v", ErrProjectSeedContentInvalid, err)
 	}
 	if err := runSeedGit(ctx, workspace, "merge-base", "--is-ancestor", application.baseRevision, bundledHead); err != nil {
-		return errors.New("Project Seed Git bundle does not descend from the canonical base revision")
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: Git bundle does not descend from the canonical base revision", ErrProjectSeedContentInvalid)
 	}
 	if err := runSeedGit(ctx, workspace, "checkout", "--detach", bundledHead); err != nil {
-		return fmt.Errorf("check out Project Seed Git bundle: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: check out Git bundle: %v", ErrProjectSeedContentInvalid, err)
 	}
 	return nil
 }
@@ -188,7 +229,7 @@ func projectSeedBundleRefspecs(output string) ([]string, string, error) {
 	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 2 || !gitObjectID.MatchString(fields[0]) {
-			return nil, "", errors.New("Project Seed Git bundle has an invalid ref listing")
+			return nil, "", fmt.Errorf("%w: Git bundle has an invalid ref listing", ErrProjectSeedContentInvalid)
 		}
 		source := fields[1]
 		if source == "HEAD" {
@@ -197,12 +238,12 @@ func projectSeedBundleRefspecs(output string) ([]string, string, error) {
 			continue
 		}
 		if !strings.HasPrefix(source, "refs/") {
-			return nil, "", fmt.Errorf("Project Seed Git bundle ref %q is unsafe", source)
+			return nil, "", fmt.Errorf("%w: Git bundle ref %q is unsafe", ErrProjectSeedContentInvalid, source)
 		}
 		refspecs = append(refspecs, source+":refs/sshai/project-seed/"+strings.TrimPrefix(source, "refs/"))
 	}
 	if bundledHead == "" {
-		return nil, "", errors.New("Project Seed Git bundle does not declare HEAD")
+		return nil, "", fmt.Errorf("%w: Git bundle does not declare HEAD", ErrProjectSeedContentInvalid)
 	}
 	return refspecs, bundledHead, nil
 }
@@ -214,7 +255,10 @@ func (application *ProjectSeedApplication) applyPatch(ctx context.Context, works
 	}
 	defer os.Remove(patchPath)
 	if err := runSeedGit(ctx, workspace, "apply", "--binary", "--whitespace=nowarn", "--", patchPath); err != nil {
-		return fmt.Errorf("apply Project Seed tracked patch: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: apply tracked patch: %v", ErrProjectSeedContentInvalid, err)
 	}
 	return nil
 }
@@ -378,8 +422,17 @@ func (application *ProjectSeedApplication) replayed(workspace string) (bool, err
 	if err == nil && strings.TrimSpace(string(marker)) == application.fingerprint {
 		return true, nil
 	}
-	return false, errors.New("workspace diverges from this Project Seed")
+	return false, ErrProjectSeedWorkspaceDiverged
 }
+
+// ErrProjectSeedWorkspaceDiverged means the durable workspace contains state
+// that was not initialized by this exact Project Seed.
+var (
+	ErrProjectSeedWorkspaceDiverged = errors.New("workspace diverges from this Project Seed")
+	// ErrProjectSeedContentInvalid identifies deterministic failures in immutable
+	// bundle or patch content after constructor-level digest validation.
+	ErrProjectSeedContentInvalid = errors.New("Project Seed immutable content is invalid")
+)
 
 func validateRepositoryURL(raw string) error {
 	repository, err := url.Parse(raw)

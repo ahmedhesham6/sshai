@@ -107,28 +107,50 @@ func run(ctx context.Context) error {
 	runtimeActions := &runtimeWorkflowActions{store: store, now: time.Now}
 	snapshots := newAutoStopSnapshotSource(store)
 	dataVolumes := runtimeDataVolumeVerifier{store: store}
-	guest := unavailableGuestTransport{}
+	guest, err := newRuntimeGuestTransport(config.guestControl, guestTransportDependencies{
+		projectSeeds: storedProjectSeedSource{
+			metadata: store,
+			objects:  s3ProjectSeedObjectSource{client: capsuleClient, bucket: config.capsuleBucket},
+		},
+		capsuleGrants: capsuleMaterializationGrantSource{provider: grantProvider},
+	})
+	if err != nil {
+		return fmt.Errorf("construct guest control transport: %w", err)
+	}
 	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)
 	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, idGenerator{}, time.Now)
 	autoStop := workflows.AutoStopDefinition(snapshots, runtimeStopDispatcher{store: store, commands: runtimeCommands})
 	runtimeStart := workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{
-		Provider: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Credits: store,
+		Provider: runtimeProvider, Attachments: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Credits: store,
 		Images: promotedImageSource{image: config.imageVersion}, Usage: store, Guest: guest, SSHKeys: guest,
-		Managed: guest, AutoStop: workflowClient, IDs: idGenerator{}, Now: time.Now,
+		Managed: guest, ReplacementActions: runtimeActions, HostIdentity: guest, Toolchain: guest,
+		AutoStop: workflowClient, IDs: idGenerator{}, Now: time.Now,
 	})
 	runtimeStop := workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{
 		Provider: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes, Snapshots: snapshots,
 		Guest: guest, Usage: store, AutoStop: workflowClient, Now: time.Now,
 	})
+	runtimeReplace := workflows.RuntimeReplaceDefinition(workflows.RuntimeReplaceDependencies{
+		Provider: runtimeProvider, Attachments: runtimeProvider, Actions: runtimeActions, DataVolumes: dataVolumes,
+		Images: promotedImageSource{image: config.imageVersion}, Usage: store, Guest: guest,
+		HostIdentity: guest, SSHKeys: guest, Managed: guest, Toolchain: guest, AutoStop: workflowClient,
+		IDs: idGenerator{}, Now: time.Now,
+	})
 
 	restateServer := server.NewRestate()
 	for _, service := range buildServices(serviceDependencies{
 		polarDeliverer: polarClient, polarStore: store, now: time.Now,
-		environmentCreate: workflows.EnvironmentCreateDefinition(runtimeProvider, creationActions, idGenerator{}, time.Now, config.imageVersion),
-		profileResolve:    workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolver, idGenerator{}, time.Now),
-		autoStop:          autoStop,
-		runtimeStart:      runtimeStart,
-		runtimeStop:       runtimeStop,
+		environmentCreate: workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
+			Provider: runtimeProvider, Actions: creationActions, Capsules: creationActions,
+			SSHIdentity: guest, GuestReadiness: guest, SSHKeys: guest, ProjectSeed: guest, Materializer: guest,
+			Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
+			IDs: idGenerator{}, Now: time.Now, ImageVersion: config.imageVersion,
+		}),
+		profileResolve: workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolver, idGenerator{}, time.Now),
+		autoStop:       autoStop,
+		runtimeStart:   runtimeStart,
+		runtimeStop:    runtimeStop,
+		runtimeReplace: runtimeReplace,
 	}) {
 		restateServer.Bind(service)
 	}
@@ -151,6 +173,7 @@ type serviceDependencies struct {
 	autoStop          restate.ServiceDefinition
 	runtimeStart      restate.ServiceDefinition
 	runtimeStop       restate.ServiceDefinition
+	runtimeReplace    restate.ServiceDefinition
 }
 
 func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition {
@@ -159,7 +182,7 @@ func buildServices(dependencies serviceDependencies) []restate.ServiceDefinition
 	}
 	for _, pending := range []restate.ServiceDefinition{
 		dependencies.environmentCreate, dependencies.profileResolve, dependencies.autoStop,
-		dependencies.runtimeStart, dependencies.runtimeStop,
+		dependencies.runtimeStart, dependencies.runtimeStop, dependencies.runtimeReplace,
 	} {
 		if pending != nil {
 			services = append(services, pending)
@@ -188,6 +211,7 @@ type config struct {
 	runtimeSystemVolumeGiB int32
 	runtimePresets         map[string]string
 	imageVersion           string
+	guestControl           guestControlConfig
 }
 
 func loadConfig() (config, error) {
@@ -195,13 +219,17 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	dataVolumeSizeGiB, err := int32OrDefault("DATA_VOLUME_SIZE_GIB", 20)
+	dataVolumeSizeGiB, err := int32OrDefault("DATA_VOLUME_SIZE_GIB", 100)
 	if err != nil {
 		return config{}, err
 	}
-	runtimeSystemVolumeGiB, err := int32OrDefault("RUNTIME_SYSTEM_VOLUME_GIB", 20)
+	runtimeSystemVolumeGiB, err := int32OrDefault("RUNTIME_SYSTEM_VOLUME_GIB", 30)
 	if err != nil {
 		return config{}, err
+	}
+	guestControlPort, err := int32OrDefault("GUEST_CONTROL_PORT", 9443)
+	if err != nil || guestControlPort < 1 || guestControlPort > 65535 {
+		return config{}, errors.New("GUEST_CONTROL_PORT must be between 1 and 65535")
 	}
 	config := config{
 		databaseURL:         os.Getenv("DATABASE_URL"),
@@ -210,7 +238,7 @@ func loadConfig() (config, error) {
 		listenAddress:       valueOrDefault("LISTEN_ADDR", ":9080"),
 		restateIngressURL:   valueOrDefault("RESTATE_INGRESS_URL", "http://localhost:8080"),
 
-		defaultRegion: valueOrDefault("DEFAULT_REGION", "us-east-1"),
+		defaultRegion: valueOrDefault("DEFAULT_REGION", "eu-central-1"),
 		s3EndpointURL: os.Getenv("AWS_ENDPOINT_URL_S3"),
 		capsuleBucket: os.Getenv("CAPSULE_BUCKET"),
 
@@ -223,6 +251,10 @@ func loadConfig() (config, error) {
 		runtimeSystemVolumeGiB: runtimeSystemVolumeGiB,
 		runtimePresets:         presets,
 		imageVersion:           os.Getenv("IMAGE_VERSION"),
+		guestControl: guestControlConfig{
+			port: int(guestControlPort), serverName: os.Getenv("GUEST_CONTROL_TLS_SERVER_NAME"), certificateDirectory: os.Getenv("GUEST_CONTROL_TLS_CERT_DIR"),
+			privateKeyDirectory: os.Getenv("GUEST_CONTROL_TLS_KEY_DIR"), caFile: os.Getenv("GUEST_CONTROL_TLS_CA_FILE"),
+		},
 	}
 	if config.databaseURL == "" || config.polarEventsEndpoint == "" || config.polarAccessToken == "" ||
 		config.capsuleBucket == "" || config.runtimeEnvironmentName == "" || config.runtimeAMI == "" ||

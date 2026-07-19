@@ -10,7 +10,18 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/domain"
 )
 
-var ErrInvalidProjectSeed = errors.New("invalid Project Seed command")
+const (
+	// ProjectSeedTransportMaximumRequestBytes is the guest control request cap.
+	ProjectSeedTransportMaximumRequestBytes int64 = 1 << 30
+	// ProjectSeedTransportMaximumRawBytes reserves more than 90 MiB for JSON
+	// structure after base64's 4/3 expansion inside the 1 GiB request cap.
+	ProjectSeedTransportMaximumRawBytes int64 = 700 << 20
+)
+
+var (
+	ErrInvalidProjectSeed        = errors.New("invalid Project Seed command")
+	ErrProjectSeedTransportLimit = errors.New("Project Seed exceeds the guest transport limit")
+)
 
 type ProjectSeedRepository interface {
 	RegisterProjectSeed(context.Context, domain.ProjectSeed, string) (domain.ProjectSeed, error)
@@ -65,13 +76,20 @@ func (service *RegisterProjectSeedService) RegisterProjectSeed(ctx context.Conte
 		{kind: domain.UploadTrackedPatch, digest: input.TrackedPatchDigest},
 		{kind: domain.UploadUntrackedBundle, digest: input.UntrackedBundleDigest},
 	}
+	var aggregateSize int64
 	for _, part := range parts {
 		if part.digest == "" {
 			continue
 		}
-		if _, err := service.uploads.Verify(ctx, VerifyUploadInput{OwnerUserID: input.OwnerUserID, Kind: part.kind, Digest: part.digest}); err != nil {
+		verified, err := service.uploads.Verify(ctx, VerifyUploadInput{OwnerUserID: input.OwnerUserID, Kind: part.kind, Digest: part.digest})
+		if err != nil {
 			return domain.ProjectSeed{}, fmt.Errorf("verify Project Seed %s: %w", part.kind, err)
 		}
+		size := verified.Intent.Snapshot().SizeBytes
+		if size > ProjectSeedTransportMaximumRawBytes-aggregateSize {
+			return domain.ProjectSeed{}, fmt.Errorf("%w: aggregate upload content exceeds %d bytes", ErrProjectSeedTransportLimit, ProjectSeedTransportMaximumRawBytes)
+		}
+		aggregateSize += size
 	}
 	seed, err = service.repository.RegisterProjectSeed(ctx, seed, input.IdempotencyKey)
 	if err != nil {

@@ -100,6 +100,8 @@ func TestMaterializeCapsuleLockClaudeEndToEndUsesVerifiedCacheAndNoOp(t *testing
 	provider.resetReads()
 	if _, err := guest.MaterializeCapsuleLock(t.Context(), secondRequest); err == nil {
 		t.Fatal("tampered cached component was accepted")
+	} else if !errors.Is(err, guest.ErrCapsuleContentInvalid) {
+		t.Fatalf("tampered cached component error = %v, want immutable content classification", err)
 	}
 	if got := countGrantReads(provider); got != 0 {
 		t.Fatalf("tampered cache fell back to the object store with %d reads", got)
@@ -400,6 +402,30 @@ func TestCapsuleMaterializationRejectsDuplicateInstalledComponentIDs(t *testing.
 	}
 	if _, err := guest.MaterializeCapsuleLock(t.Context(), request); err == nil || !strings.Contains(err.Error(), "duplicate installed Component ID") {
 		t.Fatalf("duplicate installed Component IDs error = %v; want integrity rejection", err)
+	}
+}
+
+func TestCapsuleMaterializationClassifiesLockMetadataMismatchAsImmutableInput(t *testing.T) {
+	value := buildClaudeCapsule(t, []claudeComponentFixture{{
+		component: capsule.Component{ID: "config:CLAUDE.md", Type: capsule.ComponentTypeConfig, Scope: capsule.ScopeUser, TrustClass: capsule.TrustDeclarative},
+		files:     map[string]string{"CLAUDE.md": "instructions\n"},
+	}})
+	provider := newCapsuleObjectProvider(t)
+	publishCapsule(t, provider, value)
+	request := lockMaterializationRequest(t, provider, value)
+	snapshot := request.Lock.Snapshot()
+	component := snapshot.ResolvedComponents["config:CLAUDE.md"]
+	component.ComponentDigest = "sha256:" + strings.Repeat("0", 64)
+	snapshot.ResolvedComponents[component.ID] = component
+	snapshot.Digest = ""
+	lock, err := domain.CreateCapsuleLock(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Lock = lock
+	_, err = guest.MaterializeCapsuleLock(t.Context(), request)
+	if !errors.Is(err, guest.ErrCapsuleContentInvalid) {
+		t.Fatalf("metadata mismatch error = %T %v, want ErrCapsuleContentInvalid", err, err)
 	}
 }
 
