@@ -59,10 +59,33 @@ func TestAutoStopPolicyRefreshDispatcherContinuesAfterPerItemFailure(t *testing.
 	}
 }
 
+func TestAutoStopPolicyRefreshDispatcherBacksOffPoisonedRowSoNewerWorkRuns(t *testing.T) {
+	refreshes := []domain.AutoStopPolicyRefresh{
+		{EnvironmentID: "environment-poison", Generation: 1},
+		{EnvironmentID: "environment-new", Generation: 1},
+	}
+	outbox := &autoStopPolicyRefreshOutboxFake{pending: refreshes, deferred: map[string]int{}}
+	sender := &autoStopPolicyRefreshSenderFake{errorsByEnvironment: map[string]error{
+		"environment-poison": errors.New("permanent dispatch rejection"),
+	}}
+	dispatcher := application.NewAutoStopPolicyRefreshDispatcher(outbox, sender)
+
+	if err := dispatcher.DispatchPendingAutoStopPolicyRefreshes(t.Context(), 1); err == nil {
+		t.Fatal("first poisoned refresh error = nil")
+	}
+	if err := dispatcher.DispatchPendingAutoStopPolicyRefreshes(t.Context(), 1); err != nil {
+		t.Fatalf("newer refresh dispatch: %v", err)
+	}
+	if len(sender.environments) != 2 || sender.environments[1] != "environment-new" {
+		t.Fatalf("refresh attempts = %#v, want poisoned row then newer row", sender.environments)
+	}
+}
+
 type autoStopPolicyRefreshOutboxFake struct {
 	pending      []domain.AutoStopPolicyRefresh
 	acknowledged []domain.AutoStopPolicyRefresh
 	cancel       context.CancelFunc
+	deferred     map[string]int
 }
 
 func (fake *autoStopPolicyRefreshOutboxFake) PendingAutoStopPolicyRefresh(_ context.Context, environmentID string) (domain.AutoStopPolicyRefresh, bool, error) {
@@ -75,10 +98,26 @@ func (fake *autoStopPolicyRefreshOutboxFake) PendingAutoStopPolicyRefresh(_ cont
 }
 
 func (fake *autoStopPolicyRefreshOutboxFake) PendingAutoStopPolicyRefreshes(_ context.Context, limit int) ([]domain.AutoStopPolicyRefresh, error) {
-	if limit < len(fake.pending) {
-		return append([]domain.AutoStopPolicyRefresh(nil), fake.pending[:limit]...), nil
+	var eligible []domain.AutoStopPolicyRefresh
+	for _, refresh := range fake.pending {
+		if fake.deferred[refresh.EnvironmentID] > 0 {
+			fake.deferred[refresh.EnvironmentID]--
+			continue
+		}
+		eligible = append(eligible, refresh)
 	}
-	return append([]domain.AutoStopPolicyRefresh(nil), fake.pending...), nil
+	if limit < len(eligible) {
+		return append([]domain.AutoStopPolicyRefresh(nil), eligible[:limit]...), nil
+	}
+	return append([]domain.AutoStopPolicyRefresh(nil), eligible...), nil
+}
+
+func (fake *autoStopPolicyRefreshOutboxFake) DeferAutoStopPolicyRefresh(_ context.Context, environmentID string, _ uint64, _ time.Time) error {
+	if fake.deferred == nil {
+		fake.deferred = make(map[string]int)
+	}
+	fake.deferred[environmentID] = 1
+	return nil
 }
 
 func (fake *autoStopPolicyRefreshOutboxFake) AcknowledgeAutoStopPolicyRefresh(_ context.Context, environmentID string, generation uint64) error {

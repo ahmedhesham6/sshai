@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/ahmedhesham6/sshai/libs/db/internal/dbsql"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 	"github.com/jackc/pgx/v5"
 )
@@ -23,6 +25,18 @@ func (store *Store) PendingRuntimeOperation(ctx context.Context, operationID str
 		return domain.RuntimeOperationDispatch{}, false, err
 	}
 	return dispatch, true, nil
+}
+
+func (store *Store) DeferRuntimeOperationDispatch(ctx context.Context, operationID string, attemptedAt time.Time) error {
+	if operationID == "" || attemptedAt.IsZero() {
+		return errors.New("defer Runtime Operation dispatch: Operation and attempt time are required")
+	}
+	if _, err := store.queries.DeferRuntimeOperationDispatch(ctx, dbsql.DeferRuntimeOperationDispatchParams{
+		OperationID: operationID, AttemptedAt: timestamp(attemptedAt),
+	}); err != nil {
+		return fmt.Errorf("defer Runtime Operation dispatch: %w", err)
+	}
+	return nil
 }
 
 func (store *Store) PendingRuntimeOperations(ctx context.Context, limit int) ([]domain.RuntimeOperationDispatch, error) {

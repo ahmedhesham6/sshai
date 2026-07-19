@@ -301,58 +301,54 @@ func waitForProviderState(
 	if pollTimeout <= 0 {
 		pollTimeout = defaultProviderPollTimeout
 	}
-	observed := initial
-	if observed.ObservedAt.IsZero() {
+	if initial.ObservedAt.IsZero() {
 		return providerDivergenceOutcome(errors.New("Runtime provider observation time is required")), nil
 	}
-	deadline := observed.ObservedAt.Add(pollTimeout)
-	delay := pollInterval
-	for attempt := 0; ; attempt++ {
-		if !observed.RetryableFailure {
-			if err := validateProviderRuntimeIdentity(observed.Runtime, request); err != nil {
-				return providerDivergenceOutcome(err), nil
-			}
-			if observed.Runtime.State == expected {
-				return observed, nil
-			}
-			waiting := observed.Runtime.State == transitional
-			for _, candidate := range additionalTransitional {
-				waiting = waiting || observed.Runtime.State == candidate
-			}
-			if !waiting {
-				return providerStateDivergenceOutcome(observed, fmt.Errorf("Runtime provider observation diverged: state is %q, want %q, %q, or another accepted transitional state", observed.Runtime.State, transitional, expected)), nil
-			}
+	initialValue := durableDeadlinePollValue[runtimeProviderOutcome]{value: initial, checkedAt: initial.ObservedAt}
+	poll, err := durableDeadlinePoll(ctx, &initialValue, durableDeadlinePollConfig{
+		startedAt: initial.ObservedAt, timeout: pollTimeout, initialDelay: pollInterval, maxDelay: 30 * time.Second,
+		stepPrefix: stepPrefix, readStepPrefix: stepPrefix + "-observe", now: now,
+	}, func(runCtx restate.RunContext, _ time.Time) (durableDeadlinePollRead[runtimeProviderOutcome], error) {
+		runtime, observeErr := runtimeProvider.ObserveRuntime(runCtx, request)
+		outcome := providerPollOutcome(runtime, observeErr, time.Time{})
+		return durableDeadlinePollRead[runtimeProviderOutcome]{
+			Value: outcome, UseValue: true, RetryableFailure: outcome.RetryableFailure,
+		}, nil
+	}, func(observed runtimeProviderOutcome, _ time.Time) (runtimeProviderOutcome, bool) {
+		if observed.RetryableFailure {
+			return observed, false
 		}
-		if !observed.ObservedAt.Before(deadline) {
-			return runtimeProviderOutcome{
-				FailureCode: string(provider.ErrorCodeUnavailable),
-				Failure:     fmt.Sprintf("provider did not reach %q before the durable wait deadline", expected),
-			}, nil
+		if observed.Failure != "" {
+			return observed, true
 		}
-		if remaining := deadline.Sub(observed.ObservedAt); delay > remaining {
-			delay = remaining
+		if err := validateProviderRuntimeIdentity(observed.Runtime, request); err != nil {
+			return providerDivergenceOutcome(err), true
 		}
-		if err := restate.Sleep(ctx, delay, restate.WithName(fmt.Sprintf("%s-wait-%d", stepPrefix, attempt+1))); err != nil {
-			return runtimeProviderOutcome{}, err
+		if observed.Runtime.State == expected {
+			return observed, true
 		}
-		if delay < 30*time.Second {
-			delay *= 2
-			if delay > 30*time.Second {
-				delay = 30 * time.Second
-			}
+		waiting := observed.Runtime.State == transitional
+		for _, candidate := range additionalTransitional {
+			waiting = waiting || observed.Runtime.State == candidate
 		}
-		next, err := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
-			runtime, err := runtimeProvider.ObserveRuntime(runCtx, request)
-			return providerPollOutcome(runtime, err, now()), nil
-		}, restate.WithName(fmt.Sprintf("%s-observe-%d", stepPrefix, attempt+1)))
-		if err != nil {
-			return runtimeProviderOutcome{}, err
+		if !waiting {
+			return providerStateDivergenceOutcome(observed, fmt.Errorf("Runtime provider observation diverged: state is %q, want %q, %q, or another accepted transitional state", observed.Runtime.State, transitional, expected)), true
 		}
-		if next.Failure != "" {
-			return next, nil
-		}
-		observed = next
+		return observed, false
+	}, func(outcome runtimeProviderOutcome, checkedAt time.Time) runtimeProviderOutcome {
+		outcome.ObservedAt = checkedAt
+		return outcome
+	})
+	if err != nil {
+		return runtimeProviderOutcome{}, err
 	}
+	if poll.timedOut {
+		return runtimeProviderOutcome{
+			FailureCode: string(provider.ErrorCodeUnavailable),
+			Failure:     fmt.Sprintf("provider did not reach %q before the durable wait deadline", expected),
+		}, nil
+	}
+	return poll.value, nil
 }
 
 func validateRuntimeStopAudit(input domain.RuntimeOperationDispatch) error {

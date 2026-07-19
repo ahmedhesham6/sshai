@@ -68,6 +68,7 @@ type autoStopSnapshotPolling struct {
 	timeout        time.Duration
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
+	now            func() time.Time
 }
 
 type autoStopDispatchDisposition string
@@ -284,6 +285,9 @@ func refreshAutoStopSnapshot(ctx restate.Context, source AutoStopSnapshotSource,
 	if polling.maxBackoff <= 0 {
 		polling.maxBackoff = autoStopSnapshotPollMaxBackoff
 	}
+	if polling.now == nil {
+		polling.now = time.Now
+	}
 	readState := func(name string) (autoStopSnapshotRead, error) {
 		return restate.Run(ctx, func(runCtx restate.RunContext) (autoStopSnapshotRead, error) {
 			observation, err := source.ReadAutoStopState(runCtx, request)
@@ -298,37 +302,44 @@ func refreshAutoStopSnapshot(ctx restate.Context, source AutoStopSnapshotSource,
 		return initial, err
 	}
 
-	var latest *domain.AutoStopActivitySnapshot
-	waited := time.Duration(0)
-	delay := polling.initialBackoff
-	for attempt := 1; ; attempt++ {
-		latest, err = restate.Run(ctx, func(runCtx restate.RunContext) (*domain.AutoStopActivitySnapshot, error) {
-			snapshot, err := source.ReadLatestSnapshot(runCtx, request)
-			return snapshot, classifyDurableError(err)
-		}, restate.WithName(fmt.Sprintf("%s-read-snapshot-%d", stepPrefix, attempt)))
-		if err != nil {
-			return autoStopSnapshotRead{}, err
+	poll, err := durableDeadlinePoll[*domain.AutoStopActivitySnapshot](ctx, nil, durableDeadlinePollConfig{
+		timeout: polling.timeout, initialDelay: polling.initialBackoff, maxDelay: polling.maxBackoff,
+		stepPrefix: stepPrefix, readStepPrefix: stepPrefix + "-read-snapshot", now: polling.now,
+	}, func(runCtx restate.RunContext, pollStartedAt time.Time) (durableDeadlinePollRead[*domain.AutoStopActivitySnapshot], error) {
+		readRequest := request
+		if readRequest.FreshAfter.IsZero() {
+			readRequest.FreshAfter = pollStartedAt
 		}
-		if autoStopSnapshotSatisfies(latest, request) || waited >= polling.timeout {
-			break
+		snapshot, readErr := source.ReadLatestSnapshot(runCtx, readRequest)
+		if readErr == nil {
+			return durableDeadlinePollRead[*domain.AutoStopActivitySnapshot]{Value: snapshot, UseValue: true}, nil
 		}
-		remaining := polling.timeout - waited
-		if delay > remaining {
-			delay = remaining
+		classified := classifyDurableError(readErr)
+		if restate.IsTerminalError(classified) {
+			return durableDeadlinePollRead[*domain.AutoStopActivitySnapshot]{}, classified
 		}
-		if err := restate.Sleep(ctx, delay, restate.WithName(fmt.Sprintf("%s-wait-%d", stepPrefix, attempt))); err != nil {
-			return autoStopSnapshotRead{}, err
+		return durableDeadlinePollRead[*domain.AutoStopActivitySnapshot]{RetryableFailure: true}, nil
+	}, func(snapshot *domain.AutoStopActivitySnapshot, pollStartedAt time.Time) (*domain.AutoStopActivitySnapshot, bool) {
+		effectiveRequest := request
+		if effectiveRequest.FreshAfter.IsZero() {
+			effectiveRequest.FreshAfter = pollStartedAt
 		}
-		waited += delay
-		delay = min(delay*2, polling.maxBackoff)
+		return snapshot, autoStopSnapshotSatisfies(snapshot, effectiveRequest)
+	}, nil)
+	if err != nil {
+		return autoStopSnapshotRead{}, err
+	}
+	effectiveRequest := request
+	if effectiveRequest.FreshAfter.IsZero() {
+		effectiveRequest.FreshAfter = poll.startedAt
 	}
 
 	final, err := readState(stepPrefix + "-state-after")
 	if err != nil || final.ReferenceUnavailable {
 		return final, err
 	}
-	final.Observation.Snapshot = latest
-	final.Observation.FreshAfter = request.FreshAfter
+	final.Observation.Snapshot = poll.value
+	final.Observation.FreshAfter = effectiveRequest.FreshAfter
 	return final, nil
 }
 

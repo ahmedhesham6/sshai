@@ -489,6 +489,7 @@ func TestRuntimeStopFailureReleasesAutoStopSuppression(t *testing.T) {
 func TestRuntimeStopRejectsSnapshotThatRemainsStaleAfterBoundedRefresh(t *testing.T) {
 	harness := newRuntimeWorkflowHarness(true)
 	harness.guest.snapshotLag = time.Minute
+	harness.guest.afterSnapshotRead = func() { harness.advanceClock(time.Millisecond) }
 	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
 	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
 	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
@@ -522,6 +523,26 @@ func TestRuntimeStopPollsSnapshotAsDurablePerAttemptReads(t *testing.T) {
 	}
 	if harness.guest.snapshotCalls != 2 {
 		t.Fatalf("latest Snapshot reads = %d, want stale attempt then fresh attempt", harness.guest.snapshotCalls)
+	}
+}
+
+func TestRuntimeStopSnapshotPollingDeadlineAdvancesPastTransientReadFailure(t *testing.T) {
+	harness := newRuntimeWorkflowHarness(true)
+	harness.guest.snapshotErr = runtimeTransientError{error: errors.New("snapshot database unavailable")}
+	harness.guest.afterSnapshotRead = func() { harness.advanceClock(time.Second) }
+	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
+	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
+	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	_, err := ingress.WorkflowHandle[RuntimeStopOutput](environment.Ingress(), RuntimeStopService, input.OperationID).Attach(ctx)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), RuntimeStopFailed) {
+		t.Fatalf("Runtime stop error = %v, want bounded stale/missing Snapshot failure", err)
+	}
+	if harness.guest.snapshotCalls != 1 {
+		t.Fatalf("Snapshot reads = %d, want one failed read before durable deadline", harness.guest.snapshotCalls)
 	}
 }
 
@@ -630,6 +651,12 @@ func (h *runtimeWorkflowHarness) setClock(now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clock = now
+}
+
+func (h *runtimeWorkflowHarness) advanceClock(delta time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clock = h.clock.Add(delta)
 }
 
 func runtimeDispatch(operationType domain.OperationType, reason domain.RuntimeStopReason) domain.RuntimeOperationDispatch {
@@ -937,6 +964,7 @@ type runtimeGuestFake struct {
 	snapshotErr               error
 	snapshotLag               time.Duration
 	snapshots                 []*domain.AutoStopActivitySnapshot
+	afterSnapshotRead         func()
 }
 
 func (fake *runtimeGuestFake) WaitForRuntimeReady(_ context.Context, request RuntimeGuestReadinessRequest) (RuntimeGuestReadiness, error) {
@@ -972,6 +1000,9 @@ func (fake *runtimeGuestFake) ReadAutoStopState(_ context.Context, request AutoS
 }
 func (fake *runtimeGuestFake) ReadLatestSnapshot(_ context.Context, request AutoStopRefreshRequest) (*domain.AutoStopActivitySnapshot, error) {
 	fake.snapshotCalls++
+	if fake.afterSnapshotRead != nil {
+		fake.afterSnapshotRead()
+	}
 	if fake.snapshotErr != nil {
 		return nil, fake.snapshotErr
 	}

@@ -117,12 +117,11 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 	failWhileReady := func(code, message string) error {
 		return resumeAutoStopAndFailRuntimeStop(ctx, dependencies, input, state, code, message)
 	}
-	freshAfter := dependencies.Now()
 	read, refreshErr := refreshAutoStopSnapshot(ctx, dependencies.Snapshots, AutoStopRefreshRequest{
-		EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID, FreshAfter: freshAfter,
+		EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID,
 	}, autoStopSnapshotPolling{
 		timeout: dependencies.SnapshotPollTimeout, initialBackoff: dependencies.SnapshotPollInitialBackoff,
-		maxBackoff: dependencies.SnapshotPollMaxBackoff,
+		maxBackoff: dependencies.SnapshotPollMaxBackoff, now: dependencies.Now,
 	}, "request-activity-snapshot")
 	if refreshErr != nil {
 		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, refreshErr.Error())

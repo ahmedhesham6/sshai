@@ -71,7 +71,8 @@ func (store *Store) UpdateAutoStopPolicy(ctx context.Context, ownerID string, po
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE auto_stop_policies
-		SET mode = $2, grace_period_seconds = $3, generation = generation + 1
+		SET mode = $2, grace_period_seconds = $3, generation = generation + 1,
+		    refresh_attempts = 0, refresh_next_attempt_at = NULL
 		WHERE id = $1`, policySnapshot.ID, string(policySnapshot.Mode), policySnapshot.GracePeriodSeconds); err != nil {
 		return domain.Operation{}, false, fmt.Errorf("update Auto-stop Policy: persist Policy: %w", err)
 	}

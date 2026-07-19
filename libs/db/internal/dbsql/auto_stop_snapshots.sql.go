@@ -13,7 +13,9 @@ import (
 
 const acknowledgeAutoStopPolicyRefresh = `-- name: AcknowledgeAutoStopPolicyRefresh :execrows
 UPDATE auto_stop_policies
-SET refresh_acknowledged_generation = GREATEST(refresh_acknowledged_generation, $1)
+SET refresh_acknowledged_generation = GREATEST(refresh_acknowledged_generation, $1),
+    refresh_attempts = CASE WHEN generation = $1 THEN 0 ELSE refresh_attempts END,
+    refresh_next_attempt_at = CASE WHEN generation = $1 THEN NULL ELSE refresh_next_attempt_at END
 WHERE environment_id = $2
   AND generation >= $1
 `
@@ -25,6 +27,32 @@ type AcknowledgeAutoStopPolicyRefreshParams struct {
 
 func (q *Queries) AcknowledgeAutoStopPolicyRefresh(ctx context.Context, arg AcknowledgeAutoStopPolicyRefreshParams) (int64, error) {
 	result, err := q.db.Exec(ctx, acknowledgeAutoStopPolicyRefresh, arg.Generation, arg.EnvironmentID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deferAutoStopPolicyRefresh = `-- name: DeferAutoStopPolicyRefresh :execrows
+UPDATE auto_stop_policies
+SET refresh_attempts = refresh_attempts + 1,
+    refresh_next_attempt_at = $1::timestamptz + LEAST(
+        INTERVAL '1 hour',
+        INTERVAL '5 seconds' * power(2::numeric, LEAST(refresh_attempts, 10))::double precision
+    )
+WHERE environment_id = $2
+  AND generation = $3
+  AND refresh_acknowledged_generation < generation
+`
+
+type DeferAutoStopPolicyRefreshParams struct {
+	AttemptedAt   pgtype.Timestamptz
+	EnvironmentID string
+	Generation    int64
+}
+
+func (q *Queries) DeferAutoStopPolicyRefresh(ctx context.Context, arg DeferAutoStopPolicyRefreshParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferAutoStopPolicyRefresh, arg.AttemptedAt, arg.EnvironmentID, arg.Generation)
 	if err != nil {
 		return 0, err
 	}
@@ -137,6 +165,7 @@ SELECT environment_id, generation
 FROM auto_stop_policies
 WHERE environment_id = $1
   AND refresh_acknowledged_generation < generation
+  AND (refresh_next_attempt_at IS NULL OR refresh_next_attempt_at <= statement_timestamp())
 `
 
 type GetPendingAutoStopPolicyRefreshRow struct {
@@ -255,7 +284,8 @@ const listPendingAutoStopPolicyRefreshes = `-- name: ListPendingAutoStopPolicyRe
 SELECT environment_id, generation
 FROM auto_stop_policies
 WHERE refresh_acknowledged_generation < generation
-ORDER BY environment_id
+  AND (refresh_next_attempt_at IS NULL OR refresh_next_attempt_at <= statement_timestamp())
+ORDER BY refresh_attempts, refresh_next_attempt_at NULLS FIRST, environment_id
 LIMIT $1
 `
 

@@ -133,3 +133,41 @@ func TestStoreListsPendingRuntimeOperationsInDeterministicBatches(t *testing.T) 
 		t.Fatal("PendingRuntimeOperations(limit 0) error = nil")
 	}
 }
+
+func TestStoreBacksOffFailedRuntimeOperationSoFreshRowsInterleave(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Date(2026, time.July, 13, 17, 0, 0, 0, time.UTC)
+	insertRuntimeOperationState(t, ctx, pool, createdAt)
+	first := runtimeOperationCandidate(t, "operation-poison", "environment-1", domain.OperationRuntimeStart, "request-poison", []byte(`{}`), createdAt.Add(time.Hour))
+	if _, err := store.ReserveRuntimeOperation(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE operations SET status = 'succeeded', restate_invocation_id = 'invocation-poison', completed_at = $2 WHERE id = $1`, "operation-poison", createdAt.Add(90*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	second := runtimeOperationCandidate(t, "operation-fresh", "environment-1", domain.OperationRuntimeStop, "request-fresh", []byte(`{"reason":"manual"}`), createdAt.Add(2*time.Hour))
+	if _, err := store.ReserveRuntimeOperation(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	attemptedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if err := store.DeferRuntimeOperationDispatch(ctx, "operation-poison", attemptedAt); err != nil {
+		t.Fatal(err)
+	}
+	dispatches, err := store.PendingRuntimeOperations(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dispatches) != 1 || dispatches[0].OperationID != "operation-fresh" {
+		t.Fatalf("eligible Runtime Operation = %#v, want fresh row while poison backs off", dispatches)
+	}
+	var attempts int
+	var nextAttemptAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT dispatch_attempts, next_attempt_at FROM workflow_outbox WHERE operation_id = 'operation-poison'`).Scan(&attempts, &nextAttemptAt); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || !nextAttemptAt.Equal(attemptedAt.Add(5*time.Second)) {
+		t.Fatalf("poison backoff = attempts:%d next:%s", attempts, nextAttemptAt)
+	}
+}

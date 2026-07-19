@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/db/internal/dbsql"
 	"github.com/ahmedhesham6/sshai/libs/domain"
@@ -58,6 +59,18 @@ func (store *Store) AcknowledgeAutoStopPolicyRefresh(ctx context.Context, enviro
 	}
 	if updated == 0 {
 		return ErrReferenceNotOwned
+	}
+	return nil
+}
+
+func (store *Store) DeferAutoStopPolicyRefresh(ctx context.Context, environmentID string, generation uint64, attemptedAt time.Time) error {
+	if strings.TrimSpace(environmentID) == "" || environmentID != strings.TrimSpace(environmentID) || generation == 0 || generation > math.MaxInt64 || attemptedAt.IsZero() {
+		return errors.New("defer Auto-stop Policy refresh: canonical Environment, generation, and attempt time are required")
+	}
+	if _, err := store.queries.DeferAutoStopPolicyRefresh(ctx, dbsql.DeferAutoStopPolicyRefreshParams{
+		EnvironmentID: environmentID, Generation: int64(generation), AttemptedAt: timestamp(attemptedAt),
+	}); err != nil {
+		return fmt.Errorf("defer Auto-stop Policy refresh: %w", err)
 	}
 	return nil
 }
