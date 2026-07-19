@@ -192,7 +192,8 @@ func (q *Queries) GetOwnedRuntimeStateForUpdate(ctx context.Context, arg GetOwne
 const getPendingRuntimeOperation = `-- name: GetPendingRuntimeOperation :one
 SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id,
        operation.requested_by_user_id,
-       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason
+       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason,
+       operation.input AS operation_input
 FROM workflow_outbox outbox
 JOIN runtime_operation_targets target
   ON target.operation_id = outbox.operation_id
@@ -210,6 +211,7 @@ type GetPendingRuntimeOperationRow struct {
 	RuntimeID         string
 	RequestedByUserID string
 	StopReason        string
+	OperationInput    []byte
 }
 
 func (q *Queries) GetPendingRuntimeOperation(ctx context.Context, operationID string) (GetPendingRuntimeOperationRow, error) {
@@ -222,6 +224,7 @@ func (q *Queries) GetPendingRuntimeOperation(ctx context.Context, operationID st
 		&i.RuntimeID,
 		&i.RequestedByUserID,
 		&i.StopReason,
+		&i.OperationInput,
 	)
 	return i, err
 }
@@ -314,7 +317,8 @@ func (q *Queries) InsertRuntimeOperationTarget(ctx context.Context, arg InsertRu
 const listPendingRuntimeOperations = `-- name: ListPendingRuntimeOperations :many
 SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id,
        operation.requested_by_user_id,
-       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason
+       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason,
+       operation.input AS operation_input
 FROM workflow_outbox outbox
 JOIN runtime_operation_targets target
   ON target.operation_id = outbox.operation_id
@@ -333,6 +337,7 @@ type ListPendingRuntimeOperationsRow struct {
 	RuntimeID         string
 	RequestedByUserID string
 	StopReason        string
+	OperationInput    []byte
 }
 
 func (q *Queries) ListPendingRuntimeOperations(ctx context.Context, limitCount int32) ([]ListPendingRuntimeOperationsRow, error) {
@@ -351,6 +356,7 @@ func (q *Queries) ListPendingRuntimeOperations(ctx context.Context, limitCount i
 			&i.RuntimeID,
 			&i.RequestedByUserID,
 			&i.StopReason,
+			&i.OperationInput,
 		); err != nil {
 			return nil, err
 		}

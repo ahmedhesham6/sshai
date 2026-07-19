@@ -2,6 +2,7 @@ package application_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -33,6 +34,37 @@ func TestRuntimeCommandServiceReservesStartBeforeDispatch(t *testing.T) {
 	}
 	if repository.calls != 1 || len(dispatcher.operationIDs) != 1 || dispatcher.operationIDs[0] != "operation-1" {
 		t.Fatalf("repository calls = %d, dispatches = %#v", repository.calls, dispatcher.operationIDs)
+	}
+}
+
+func TestRuntimeCommandServicePersistsAutoStopAuditEvidence(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
+	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
+	repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime}
+	service := application.NewRuntimeCommandService(repository, &runtimeCommandDispatcherFake{}, &idsFake{values: []string{"operation-1"}}, func() time.Time { return now })
+	audit := &domain.RuntimeStopAuditEvidence{
+		Policy:           domain.AutoStopPolicySnapshot{ID: "policy-1", EnvironmentID: "environment-1", Mode: domain.AutoStopWhenFullyIdle, GracePeriodSeconds: 60},
+		PolicyGeneration: 2, GraceStartedAt: now.Add(-time.Minute), GraceExpiredAt: now, GracePeriodSeconds: 60,
+		QualifyingSnapshots: []domain.AutoStopActivitySnapshot{
+			{RuntimeID: "runtime-1", Sequence: 8, ObservedAt: now.Add(-time.Minute)},
+			{RuntimeID: "runtime-1", Sequence: 9, ObservedAt: now},
+		},
+	}
+	command, err := service.StopRuntimeWithReason(t.Context(), application.RuntimeCommandInput{
+		OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "auto-stop-1",
+	}, domain.RuntimeStopAutoStop, audit)
+	if err != nil {
+		t.Fatalf("StopRuntimeWithReason(): %v", err)
+	}
+	var persisted struct {
+		Reason domain.RuntimeStopReason         `json:"reason"`
+		Audit  *domain.RuntimeStopAuditEvidence `json:"audit"`
+	}
+	if err := json.Unmarshal(command.Operation().Snapshot().Input, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Reason != domain.RuntimeStopAutoStop || persisted.Audit == nil || persisted.Audit.PolicyGeneration != 2 || len(persisted.Audit.QualifyingSnapshots) != 2 {
+		t.Fatalf("persisted Auto-stop input = %#v", persisted)
 	}
 }
 

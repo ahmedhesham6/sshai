@@ -22,6 +22,14 @@ import (
 
 var _ application.RuntimeOperationSender = (*Client)(nil)
 
+type runtimePermanentError struct{ error }
+
+func (runtimePermanentError) Transient() bool { return false }
+
+type runtimeTransientError struct{ error }
+
+func (runtimeTransientError) Transient() bool { return true }
+
 func TestClientRoutesRuntimeReplace(t *testing.T) {
 	definition := restate.NewWorkflow(RuntimeReplaceService).Handler(
 		RunHandler,
@@ -48,17 +56,25 @@ func TestRuntimeStartWorkflow(t *testing.T) {
 		name          string
 		configure     func(*runtimeWorkflowHarness)
 		wantRoute     string
-		wantReplace   bool
 		wantErrorCode string
 		wantStatus    domain.RuntimeStatus
 		wantObserves  int
 		wantStarts    int
 		wantOpens     int
+		wantFailure   string
+		wantManaged   int
 	}{
-		{name: "happy start", wantRoute: "10.0.0.8", wantStatus: domain.RuntimeReady, wantObserves: 1, wantStarts: 1, wantOpens: 1},
+		{name: "happy start", wantRoute: "10.0.0.8", wantStatus: domain.RuntimeReady, wantObserves: 1, wantStarts: 1, wantOpens: 1, wantManaged: 1},
+		{name: "pending progresses to running", configure: func(h *runtimeWorkflowHarness) { h.provider.startPending = true }, wantRoute: "10.0.0.8", wantStatus: domain.RuntimeReady, wantObserves: 2, wantStarts: 1, wantOpens: 1, wantManaged: 1},
 		{name: "already ready short circuit", configure: func(h *runtimeWorkflowHarness) { h.actions.state.Runtime = readyRuntimeSnapshot() }, wantRoute: "10.0.0.7", wantStatus: domain.RuntimeReady},
-		{name: "credit blocked", configure: func(h *runtimeWorkflowHarness) { h.credits.credits = 0 }, wantErrorCode: CreditsPolicyBlocked, wantStatus: domain.RuntimeStopped, wantObserves: 1},
-		{name: "upgrade dispatches replace", configure: func(h *runtimeWorkflowHarness) { h.images.image = "image-v2" }, wantReplace: true, wantStatus: domain.RuntimeStopped, wantObserves: 1},
+		{name: "credit blocked finalizes Operation", configure: func(h *runtimeWorkflowHarness) { h.credits.credits = 0 }, wantErrorCode: CreditsPolicyBlocked, wantFailure: CreditsPolicyBlocked, wantStatus: domain.RuntimeStopped, wantObserves: 1},
+		{name: "upgrade requires future replace workflow", configure: func(h *runtimeWorkflowHarness) { h.images.image = "image-v2" }, wantErrorCode: ReplaceRequired, wantFailure: ReplaceRequired, wantStatus: domain.RuntimeStopped, wantObserves: 1},
+		{name: "readiness failure marks Runtime error and keeps usage open", configure: func(h *runtimeWorkflowHarness) {
+			h.guest.readiness = RuntimeGuestReadiness{BootID: "boot-new", PrivateIPv4: "10.0.0.8", DataMounted: false}
+		}, wantErrorCode: GuestNotReady, wantFailure: GuestNotReady, wantStatus: domain.RuntimeError, wantObserves: 1, wantStarts: 1, wantOpens: 1},
+		{name: "usage retry reuses journaled identity", configure: func(h *runtimeWorkflowHarness) {
+			h.usage.openErrors = []error{runtimeTransientError{error: errors.New("retry usage")}}
+		}, wantRoute: "10.0.0.8", wantStatus: domain.RuntimeReady, wantObserves: 1, wantStarts: 1, wantOpens: 2, wantManaged: 1},
 		{name: "pre-start provider verification failure marks Runtime error", configure: func(h *runtimeWorkflowHarness) {
 			h.provider.observeErr = provider.NewError(provider.ErrorCodeResourceDiverged, "instance missing", nil)
 		}, wantErrorCode: string(provider.ErrorCodeResourceDiverged), wantStatus: domain.RuntimeError, wantObserves: 1},
@@ -87,7 +103,7 @@ func TestRuntimeStartWorkflow(t *testing.T) {
 			} else if err != nil {
 				t.Fatalf("await Runtime start: %v", err)
 			}
-			if output.PrivateRoute != test.wantRoute || output.ReplaceDispatched != test.wantReplace {
+			if output.PrivateRoute != test.wantRoute {
 				t.Fatalf("Runtime start output = %#v", output)
 			}
 			if got := harness.actions.runtimeStatus(); got != test.wantStatus {
@@ -96,8 +112,17 @@ func TestRuntimeStartWorkflow(t *testing.T) {
 			if harness.provider.observeCalls != test.wantObserves || harness.provider.startCalls != test.wantStarts || harness.usage.openCalls != test.wantOpens {
 				t.Fatalf("provider observes / starts / usage opens = %d/%d/%d, want %d/%d/%d", harness.provider.observeCalls, harness.provider.startCalls, harness.usage.openCalls, test.wantObserves, test.wantStarts, test.wantOpens)
 			}
-			if test.wantReplace && (len(harness.sender.inputs) != 1 || harness.sender.inputs[0].OperationType != domain.OperationRuntimeReplace || harness.actions.decision != "replace:image-v2") {
-				t.Fatalf("replace dispatch / decision = %#v / %q", harness.sender.inputs, harness.actions.decision)
+			if test.wantErrorCode == ReplaceRequired && harness.actions.decision != "replace:image-v2" {
+				t.Fatalf("replace decision = %q", harness.actions.decision)
+			}
+			if harness.actions.failureCode != test.wantFailure && test.wantFailure != "" {
+				t.Fatalf("Operation failure = %q, want %q", harness.actions.failureCode, test.wantFailure)
+			}
+			if harness.guest.managedCalls != test.wantManaged {
+				t.Fatalf("managed reconciliation calls = %d, want %d", harness.guest.managedCalls, test.wantManaged)
+			}
+			if test.name == "usage retry reuses journaled identity" && !harness.usage.sameOpenIdentity() {
+				t.Fatalf("usage retry inputs changed: %#v", harness.usage.openInputs)
 			}
 			if test.wantStatus == domain.RuntimeReady && harness.actions.completeCalls != 1 {
 				t.Fatalf("completion calls = %d, want 1", harness.actions.completeCalls)
@@ -130,6 +155,9 @@ func TestRuntimeStopWorkflowRecordsEveryReasonAndClosesUsage(t *testing.T) {
 			if harness.auto.suppressCalls != 1 || harness.auto.resumeCalls != 0 || harness.actions.snapshotCalls != 1 || harness.guest.shutdownCalls != 1 {
 				t.Fatalf("suppression/snapshot/shutdown = %d/%d/%d", harness.auto.suppressCalls, harness.actions.snapshotCalls, harness.guest.shutdownCalls)
 			}
+			if reason == domain.RuntimeStopAutoStop && (harness.actions.stopAudit == nil || len(harness.actions.stopAudit.QualifyingSnapshots) != 2) {
+				t.Fatalf("Auto-stop audit = %#v", harness.actions.stopAudit)
+			}
 		})
 	}
 }
@@ -153,6 +181,41 @@ func TestRuntimeStopProviderFailureMarksRuntimeError(t *testing.T) {
 	}
 }
 
+func TestRuntimeStopWaitsThroughStopping(t *testing.T) {
+	harness := newRuntimeWorkflowHarness(true)
+	harness.provider.stopStopping = true
+	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
+	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
+	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+		t.Fatalf("send Runtime stop: %v", err)
+	}
+	if _, err := ingress.WorkflowHandle[RuntimeStopOutput](environment.Ingress(), RuntimeStopService, input.OperationID).Attach(t.Context()); err != nil {
+		t.Fatalf("await Runtime stop: %v", err)
+	}
+	if harness.actions.runtimeStatus() != domain.RuntimeStopped || harness.provider.observeCalls != 1 || harness.usage.closeCalls != 1 {
+		t.Fatalf("stopping progression status/observes/closes = %q/%d/%d", harness.actions.runtimeStatus(), harness.provider.observeCalls, harness.usage.closeCalls)
+	}
+}
+
+func TestRuntimeStopVerificationFailureStillFinalizesPhysicalStop(t *testing.T) {
+	harness := newRuntimeWorkflowHarness(true)
+	harness.volume.err = runtimePermanentError{error: errors.New("persistent data missing")}
+	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
+	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopRepair)
+	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+		t.Fatalf("send Runtime stop: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := ingress.WorkflowHandle[RuntimeStopOutput](environment.Ingress(), RuntimeStopService, input.OperationID).Attach(ctx)
+	if err == nil || !strings.Contains(err.Error(), RuntimeStopFailed) {
+		t.Fatalf("Runtime stop error = %v", err)
+	}
+	if harness.actions.runtimeStatus() != domain.RuntimeStopped || harness.usage.closeCalls != 1 || harness.actions.failureCode != RuntimeStopFailed {
+		t.Fatalf("post-verification status/close/failure = %q/%d/%q", harness.actions.runtimeStatus(), harness.usage.closeCalls, harness.actions.failureCode)
+	}
+}
+
 type runtimeWorkflowHarness struct {
 	actions  *runtimeActionsFake
 	provider *runtimeProviderFake
@@ -162,7 +225,6 @@ type runtimeWorkflowHarness struct {
 	usage    *runtimeUsageFake
 	guest    *runtimeGuestFake
 	auto     *runtimeAutoStopFake
-	sender   *runtimeSenderFake
 	clock    time.Time
 }
 
@@ -182,7 +244,7 @@ func newRuntimeWorkflowHarness(ready bool) *runtimeWorkflowHarness {
 		}},
 		volume: &runtimeVolumeFake{expectedOwnerID: "user-1"}, credits: &runtimeCreditsFake{expectedOwnerID: "user-1", credits: 10},
 		images: &runtimeImageFake{image: "image-v1"}, usage: &runtimeUsageFake{expectedOwnerID: "user-1"},
-		guest: &runtimeGuestFake{expectedOwnerID: "user-1"}, auto: &runtimeAutoStopFake{}, sender: &runtimeSenderFake{},
+		guest: &runtimeGuestFake{expectedOwnerID: "user-1", readiness: RuntimeGuestReadiness{BootID: "boot-new", PrivateIPv4: "10.0.0.8", DataMounted: true}}, auto: &runtimeAutoStopFake{},
 		clock: time.Date(2026, time.July, 18, 12, 5, 0, 0, time.UTC),
 	}
 }
@@ -190,8 +252,9 @@ func newRuntimeWorkflowHarness(ready bool) *runtimeWorkflowHarness {
 func (h *runtimeWorkflowHarness) startDependencies() RuntimeStartDependencies {
 	return RuntimeStartDependencies{
 		Provider: h.provider, Actions: h.actions, DataVolumes: h.volume, Credits: h.credits, Images: h.images,
-		Usage: h.usage, Guest: h.guest, SSHKeys: h.guest, AutoStop: h.auto, Replace: h.sender,
+		Usage: h.usage, Guest: h.guest, SSHKeys: h.guest, Managed: h.guest, AutoStop: h.auto,
 		IDs: fixedRuntimeID("usage-new"), Now: func() time.Time { return h.clock },
+		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
 	}
 }
 
@@ -199,14 +262,28 @@ func (h *runtimeWorkflowHarness) stopDependencies() RuntimeStopDependencies {
 	return RuntimeStopDependencies{
 		Provider: h.provider, Actions: h.actions, DataVolumes: h.volume, Snapshots: h.guest,
 		Guest: h.guest, Usage: h.usage, AutoStop: h.auto, Now: func() time.Time { return h.clock },
+		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
 	}
 }
 
 func runtimeDispatch(operationType domain.OperationType, reason domain.RuntimeStopReason) domain.RuntimeOperationDispatch {
-	return domain.RuntimeOperationDispatch{
+	dispatch := domain.RuntimeOperationDispatch{
 		OperationID: "operation-1", OperationType: operationType, EnvironmentID: "environment-1",
 		RuntimeID: "runtime-1", OwnerUserID: "user-1", StopReason: reason,
 	}
+	if reason == domain.RuntimeStopAutoStop {
+		startedAt := time.Date(2026, time.July, 18, 12, 3, 0, 0, time.UTC)
+		expiredAt := startedAt.Add(time.Minute)
+		dispatch.StopAudit = &domain.RuntimeStopAuditEvidence{
+			Policy:           domain.AutoStopPolicySnapshot{ID: "policy-1", EnvironmentID: "environment-1", Mode: domain.AutoStopWhenFullyIdle, GracePeriodSeconds: 60},
+			PolicyGeneration: 3, GraceStartedAt: startedAt, GraceExpiredAt: expiredAt, GracePeriodSeconds: 60,
+			QualifyingSnapshots: []domain.AutoStopActivitySnapshot{
+				{RuntimeID: "runtime-1", Sequence: 10, ObservedAt: startedAt},
+				{RuntimeID: "runtime-1", Sequence: 11, ObservedAt: expiredAt},
+			},
+		}
+	}
+	return dispatch
 }
 
 func stoppedRuntimeSnapshot() domain.RuntimeSnapshot {
@@ -246,6 +323,7 @@ type runtimeActionsFake struct {
 	snapshotCalls   int
 	completeCalls   int
 	failureCode     string
+	stopAudit       *domain.RuntimeStopAuditEvidence
 }
 
 func (fake *runtimeActionsFake) LoadRuntimeOperation(_ context.Context, input domain.RuntimeOperationDispatch, invocationID string, _ time.Time) (RuntimeOperationState, error) {
@@ -302,6 +380,13 @@ func (fake *runtimeActionsFake) RecordRuntimeStopSnapshot(_ context.Context, _ s
 	return nil
 }
 
+func (fake *runtimeActionsFake) RecordRuntimeStopAudit(_ context.Context, _ string, audit domain.RuntimeStopAuditEvidence) error {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.stopAudit = domain.CloneRuntimeStopAuditEvidence(&audit)
+	return nil
+}
+
 func (fake *runtimeActionsFake) runtimeStatus() domain.RuntimeStatus {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -313,6 +398,7 @@ type runtimeProviderFake struct {
 	observeErr, startErr, stopErr error
 	startCalls, stopCalls         int
 	retireCalls, observeCalls     int
+	startPending, stopStopping    bool
 }
 
 func (fake *runtimeProviderFake) EnsureRuntime(context.Context, provider.EnsureRuntimeRequest) (provider.Runtime, error) {
@@ -326,7 +412,11 @@ func (fake *runtimeProviderFake) StartRuntime(_ context.Context, request provide
 	if fake.startErr != nil {
 		return provider.Runtime{}, fake.startErr
 	}
-	fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStateRunning, "10.0.0.8"
+	if fake.startPending {
+		fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStatePending, ""
+	} else {
+		fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStateRunning, "10.0.0.8"
+	}
 	return fake.runtime, nil
 }
 func (fake *runtimeProviderFake) StopRuntime(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
@@ -337,7 +427,11 @@ func (fake *runtimeProviderFake) StopRuntime(_ context.Context, request provider
 	if fake.stopErr != nil {
 		return provider.Runtime{}, fake.stopErr
 	}
-	fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStateStopped, ""
+	if fake.stopStopping {
+		fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStateStopping, ""
+	} else {
+		fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStateStopped, ""
+	}
 	return fake.runtime, nil
 }
 func (fake *runtimeProviderFake) RetireRuntime(context.Context, provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
@@ -352,16 +446,24 @@ func (fake *runtimeProviderFake) ObserveRuntime(_ context.Context, request provi
 	if fake.observeErr != nil {
 		return provider.Runtime{}, fake.observeErr
 	}
+	if fake.runtime.State == provider.RuntimeStatePending {
+		fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStateRunning, "10.0.0.8"
+	} else if fake.runtime.State == provider.RuntimeStateStopping {
+		fake.runtime.State, fake.runtime.PrivateIPv4 = provider.RuntimeStateStopped, ""
+	}
 	return fake.runtime, nil
 }
 
-type runtimeVolumeFake struct{ expectedOwnerID string }
+type runtimeVolumeFake struct {
+	expectedOwnerID string
+	err             error
+}
 
 func (fake *runtimeVolumeFake) VerifyRuntimeDataVolume(_ context.Context, request RuntimeDataVolumeRequest) error {
 	if request.OwnerUserID != fake.expectedOwnerID || request.EnvironmentID != "environment-1" || request.RuntimeID != "runtime-1" || request.DataVolumeProviderID != "volume-1" {
 		return errors.New("unexpected data volume ownership")
 	}
-	return nil
+	return fake.err
 }
 
 type runtimeCreditsFake struct {
@@ -386,6 +488,8 @@ type runtimeUsageFake struct {
 	expectedOwnerID       string
 	openCalls, closeCalls int
 	closedInterval        string
+	openInputs            []dbstore.OpenComputeUsageIntervalInput
+	openErrors            []error
 }
 
 func (fake *runtimeUsageFake) OpenComputeUsageInterval(_ context.Context, input dbstore.OpenComputeUsageIntervalInput) (dbstore.ComputeUsageInterval, error) {
@@ -393,7 +497,26 @@ func (fake *runtimeUsageFake) OpenComputeUsageInterval(_ context.Context, input 
 		return dbstore.ComputeUsageInterval{}, errors.New("unexpected usage owner")
 	}
 	fake.openCalls++
+	fake.openInputs = append(fake.openInputs, input)
+	if len(fake.openErrors) > 0 {
+		err := fake.openErrors[0]
+		fake.openErrors = fake.openErrors[1:]
+		return dbstore.ComputeUsageInterval{}, err
+	}
 	return dbstore.ComputeUsageInterval{ID: input.ID, UserID: input.UserID, EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID, StartedAt: input.StartedAt}, nil
+}
+
+func (fake *runtimeUsageFake) sameOpenIdentity() bool {
+	if len(fake.openInputs) < 2 {
+		return false
+	}
+	first := fake.openInputs[0]
+	for _, input := range fake.openInputs[1:] {
+		if input.ID != first.ID || !input.StartedAt.Equal(first.StartedAt) {
+			return false
+		}
+	}
+	return true
 }
 func (fake *runtimeUsageFake) CloseComputeUsageInterval(_ context.Context, input dbstore.CloseComputeUsageIntervalInput) (billing.CreditTransaction, error) {
 	fake.closeCalls++
@@ -405,6 +528,8 @@ type runtimeGuestFake struct {
 	expectedOwnerID           string
 	shutdownCalls, readyCalls int
 	sshCalls, snapshotCalls   int
+	managedCalls              int
+	readiness                 RuntimeGuestReadiness
 }
 
 func (fake *runtimeGuestFake) WaitForRuntimeReady(_ context.Context, request RuntimeGuestReadinessRequest) (RuntimeGuestReadiness, error) {
@@ -412,7 +537,14 @@ func (fake *runtimeGuestFake) WaitForRuntimeReady(_ context.Context, request Run
 		return RuntimeGuestReadiness{}, errors.New("unexpected guest owner")
 	}
 	fake.readyCalls++
-	return RuntimeGuestReadiness{BootID: "boot-new", PrivateIPv4: "10.0.0.8", DataMounted: true}, nil
+	return fake.readiness, nil
+}
+func (fake *runtimeGuestFake) ReconcileRuntimeManagedConfiguration(_ context.Context, request RuntimeGuestReadinessRequest) error {
+	if request.OwnerUserID != fake.expectedOwnerID {
+		return errors.New("unexpected managed configuration owner")
+	}
+	fake.managedCalls++
+	return nil
 }
 func (fake *runtimeGuestFake) ReconcileRuntimeSSHKeys(_ context.Context, request RuntimeGuestReadinessRequest) error {
 	if request.OwnerUserID != fake.expectedOwnerID {
@@ -444,15 +576,6 @@ func (fake *runtimeAutoStopFake) SuppressAutoStop(context.Context, string, strin
 }
 func (fake *runtimeAutoStopFake) ResumeAutoStop(context.Context, string, string) error {
 	fake.resumeCalls++
-	return nil
-}
-
-type runtimeSenderFake struct {
-	inputs []domain.RuntimeOperationDispatch
-}
-
-func (fake *runtimeSenderFake) SendRuntimeOperation(_ context.Context, input domain.RuntimeOperationDispatch) error {
-	fake.inputs = append(fake.inputs, input)
 	return nil
 }
 

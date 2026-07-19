@@ -80,7 +80,8 @@ VALUES (sqlc.arg(operation_id), sqlc.arg(environment_id), sqlc.arg(runtime_id), 
 -- name: GetPendingRuntimeOperation :one
 SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id,
        operation.requested_by_user_id,
-       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason
+       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason,
+       operation.input AS operation_input
 FROM workflow_outbox outbox
 JOIN runtime_operation_targets target
   ON target.operation_id = outbox.operation_id
@@ -93,7 +94,8 @@ WHERE outbox.operation_id = sqlc.arg(operation_id)
 -- name: ListPendingRuntimeOperations :many
 SELECT outbox.operation_id, target.operation_type, target.environment_id, target.runtime_id,
        operation.requested_by_user_id,
-       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason
+       CAST(COALESCE(operation.input ->> 'reason', '') AS TEXT) AS stop_reason,
+       operation.input AS operation_input
 FROM workflow_outbox outbox
 JOIN runtime_operation_targets target
   ON target.operation_id = outbox.operation_id

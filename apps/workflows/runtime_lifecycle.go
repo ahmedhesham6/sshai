@@ -16,8 +16,14 @@ import (
 )
 
 const (
-	CreditsPolicyBlocked  = "CREDITS_POLICY_BLOCKED"
-	RuntimeReplaceService = "RuntimeReplace"
+	CreditsPolicyBlocked        = "CREDITS_POLICY_BLOCKED"
+	ReplaceRequired             = "REPLACE_REQUIRED"
+	GuestNotReady               = "GUEST_NOT_READY"
+	RuntimeStartFailed          = "RUNTIME_START_FAILED"
+	RuntimeStopFailed           = "RUNTIME_STOP_FAILED"
+	RuntimeReplaceService       = "RuntimeReplace"
+	defaultProviderPollInterval = 5 * time.Second
+	defaultProviderPollTimeout  = 10 * time.Minute
 )
 
 type RuntimeOperationState struct {
@@ -47,6 +53,7 @@ type RuntimeStopActions interface {
 	RuntimeLifecycleActions
 	RecordRuntimeStopReason(context.Context, string, domain.RuntimeStopReason) error
 	RecordRuntimeStopSnapshot(context.Context, string, AutoStopObservation) error
+	RecordRuntimeStopAudit(context.Context, string, domain.RuntimeStopAuditEvidence) error
 }
 
 type RuntimeDataVolumeRequest struct {
@@ -97,6 +104,10 @@ type RuntimeSSHKeyReconciler interface {
 	ReconcileRuntimeSSHKeys(context.Context, RuntimeGuestReadinessRequest) error
 }
 
+type RuntimeManagedConfigurationReconciler interface {
+	ReconcileRuntimeManagedConfiguration(context.Context, RuntimeGuestReadinessRequest) error
+}
+
 type RuntimeGuestShutdownPreparer interface {
 	PrepareRuntimeShutdown(context.Context, RuntimeGuestReadinessRequest) error
 }
@@ -134,8 +145,18 @@ func validateRuntimeOperationInput(input domain.RuntimeOperationDispatch, expect
 }
 
 func validateProviderRuntime(observed provider.Runtime, request provider.RuntimeLifecycleRequest, expected provider.RuntimeState) error {
-	if observed.RuntimeSpec != request.RuntimeSpec || observed.ProviderID != request.ProviderID || observed.State != expected {
+	if err := validateProviderRuntimeIdentity(observed, request); err != nil {
+		return err
+	}
+	if observed.State != expected {
 		return fmt.Errorf("Runtime provider observation diverged: state is %q, want %q", observed.State, expected)
+	}
+	return nil
+}
+
+func validateProviderRuntimeIdentity(observed provider.Runtime, request provider.RuntimeLifecycleRequest) error {
+	if observed.RuntimeSpec != request.RuntimeSpec || observed.ProviderID != request.ProviderID {
+		return errors.New("Runtime provider observation identity diverged")
 	}
 	return nil
 }
@@ -172,6 +193,10 @@ func persistRuntimeTransition(ctx restate.WorkflowContext, actions RuntimeLifecy
 }
 
 func markRuntimeProviderFailure(ctx restate.WorkflowContext, actions RuntimeLifecycleActions, operationID string, current domain.RuntimeSnapshot, outcome runtimeProviderOutcome, now func() time.Time) error {
+	return markRuntimeErrorAndFail(ctx, actions, operationID, current, outcome.FailureCode, outcome.Failure, now)
+}
+
+func markRuntimeErrorAndFail(ctx restate.WorkflowContext, actions RuntimeLifecycleActions, operationID string, current domain.RuntimeSnapshot, code, message string, now func() time.Time) error {
 	runtime, err := domain.RestoreRuntime(current)
 	if err != nil {
 		return restate.ToTerminalError(err)
@@ -185,12 +210,102 @@ func markRuntimeProviderFailure(ctx restate.WorkflowContext, actions RuntimeLife
 	if _, err := persistRuntimeTransition(ctx, actions, operationID, "mark-runtime-error", current, failed); err != nil {
 		return err
 	}
+	return failRuntimeOperation(ctx, actions, operationID, code, message, now)
+}
+
+func failRuntimeOperation(ctx restate.WorkflowContext, actions RuntimeLifecycleActions, operationID, code, message string, now func() time.Time) error {
+	if code == "" {
+		code = "RUNTIME_OPERATION_FAILED"
+	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
-		return classifyDurableError(actions.RecordRuntimeFailure(runCtx, operationID, outcome.FailureCode, now()))
-	}, restate.WithName("fail-runtime-operation")); err != nil {
+		return classifyDurableError(actions.RecordRuntimeFailure(runCtx, operationID, code, now()))
+	}, restate.WithName("fail-runtime-operation-"+strings.ToLower(strings.ReplaceAll(code, "_", "-")))); err != nil {
 		return err
 	}
-	return restate.TerminalErrorf("%s: %s", outcome.FailureCode, outcome.Failure)
+	return restate.TerminalErrorf("%s: %s", code, message)
+}
+
+func waitForProviderState(
+	ctx restate.WorkflowContext,
+	runtimeProvider provider.RuntimeProvider,
+	request provider.RuntimeLifecycleRequest,
+	initial provider.Runtime,
+	expected provider.RuntimeState,
+	transitional provider.RuntimeState,
+	stepPrefix string,
+	pollInterval, pollTimeout time.Duration,
+) (runtimeProviderOutcome, error) {
+	if pollInterval <= 0 {
+		pollInterval = defaultProviderPollInterval
+	}
+	if pollTimeout <= 0 {
+		pollTimeout = defaultProviderPollTimeout
+	}
+	observed := initial
+	elapsed := time.Duration(0)
+	delay := pollInterval
+	for attempt := 0; ; attempt++ {
+		if err := validateProviderRuntimeIdentity(observed, request); err != nil {
+			return providerDivergenceOutcome(err), nil
+		}
+		if observed.State == expected {
+			return runtimeProviderOutcome{Runtime: observed}, nil
+		}
+		if observed.State != transitional {
+			return providerDivergenceOutcome(fmt.Errorf("Runtime provider observation diverged: state is %q, want %q or %q", observed.State, transitional, expected)), nil
+		}
+		if elapsed >= pollTimeout {
+			return runtimeProviderOutcome{
+				FailureCode: string(provider.ErrorCodeUnavailable),
+				Failure:     fmt.Sprintf("provider did not reach %q before the durable wait deadline", expected),
+			}, nil
+		}
+		if delay > pollTimeout-elapsed {
+			delay = pollTimeout - elapsed
+		}
+		if err := restate.Sleep(ctx, delay, restate.WithName(fmt.Sprintf("%s-wait-%d", stepPrefix, attempt+1))); err != nil {
+			return runtimeProviderOutcome{}, err
+		}
+		elapsed += delay
+		if delay < 30*time.Second {
+			delay *= 2
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
+		next, err := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
+			runtime, err := runtimeProvider.ObserveRuntime(runCtx, request)
+			return providerOutcome(runtime, err)
+		}, restate.WithName(fmt.Sprintf("%s-observe-%d", stepPrefix, attempt+1)))
+		if err != nil {
+			return runtimeProviderOutcome{}, err
+		}
+		if next.Failure != "" {
+			return next, nil
+		}
+		observed = next.Runtime
+	}
+}
+
+func validateRuntimeStopAudit(input domain.RuntimeOperationDispatch) error {
+	if input.StopReason != domain.RuntimeStopAutoStop {
+		if input.StopAudit != nil {
+			return errors.New("only an automatic stop may carry Auto-stop audit evidence")
+		}
+		return nil
+	}
+	evidence := input.StopAudit
+	if evidence == nil || evidence.Policy.EnvironmentID != input.EnvironmentID || evidence.PolicyGeneration == 0 ||
+		evidence.GraceStartedAt.IsZero() || evidence.GraceExpiredAt.Before(evidence.GraceStartedAt) ||
+		evidence.GracePeriodSeconds != evidence.Policy.GracePeriodSeconds || len(evidence.QualifyingSnapshots) != 2 {
+		return errors.New("automatic stop requires complete policy, snapshot, and grace evidence")
+	}
+	for _, snapshot := range evidence.QualifyingSnapshots {
+		if snapshot.RuntimeID != input.RuntimeID || snapshot.Sequence == 0 || snapshot.ObservedAt.IsZero() {
+			return errors.New("automatic stop audit evidence belongs to another Runtime")
+		}
+	}
+	return nil
 }
 
 func dataVolumeRequest(input domain.RuntimeOperationDispatch, state RuntimeOperationState) RuntimeDataVolumeRequest {

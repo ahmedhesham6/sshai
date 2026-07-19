@@ -7,4 +7,5 @@ type RuntimeOperationDispatch struct {
 	RuntimeID     string
 	OwnerUserID   string
 	StopReason    RuntimeStopReason
+	StopAudit     *RuntimeStopAuditEvidence
 }

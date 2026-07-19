@@ -99,6 +99,11 @@ func TestAutoStopCoordinatorExpiryRequiresFreshCurrentSnapshotAndDispatchesOnce(
 	if expired.Stop == nil || expired.Stop.Reason != domain.RuntimeStopAutoStop || expired.Stop.RuntimeID != "runtime-1" || expired.Stop.IdempotencyKey == "" {
 		t.Fatalf("fresh expiry = %#v", expired)
 	}
+	if evidence := expired.Stop.AuditEvidence; evidence == nil || evidence.Policy.ID != "policy-1" || evidence.PolicyGeneration != 7 ||
+		len(evidence.QualifyingSnapshots) != 2 || evidence.QualifyingSnapshots[0].Sequence != 13 || evidence.QualifyingSnapshots[1].Sequence != 14 ||
+		evidence.GracePeriodSeconds != 10 || evidence.GraceStartedAt.IsZero() || evidence.GraceExpiredAt.IsZero() {
+		t.Fatalf("Auto-stop audit evidence = %#v", evidence)
+	}
 	replayed := expire(t, coordinator, expired.State, workflows.AutoStopExpiry{
 		RuntimeID: "runtime-1", Generation: freshGeneration,
 		Observation: observation(policy, 7, activity(now.Add(6*time.Second), 15)),
