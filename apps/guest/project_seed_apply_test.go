@@ -47,6 +47,26 @@ func TestProjectSeedApplicationChecksOutTheExactBaseAndReplaysSafely(t *testing.
 	}
 }
 
+func TestProjectSeedApplicationSeedsBootstrapCreatedEmptyWorkspace(t *testing.T) {
+	repository, base := seedRepository(t)
+	application, err := guest.NewProjectSeedApplication(guest.ProjectSeedApplicationInput{
+		RepositoryURL: repositoryURL(repository), BaseRevision: base, Manifest: seedArtifact([]byte("[]")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Apply(context.Background(), workspace); err != nil {
+		t.Fatalf("seed bootstrap-created empty workspace: %v", err)
+	}
+	if head := strings.TrimSpace(seedRunGit(t, workspace, "rev-parse", "HEAD")); head != base {
+		t.Fatalf("workspace HEAD = %q, want %q", head, base)
+	}
+}
+
 func TestProjectSeedApplicationRestoresBundledDirtyRepositoryState(t *testing.T) {
 	remote, _ := seedRepository(t)
 	source := filepath.Join(t.TempDir(), "source")

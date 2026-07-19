@@ -107,7 +107,10 @@ func run(ctx context.Context) error {
 	runtimeActions := &runtimeWorkflowActions{store: store, now: time.Now}
 	snapshots := newAutoStopSnapshotSource(store)
 	dataVolumes := runtimeDataVolumeVerifier{store: store}
-	guest := unavailableGuestTransport{}
+	guest, err := newRuntimeGuestTransport(config.guestControl)
+	if err != nil {
+		return fmt.Errorf("construct guest control transport: %w", err)
+	}
 	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)
 	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, idGenerator{}, time.Now)
 	autoStop := workflows.AutoStopDefinition(snapshots, runtimeStopDispatcher{store: store, commands: runtimeCommands})
@@ -202,6 +205,7 @@ type config struct {
 	runtimeSystemVolumeGiB int32
 	runtimePresets         map[string]string
 	imageVersion           string
+	guestControl           guestControlConfig
 }
 
 func loadConfig() (config, error) {
@@ -216,6 +220,10 @@ func loadConfig() (config, error) {
 	runtimeSystemVolumeGiB, err := int32OrDefault("RUNTIME_SYSTEM_VOLUME_GIB", 30)
 	if err != nil {
 		return config{}, err
+	}
+	guestControlPort, err := int32OrDefault("GUEST_CONTROL_PORT", 9443)
+	if err != nil || guestControlPort < 1 || guestControlPort > 65535 {
+		return config{}, errors.New("GUEST_CONTROL_PORT must be between 1 and 65535")
 	}
 	config := config{
 		databaseURL:         os.Getenv("DATABASE_URL"),
@@ -237,6 +245,10 @@ func loadConfig() (config, error) {
 		runtimeSystemVolumeGiB: runtimeSystemVolumeGiB,
 		runtimePresets:         presets,
 		imageVersion:           os.Getenv("IMAGE_VERSION"),
+		guestControl: guestControlConfig{
+			port: int(guestControlPort), serverName: os.Getenv("GUEST_CONTROL_TLS_SERVER_NAME"), certificateDirectory: os.Getenv("GUEST_CONTROL_TLS_CERT_DIR"),
+			privateKeyDirectory: os.Getenv("GUEST_CONTROL_TLS_KEY_DIR"), caFile: os.Getenv("GUEST_CONTROL_TLS_CA_FILE"),
+		},
 	}
 	if config.databaseURL == "" || config.polarEventsEndpoint == "" || config.polarAccessToken == "" ||
 		config.capsuleBucket == "" || config.runtimeEnvironmentName == "" || config.runtimeAMI == "" ||
