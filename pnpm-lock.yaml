@@ -77,11 +77,15 @@ importers:
 
   apps/workflows: {}
 
+  libs/adapters: {}
+
   libs/application: {}
 
   libs/auth: {}
 
   libs/billing: {}
+
+  libs/capsule: {}
 
   libs/contracts:
     devDependencies:

@@ -252,6 +252,7 @@ func TestCLISSHSetupAcceptsFullEnvironmentPageAboveIntentResponseLimit(t *testin
 	publicKey, fingerprint := writeEd25519KeyPair(t, sshDirectory, "id_work", "")
 
 	environments := make([]contracts.Environment, setupPageSize)
+	lockID := "lock-01"
 	for index := range environments {
 		capsules := make([]contracts.LockedCapsule, 35)
 		for capsuleIndex := range capsules {
@@ -263,7 +264,7 @@ func TestCLISSHSetupAcceptsFullEnvironmentPageAboveIntentResponseLimit(t *testin
 		environments[index] = contracts.Environment{
 			Id: "env_" + strconv.Itoa(index), Name: "Environment " + strconv.Itoa(index), Slug: "environment-" + strconv.Itoa(index),
 			Lifecycle: contracts.Active, Health: contracts.EnvironmentHealthHealthy, Region: "eu-central-1", RuntimePreset: "cpu2-mem8",
-			PinnedProfileVersionId: "profile-version-01", CapsuleLockId: "lock-01", CreatedAt: time.Now(),
+			PinnedProfileVersionId: "profile-version-01", CapsuleLockId: &lockID, CreatedAt: time.Now(),
 			AutoStopPolicy: contracts.AutoStopPolicy{Mode: contracts.AutoStopPolicyModeWhenFullyIdle, GracePeriodSeconds: 300},
 			CapsuleLock: &contracts.CapsuleLock{
 				Id: "lock-01", Digest: "sha256:" + strings.Repeat("a", 64), ProfileVersionId: "profile-version-01",

@@ -41,16 +41,45 @@ func TestResolverResolveRejectsForeignOwnerRef(t *testing.T) {
 	}
 }
 
-// Capsule Refs may use a moving tag form (owner/<owner>/capsule:<tag>), which
-// domain.FreshnessTrack and domain.FreshnessReview both rely on. The MVP
-// capsule store is content-addressed only (ADR 0009): it has no tag/name to
-// digest index and no write path that would populate one, so Resolve must
-// reject tag refs with a clear error instead of fabricating a resolution.
-func TestResolverResolveRejectsTagRef(t *testing.T) {
+func TestResolverResolveRejectsTagRefWithoutIndex(t *testing.T) {
 	resolver := oci.NewResolver(stubGrantProvider{})
 	ref := domain.CapsuleRef{Ref: "owner/owner-1/capsule:stable", FreshnessPolicy: domain.FreshnessTrack}
 	_, err := resolver.Resolve(t.Context(), "owner-1", ref)
-	if err == nil || !strings.Contains(err.Error(), "tag") {
-		t.Fatalf("Resolve() error = %v, want tag-unsupported error", err)
+	if err == nil || !strings.Contains(err.Error(), "tag index") {
+		t.Fatalf("Resolve() error = %v, want tag-index configuration error", err)
 	}
+}
+
+func TestResolverResolveUsesOwnerNameAndTagIndex(t *testing.T) {
+	provider := newFileGrantProvider(t)
+	client, err := oci.NewClient("owner-1", provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := buildTestCapsule(t, map[string]string{"config:editor": "editor = vim\n"})
+	if _, err := client.Publish(t.Context(), value); err != nil {
+		t.Fatal(err)
+	}
+	tags := &tagIndexFake{digest: value.Digest}
+	resolver := oci.NewResolverWithTagIndex(provider, tags)
+	ref := domain.CapsuleRef{Ref: "owner/owner-1/agents:stable", FreshnessPolicy: domain.FreshnessTrack}
+	resolution, err := resolver.Resolve(t.Context(), "owner-1", ref)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if tags.ownerID != "owner-1" || tags.name != "agents" || tags.tag != "stable" || resolution.Digest != value.Digest || len(resolution.Components) != 1 {
+		t.Fatalf("tag lookup/resolution = fake:%#v resolution:%#v", tags, resolution)
+	}
+}
+
+type tagIndexFake struct {
+	ownerID string
+	name    string
+	tag     string
+	digest  string
+}
+
+func (index *tagIndexFake) ResolveCapsuleTag(_ context.Context, ownerID, name, tag string) (string, error) {
+	index.ownerID, index.name, index.tag = ownerID, name, tag
+	return index.digest, nil
 }

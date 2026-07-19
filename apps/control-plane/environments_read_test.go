@@ -34,8 +34,8 @@ func TestListEnvironmentsHTTPReportsOwnedEnvironments(t *testing.T) {
 	if len(page.Items) != 1 || page.Items[0].Id != "environment-1" {
 		t.Fatalf("EnvironmentPage = %#v", page)
 	}
-	if page.Items[0].CapsuleLockId != "" {
-		t.Fatalf("CapsuleLockId = %q, want empty before resolve", page.Items[0].CapsuleLockId)
+	if page.Items[0].CapsuleLockId != nil {
+		t.Fatalf("CapsuleLockId = %v, want nil before resolve", page.Items[0].CapsuleLockId)
 	}
 	if page.Items[0].Runtime != nil {
 		t.Fatalf("Runtime = %#v, want nil before provisioning", page.Items[0].Runtime)

@@ -56,26 +56,32 @@ type CapsuleResolution struct {
 // adapter satisfies workflows.CapsuleResolver, lands with the future slice
 // that wires a production CapsuleResolver into apps/workflows/cmd/workflows.
 //
-// Resolver only resolves exact-digest Capsule Refs
-// (owner/<owner>/capsule@sha256:<digest>). The MVP capsule store is
-// content-addressed only (ADR 0009, docs/spec/19-capsule-packaging.md): the
-// OCI index is keyed by Capsule digest (see IndexKey), and neither the store
-// nor the control plane persists a moving tag/name to digest mapping or a
-// write path that would populate one. A Capsule Ref that uses the tag form
-// (owner/<owner>/capsule:<tag>) — which apps/workflows.domain.FreshnessTrack
-// and FreshnessReview both allow — therefore cannot be resolved yet. Resolve
-// returns a clear error for that case rather than fabricating tag
-// infrastructure; adding a real tag/name index is a product decision for a
-// later slice.
+// Exact-digest refs resolve directly through immutable OCI content. Named tag
+// refs first resolve through the optional owner-scoped TagIndex from ADR 0012,
+// then use the same digest-addressed content path. A resolver without a
+// TagIndex returns a clear configuration error for tag refs.
 type Resolver struct {
 	grants  GrantProvider
+	tags    TagIndex
 	options []ClientOption
+}
+
+// TagIndex resolves owner-scoped mutable Capsule tag pointers. Implementations
+// must include ownerID in the lookup; content remains fetched by digest.
+type TagIndex interface {
+	ResolveCapsuleTag(context.Context, string, string, string) (string, error)
 }
 
 // NewResolver creates a Resolver backed by grants. options configure every
 // per-owner Client the Resolver constructs (see WithParallelism).
 func NewResolver(grants GrantProvider, options ...ClientOption) *Resolver {
 	return &Resolver{grants: grants, options: append([]ClientOption(nil), options...)}
+}
+
+// NewResolverWithTagIndex creates a Resolver that can follow named Capsule
+// tags as well as exact digest refs.
+func NewResolverWithTagIndex(grants GrantProvider, tags TagIndex, options ...ClientOption) *Resolver {
+	return &Resolver{grants: grants, tags: tags, options: append([]ClientOption(nil), options...)}
 }
 
 // Resolve resolves ref against the owner-scoped Capsule store. It never reads
@@ -93,20 +99,30 @@ func (resolver *Resolver) Resolve(ctx context.Context, ownerID string, ref domai
 	if parsed.OwnerID != ownerID {
 		return CapsuleResolution{}, fmt.Errorf("resolve capsule ref %q: ref owner %q does not match requesting owner %q", ref.Ref, parsed.OwnerID, ownerID)
 	}
-	if parsed.Digest == "" {
-		return CapsuleResolution{}, fmt.Errorf("resolve capsule ref %q: tag %q resolution is not supported: the MVP capsule store is content-addressed only and has no tag index (ADR 0009)", ref.Ref, parsed.Tag)
+	digest := parsed.Digest
+	if digest == "" {
+		if resolver.tags == nil {
+			return CapsuleResolution{}, fmt.Errorf("resolve capsule ref %q: tag index is not configured", ref.Ref)
+		}
+		digest, err = resolver.tags.ResolveCapsuleTag(ctx, ownerID, parsed.Name, parsed.Tag)
+		if err != nil {
+			return CapsuleResolution{}, fmt.Errorf("resolve capsule ref %q: resolve tag %q: %w", ref.Ref, parsed.Tag, err)
+		}
+		if _, err := parseSHA256Digest(digest); err != nil {
+			return CapsuleResolution{}, fmt.Errorf("resolve capsule ref %q: tag %q returned an invalid digest: %w", ref.Ref, parsed.Tag, err)
+		}
 	}
 	client, err := NewClient(ownerID, resolver.grants, resolver.options...)
 	if err != nil {
 		return CapsuleResolution{}, fmt.Errorf("resolve capsule ref %q: %w", ref.Ref, err)
 	}
-	manifest, err := client.ResolveManifest(ctx, parsed.Digest)
+	manifest, err := client.ResolveManifest(ctx, digest)
 	if err != nil {
 		return CapsuleResolution{}, fmt.Errorf("resolve capsule ref %q: %w", ref.Ref, err)
 	}
 	return CapsuleResolution{
 		OwnerID:    ownerID,
-		Digest:     parsed.Digest,
+		Digest:     digest,
 		Components: convertComponents(manifest.Components),
 	}, nil
 }

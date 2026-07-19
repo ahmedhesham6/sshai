@@ -108,21 +108,15 @@ func (server *server) ListEnvironmentEvents(response http.ResponseWriter, reques
 }
 
 // environmentResponse maps an owner-scoped Environment read projection onto
-// the public contract. capsuleLockId is required and non-nullable by the
-// OpenAPI contract, but an Environment has none until its first Profile
-// resolve completes; until then this reports an empty string rather than
-// fabricating an identifier.
+// the public contract. capsuleLockId remains nil until the first Profile
+// resolve pins a Capsule Lock.
 func environmentResponse(detail db.EnvironmentDetail) contracts.Environment {
 	snapshot := detail.Environment.Snapshot()
-	capsuleLockID := ""
-	if snapshot.CapsuleLockID != nil {
-		capsuleLockID = *snapshot.CapsuleLockID
-	}
 	body := contracts.Environment{
 		Id: snapshot.ID, Name: snapshot.Name, Slug: snapshot.Slug,
 		Lifecycle: contracts.EnvironmentLifecycle(snapshot.Lifecycle), Health: contracts.EnvironmentHealth(snapshot.Health),
 		Region: snapshot.Region, RuntimePreset: snapshot.RuntimePreset,
-		PinnedProfileVersionId: snapshot.PinnedProfileVersionID, CapsuleLockId: capsuleLockID,
+		PinnedProfileVersionId: snapshot.PinnedProfileVersionID, CapsuleLockId: snapshot.CapsuleLockID,
 		AutoStopPolicy: contracts.AutoStopPolicy{
 			Mode: contracts.AutoStopPolicyMode(detail.AutoStopMode), GracePeriodSeconds: detail.GracePeriodSeconds,
 		},

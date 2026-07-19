@@ -399,6 +399,14 @@ type CapsuleRef struct {
 // CapsuleRefFreshnessPolicy defines model for CapsuleRef.FreshnessPolicy.
 type CapsuleRefFreshnessPolicy string
 
+// CapsuleTag defines model for CapsuleTag.
+type CapsuleTag struct {
+	Digest    string    `json:"digest"`
+	Name      string    `json:"name"`
+	Tag       string    `json:"tag"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 // ConnectionIntent defines model for ConnectionIntent.
 type ConnectionIntent struct {
 	EnvironmentId   string    `json:"environmentId"`
@@ -425,7 +433,7 @@ type Environment struct {
 	ActiveOperationId      *string              `json:"activeOperationId,omitempty"`
 	AutoStopPolicy         AutoStopPolicy       `json:"autoStopPolicy"`
 	CapsuleLock            *CapsuleLock         `json:"capsuleLock,omitempty"`
-	CapsuleLockId          string               `json:"capsuleLockId"`
+	CapsuleLockId          *string              `json:"capsuleLockId"`
 	CreatedAt              time.Time            `json:"createdAt"`
 	Health                 EnvironmentHealth    `json:"health"`
 	Id                     string               `json:"id"`
@@ -548,6 +556,11 @@ type ProjectSeedInput struct {
 	RepositoryUrl         string  `json:"repositoryUrl"`
 	TrackedPatchDigest    *string `json:"trackedPatchDigest,omitempty"`
 	UntrackedBundleDigest *string `json:"untrackedBundleDigest,omitempty"`
+}
+
+// PutCapsuleTagRequest defines model for PutCapsuleTagRequest.
+type PutCapsuleTagRequest struct {
+	Digest string `json:"digest"`
 }
 
 // Runtime defines model for Runtime.
@@ -761,6 +774,9 @@ type CreateUploadIntentJSONBodyKind string
 // CreateCapsuleAccessJSONRequestBody defines body for CreateCapsuleAccess for application/json ContentType.
 type CreateCapsuleAccessJSONRequestBody = CapsuleAccessRequest
 
+// PutCapsuleTagJSONRequestBody defines body for PutCapsuleTag for application/json ContentType.
+type PutCapsuleTagJSONRequestBody = PutCapsuleTagRequest
+
 // CreateEnvironmentJSONRequestBody defines body for CreateEnvironment for application/json ContentType.
 type CreateEnvironmentJSONRequestBody = CreateEnvironmentInput
 
@@ -874,6 +890,14 @@ type ClientInterface interface {
 	CreateCapsuleAccessWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	CreateCapsuleAccess(ctx context.Context, body CreateCapsuleAccessJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetCapsuleTag request
+	GetCapsuleTag(ctx context.Context, name string, tag string, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PutCapsuleTagWithBody request with any body
+	PutCapsuleTagWithBody(ctx context.Context, name string, tag string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PutCapsuleTag(ctx context.Context, name string, tag string, body PutCapsuleTagJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListEnvironments request
 	ListEnvironments(ctx context.Context, params *ListEnvironmentsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -1003,6 +1027,42 @@ func (c *Client) CreateCapsuleAccessWithBody(ctx context.Context, contentType st
 
 func (c *Client) CreateCapsuleAccess(ctx context.Context, body CreateCapsuleAccessJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewCreateCapsuleAccessRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetCapsuleTag(ctx context.Context, name string, tag string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetCapsuleTagRequest(c.Server, name, tag)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PutCapsuleTagWithBody(ctx context.Context, name string, tag string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPutCapsuleTagRequestWithBody(c.Server, name, tag, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PutCapsuleTag(ctx context.Context, name string, tag string, body PutCapsuleTagJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPutCapsuleTagRequest(c.Server, name, tag, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1507,6 +1567,101 @@ func NewCreateCapsuleAccessRequestWithBody(server string, contentType string, bo
 	}
 
 	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetCapsuleTagRequest generates requests for GetCapsuleTag
+func NewGetCapsuleTagRequest(server string, name string, tag string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "tag", tag, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/capsules/%s/tags/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewPutCapsuleTagRequest calls the generic PutCapsuleTag builder with application/json body
+func NewPutCapsuleTagRequest(server string, name string, tag string, body PutCapsuleTagJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPutCapsuleTagRequestWithBody(server, name, tag, "application/json", bodyReader)
+}
+
+// NewPutCapsuleTagRequestWithBody generates requests for PutCapsuleTag with any type of body
+func NewPutCapsuleTagRequestWithBody(server string, name string, tag string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "tag", tag, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/capsules/%s/tags/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
 	if err != nil {
 		return nil, err
 	}
@@ -2757,6 +2912,14 @@ type ClientWithResponsesInterface interface {
 
 	CreateCapsuleAccessWithResponse(ctx context.Context, body CreateCapsuleAccessJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateCapsuleAccessResponse, error)
 
+	// GetCapsuleTagWithResponse request
+	GetCapsuleTagWithResponse(ctx context.Context, name string, tag string, reqEditors ...RequestEditorFn) (*GetCapsuleTagResponse, error)
+
+	// PutCapsuleTagWithBodyWithResponse request with any body
+	PutCapsuleTagWithBodyWithResponse(ctx context.Context, name string, tag string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutCapsuleTagResponse, error)
+
+	PutCapsuleTagWithResponse(ctx context.Context, name string, tag string, body PutCapsuleTagJSONRequestBody, reqEditors ...RequestEditorFn) (*PutCapsuleTagResponse, error)
+
 	// ListEnvironmentsWithResponse request
 	ListEnvironmentsWithResponse(ctx context.Context, params *ListEnvironmentsParams, reqEditors ...RequestEditorFn) (*ListEnvironmentsResponse, error)
 
@@ -2936,6 +3099,68 @@ func (r CreateCapsuleAccessResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r CreateCapsuleAccessResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetCapsuleTagResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *CapsuleTag
+	JSONDefault  *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r GetCapsuleTagResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetCapsuleTagResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetCapsuleTagResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type PutCapsuleTagResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *CapsuleTag
+	JSONDefault  *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r PutCapsuleTagResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PutCapsuleTagResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PutCapsuleTagResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -3697,6 +3922,32 @@ func (c *ClientWithResponses) CreateCapsuleAccessWithResponse(ctx context.Contex
 	return ParseCreateCapsuleAccessResponse(rsp)
 }
 
+// GetCapsuleTagWithResponse request returning *GetCapsuleTagResponse
+func (c *ClientWithResponses) GetCapsuleTagWithResponse(ctx context.Context, name string, tag string, reqEditors ...RequestEditorFn) (*GetCapsuleTagResponse, error) {
+	rsp, err := c.GetCapsuleTag(ctx, name, tag, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetCapsuleTagResponse(rsp)
+}
+
+// PutCapsuleTagWithBodyWithResponse request with arbitrary body returning *PutCapsuleTagResponse
+func (c *ClientWithResponses) PutCapsuleTagWithBodyWithResponse(ctx context.Context, name string, tag string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutCapsuleTagResponse, error) {
+	rsp, err := c.PutCapsuleTagWithBody(ctx, name, tag, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePutCapsuleTagResponse(rsp)
+}
+
+func (c *ClientWithResponses) PutCapsuleTagWithResponse(ctx context.Context, name string, tag string, body PutCapsuleTagJSONRequestBody, reqEditors ...RequestEditorFn) (*PutCapsuleTagResponse, error) {
+	rsp, err := c.PutCapsuleTag(ctx, name, tag, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePutCapsuleTagResponse(rsp)
+}
+
 // ListEnvironmentsWithResponse request returning *ListEnvironmentsResponse
 func (c *ClientWithResponses) ListEnvironmentsWithResponse(ctx context.Context, params *ListEnvironmentsParams, reqEditors ...RequestEditorFn) (*ListEnvironmentsResponse, error) {
 	rsp, err := c.ListEnvironments(ctx, params, reqEditors...)
@@ -4068,6 +4319,72 @@ func ParseCreateCapsuleAccessResponse(rsp *http.Response) (*CreateCapsuleAccessR
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest CapsuleAccessResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetCapsuleTagResponse parses an HTTP response from a GetCapsuleTagWithResponse call
+func ParseGetCapsuleTagResponse(rsp *http.Response) (*GetCapsuleTagResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetCapsuleTagResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest CapsuleTag
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePutCapsuleTagResponse parses an HTTP response from a PutCapsuleTagWithResponse call
+func ParsePutCapsuleTagResponse(rsp *http.Response) (*PutCapsuleTagResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PutCapsuleTagResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest CapsuleTag
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4856,6 +5173,12 @@ type ServerInterface interface {
 	// Create Capsule access grants
 	// (POST /capsule-access)
 	CreateCapsuleAccess(w http.ResponseWriter, r *http.Request)
+	// Resolve an owned Capsule tag
+	// (GET /capsules/{name}/tags/{tag})
+	GetCapsuleTag(w http.ResponseWriter, r *http.Request, name string, tag string)
+	// Publish an owned Capsule tag
+	// (PUT /capsules/{name}/tags/{tag})
+	PutCapsuleTag(w http.ResponseWriter, r *http.Request, name string, tag string)
 	// List Environments
 	// (GET /environments)
 	ListEnvironments(w http.ResponseWriter, r *http.Request, params ListEnvironmentsParams)
@@ -4946,6 +5269,18 @@ func (_ Unimplemented) CreateBillingPortal(w http.ResponseWriter, r *http.Reques
 // Create Capsule access grants
 // (POST /capsule-access)
 func (_ Unimplemented) CreateCapsuleAccess(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Resolve an owned Capsule tag
+// (GET /capsules/{name}/tags/{tag})
+func (_ Unimplemented) GetCapsuleTag(w http.ResponseWriter, r *http.Request, name string, tag string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Publish an owned Capsule tag
+// (PUT /capsules/{name}/tags/{tag})
+func (_ Unimplemented) PutCapsuleTag(w http.ResponseWriter, r *http.Request, name string, tag string) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -5178,6 +5513,88 @@ func (siw *ServerInterfaceWrapper) CreateCapsuleAccess(w http.ResponseWriter, r 
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.CreateCapsuleAccess(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetCapsuleTag operation middleware
+func (siw *ServerInterfaceWrapper) GetCapsuleTag(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "tag" -------------
+	var tag string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "tag", chi.URLParam(r, "tag"), &tag, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "tag", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, WorkosBearerScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetCapsuleTag(w, r, name, tag)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PutCapsuleTag operation middleware
+func (siw *ServerInterfaceWrapper) PutCapsuleTag(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "tag" -------------
+	var tag string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "tag", chi.URLParam(r, "tag"), &tag, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "tag", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, WorkosBearerScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PutCapsuleTag(w, r, name, tag)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -6470,6 +6887,12 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Post(options.BaseURL+"/capsule-access", wrapper.CreateCapsuleAccess)
 	})
 	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/capsules/{name}/tags/{tag}", wrapper.GetCapsuleTag)
+	})
+	r.Group(func(r chi.Router) {
+		r.Put(options.BaseURL+"/capsules/{name}/tags/{tag}", wrapper.PutCapsuleTag)
+	})
+	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/environments", wrapper.ListEnvironments)
 	})
 	r.Group(func(r chi.Router) {
@@ -6687,6 +7110,107 @@ type CreateCapsuleAccessdefaultJSONResponse struct {
 }
 
 func (response CreateCapsuleAccessdefaultJSONResponse) VisitCreateCapsuleAccessResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", fmt.Sprint(response.Headers.XRequestID))
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetCapsuleTagRequestObject struct {
+	Name string `json:"name"`
+	Tag  string `json:"tag"`
+}
+
+type GetCapsuleTagResponseObject interface {
+	VisitGetCapsuleTagResponse(w http.ResponseWriter) error
+}
+
+type GetCapsuleTag200ResponseHeaders struct {
+	XRequestID string
+}
+
+type GetCapsuleTag200JSONResponse struct {
+	Body    CapsuleTag
+	Headers GetCapsuleTag200ResponseHeaders
+}
+
+func (response GetCapsuleTag200JSONResponse) VisitGetCapsuleTagResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", fmt.Sprint(response.Headers.XRequestID))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetCapsuleTagdefaultJSONResponse struct {
+	Body       ErrorResponse
+	Headers    ErrorResponseHeaders
+	StatusCode int
+}
+
+func (response GetCapsuleTagdefaultJSONResponse) VisitGetCapsuleTagResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", fmt.Sprint(response.Headers.XRequestID))
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PutCapsuleTagRequestObject struct {
+	Name string `json:"name"`
+	Tag  string `json:"tag"`
+	Body *PutCapsuleTagJSONRequestBody
+}
+
+type PutCapsuleTagResponseObject interface {
+	VisitPutCapsuleTagResponse(w http.ResponseWriter) error
+}
+
+type PutCapsuleTag200ResponseHeaders struct {
+	XRequestID string
+}
+
+type PutCapsuleTag200JSONResponse struct {
+	Body    CapsuleTag
+	Headers PutCapsuleTag200ResponseHeaders
+}
+
+func (response PutCapsuleTag200JSONResponse) VisitPutCapsuleTagResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", fmt.Sprint(response.Headers.XRequestID))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PutCapsuleTagdefaultJSONResponse struct {
+	Body       ErrorResponse
+	Headers    ErrorResponseHeaders
+	StatusCode int
+}
+
+func (response PutCapsuleTagdefaultJSONResponse) VisitPutCapsuleTagResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -7856,6 +8380,12 @@ type StrictServerInterface interface {
 	// Create Capsule access grants
 	// (POST /capsule-access)
 	CreateCapsuleAccess(ctx context.Context, request CreateCapsuleAccessRequestObject) (CreateCapsuleAccessResponseObject, error)
+	// Resolve an owned Capsule tag
+	// (GET /capsules/{name}/tags/{tag})
+	GetCapsuleTag(ctx context.Context, request GetCapsuleTagRequestObject) (GetCapsuleTagResponseObject, error)
+	// Publish an owned Capsule tag
+	// (PUT /capsules/{name}/tags/{tag})
+	PutCapsuleTag(ctx context.Context, request PutCapsuleTagRequestObject) (PutCapsuleTagResponseObject, error)
 	// List Environments
 	// (GET /environments)
 	ListEnvironments(ctx context.Context, request ListEnvironmentsRequestObject) (ListEnvironmentsResponseObject, error)
@@ -8030,6 +8560,67 @@ func (sh *strictHandler) CreateCapsuleAccess(w http.ResponseWriter, r *http.Requ
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(CreateCapsuleAccessResponseObject); ok {
 		if err := validResponse.VisitCreateCapsuleAccessResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetCapsuleTag operation middleware
+func (sh *strictHandler) GetCapsuleTag(w http.ResponseWriter, r *http.Request, name string, tag string) {
+	var request GetCapsuleTagRequestObject
+
+	request.Name = name
+	request.Tag = tag
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetCapsuleTag(ctx, request.(GetCapsuleTagRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetCapsuleTag")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetCapsuleTagResponseObject); ok {
+		if err := validResponse.VisitGetCapsuleTagResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PutCapsuleTag operation middleware
+func (sh *strictHandler) PutCapsuleTag(w http.ResponseWriter, r *http.Request, name string, tag string) {
+	var request PutCapsuleTagRequestObject
+
+	request.Name = name
+	request.Tag = tag
+
+	var body PutCapsuleTagJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PutCapsuleTag(ctx, request.(PutCapsuleTagRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PutCapsuleTag")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PutCapsuleTagResponseObject); ok {
+		if err := validResponse.VisitPutCapsuleTagResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -8721,65 +9312,68 @@ func (sh *strictHandler) CreateUploadIntent(w http.ResponseWriter, r *http.Reque
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
-	"l81/AgAA//8=",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

@@ -100,7 +100,7 @@ export type Environment = {
     region: string;
     runtimePreset: string;
     pinnedProfileVersionId: string;
-    capsuleLockId: string;
+    capsuleLockId: string | null;
     capsuleLock?: CapsuleLock;
     autoStopPolicy: AutoStopPolicy;
     runtime?: Runtime;
@@ -145,6 +145,17 @@ export type CapsuleAccessGrant = {
 
 export type CapsuleAccessResponse = {
     grants: Array<CapsuleAccessGrant>;
+};
+
+export type PutCapsuleTagRequest = {
+    digest: string;
+};
+
+export type CapsuleTag = {
+    name: string;
+    tag: string;
+    digest: string;
+    updatedAt: string;
 };
 
 export type EnvironmentOperation = {
@@ -323,6 +334,62 @@ export type CreateCapsuleAccessResponses = {
 };
 
 export type CreateCapsuleAccessResponse = CreateCapsuleAccessResponses[keyof CreateCapsuleAccessResponses];
+
+export type GetCapsuleTagData = {
+    body?: never;
+    path: {
+        name: string;
+        tag: string;
+    };
+    query?: never;
+    url: '/capsules/{name}/tags/{tag}';
+};
+
+export type GetCapsuleTagErrors = {
+    /**
+     * Product-level error.
+     */
+    default: ErrorResponse;
+};
+
+export type GetCapsuleTagError = GetCapsuleTagErrors[keyof GetCapsuleTagErrors];
+
+export type GetCapsuleTagResponses = {
+    /**
+     * The current owner-scoped Capsule tag pointer.
+     */
+    200: CapsuleTag;
+};
+
+export type GetCapsuleTagResponse = GetCapsuleTagResponses[keyof GetCapsuleTagResponses];
+
+export type PutCapsuleTagData = {
+    body: PutCapsuleTagRequest;
+    path: {
+        name: string;
+        tag: string;
+    };
+    query?: never;
+    url: '/capsules/{name}/tags/{tag}';
+};
+
+export type PutCapsuleTagErrors = {
+    /**
+     * Product-level error.
+     */
+    default: ErrorResponse;
+};
+
+export type PutCapsuleTagError = PutCapsuleTagErrors[keyof PutCapsuleTagErrors];
+
+export type PutCapsuleTagResponses = {
+    /**
+     * The current owner-scoped Capsule tag pointer. Publishing the same digest is idempotent; publishing a different digest retags it.
+     */
+    200: CapsuleTag;
+};
+
+export type PutCapsuleTagResponse = PutCapsuleTagResponses[keyof PutCapsuleTagResponses];
 
 export type ListSshKeysData = {
     body?: never;

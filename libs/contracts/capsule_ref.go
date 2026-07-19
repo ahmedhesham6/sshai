@@ -7,12 +7,13 @@ import (
 	"strings"
 )
 
-var ownedCapsuleRefPattern = regexp.MustCompile(`^owner/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/capsule(:([A-Za-z0-9][A-Za-z0-9._-]{0,127})|@(sha256:[a-f0-9]{64}))$`)
+var ownedCapsuleRefPattern = regexp.MustCompile(`^owner/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?::([A-Za-z0-9][A-Za-z0-9._-]{0,127})|@(sha256:[a-f0-9]{64}))$`)
 
 // OwnedCapsuleRef is the owner-scoped Capsule reference used by the OCI object
 // keys. It may identify a tag or an exact content digest.
 type OwnedCapsuleRef struct {
 	OwnerID string
+	Name    string
 	Digest  string
 	Tag     string
 }
@@ -26,10 +27,15 @@ func ParseOwnedCapsuleRef(ref string) (OwnedCapsuleRef, error) {
 	if len(matches) != 5 {
 		return OwnedCapsuleRef{}, fmt.Errorf("Capsule Ref %q is not a canonical owner-scoped tag or digest reference", ref)
 	}
-	return OwnedCapsuleRef{OwnerID: matches[1], Tag: matches[3], Digest: matches[4]}, nil
+	return OwnedCapsuleRef{OwnerID: matches[1], Name: matches[2], Tag: matches[3], Digest: matches[4]}, nil
 }
 
 // FormatOwnedCapsuleRef constructs the canonical MVP Capsule store ref.
 func FormatOwnedCapsuleRef(ownerID, digest string) string {
 	return "owner/" + ownerID + "/capsule@" + digest
+}
+
+// FormatOwnedCapsuleTagRef constructs a named, owner-scoped Capsule tag ref.
+func FormatOwnedCapsuleTagRef(ownerID, name, tag string) string {
+	return "owner/" + ownerID + "/" + name + ":" + tag
 }

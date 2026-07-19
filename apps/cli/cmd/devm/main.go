@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/auth"
+	"github.com/ahmedhesham6/sshai/libs/contracts"
 	"github.com/ahmedhesham6/sshai/libs/profile"
 )
 
@@ -185,16 +186,46 @@ func (application cli) runSSH(ctx context.Context, arguments []string) error {
 
 func (application cli) runCapsule(ctx context.Context, arguments []string) error {
 	if len(arguments) == 0 {
-		return errors.New("usage: devm capsule <capture|build> [flags]")
+		return errors.New("usage: devm capsule <capture|build|publish|inspect|diff> [flags]")
 	}
 	command := arguments[0]
+	if command == "inspect" || command == "diff" {
+		want := 1
+		if command == "diff" {
+			want = 2
+		}
+		if len(arguments[1:]) != want {
+			if command == "diff" {
+				return errors.New("usage: devm capsule diff <from> <to> (Component-level digest diff; not file-level)")
+			}
+			return errors.New("usage: devm capsule inspect <ref>")
+		}
+		remote, err := application.newCapsuleRemoteCommand(ctx)
+		if err != nil {
+			return err
+		}
+		if command == "inspect" {
+			return remote.inspect(ctx, arguments[1])
+		}
+		return remote.diff(ctx, arguments[1], arguments[2])
+	}
 	flags := flag.NewFlagSet("capsule "+command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	profileRoot := flags.String("profile-root", ".", "root containing Capsule candidates")
 	selectionsFile := flags.String("selections", "", "JSON file containing PATH/SELECTOR selections")
 	var selections selectorFlags
 	flags.Var(&selections, "select", "explicit Profile path and selector")
-	if err := flags.Parse(arguments[1:]); err != nil || flags.NArg() != 0 {
+	if err := flags.Parse(arguments[1:]); err != nil {
+		return fmt.Errorf("usage: devm capsule %s --profile-root PATH [--select PATH=SELECTOR] [--selections FILE]", command)
+	}
+	wantArguments := 0
+	if command == "publish" {
+		wantArguments = 1
+	}
+	if flags.NArg() != wantArguments {
+		if command == "publish" {
+			return errors.New("usage: devm capsule publish [--profile-root PATH] [--select PATH=SELECTOR] [--selections FILE] <name>:<tag>")
+		}
 		return fmt.Errorf("usage: devm capsule %s --profile-root PATH [--select PATH=SELECTOR] [--selections FILE]", command)
 	}
 	resolvedSelections, err := loadSelections(*selectionsFile, selections)
@@ -206,9 +237,55 @@ func (application cli) runCapsule(ctx context.Context, arguments []string) error
 		return RunCapsuleCapture(ctx, *profileRoot, resolvedSelections, application.output)
 	case "build":
 		return RunCapsuleBuild(ctx, *profileRoot, resolvedSelections, application.output)
+	case "publish":
+		remote, err := application.newCapsuleRemoteCommand(ctx)
+		if err != nil {
+			return err
+		}
+		return remote.publish(ctx, flags.Arg(0), *profileRoot, resolvedSelections)
 	default:
-		return errors.New("usage: devm capsule <capture|build> [flags]")
+		return errors.New("usage: devm capsule <capture|build|publish|inspect|diff> [flags]")
 	}
+}
+
+func (application cli) newCapsuleRemoteCommand(ctx context.Context) (capsuleRemoteCommand, error) {
+	if strings.TrimSpace(application.clientID) == "" {
+		return capsuleRemoteCommand{}, errors.New("DEVM_WORKOS_CLIENT_ID is required")
+	}
+	if _, err := secureControlPlaneURL(application.controlPlaneURL); err != nil {
+		return capsuleRemoteCommand{}, errors.New("configure Capsule command: HTTPS control plane URL without credentials, query, or fragment is required")
+	}
+	if application.newRefreshClient == nil || application.configDirectory == nil || application.httpClient == nil {
+		return capsuleRemoteCommand{}, errors.New("configure Capsule command: command is incomplete")
+	}
+	refresher, err := application.newRefreshClient(application.clientID)
+	if err != nil {
+		return capsuleRemoteCommand{}, err
+	}
+	configDirectory, err := application.configDirectory()
+	if err != nil {
+		return capsuleRemoteCommand{}, errors.New("resolve user config directory for Capsule command")
+	}
+	token, err := newTokenSession(configDirectory, refresher, application.now).FreshAccessToken(ctx)
+	if err != nil {
+		return capsuleRemoteCommand{}, fmt.Errorf("authenticate Capsule command: %w", err)
+	}
+	objectClient := cloneProxyHTTPClient(application.httpClient)
+	objectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	apiClient := cloneProxyHTTPClient(application.httpClient)
+	api, err := contracts.NewClientWithResponses(application.controlPlaneURL, contracts.WithHTTPClient(boundedDoer{client: apiClient}))
+	if err != nil {
+		return capsuleRemoteCommand{}, errors.New("configure Capsule command: control plane URL is invalid")
+	}
+	currentUser, err := api.GetCurrentUserWithResponse(ctx, bearerRequestEditor(token))
+	if err != nil {
+		return capsuleRemoteCommand{}, fmt.Errorf("load authenticated User for Capsule command: %w", err)
+	}
+	if currentUser == nil || currentUser.StatusCode() != http.StatusOK || currentUser.JSON200 == nil || strings.TrimSpace(currentUser.JSON200.Id) == "" {
+		return capsuleRemoteCommand{}, errors.New("load authenticated User for Capsule command: control plane returned an invalid response")
+	}
+	provider := capsuleGrantProvider{api: api, httpClient: objectClient, token: token}
+	return capsuleRemoteCommand{api: api, grants: provider, ownerID: currentUser.JSON200.Id, token: token, output: application.output}, nil
 }
 
 func (application cli) runSSHProxy(ctx context.Context, arguments []string) error {

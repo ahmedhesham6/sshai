@@ -77,6 +77,51 @@ paths:
               schema: { $ref: '#/components/schemas/CapsuleAccessResponse' }
         default:
           $ref: '#/components/responses/Error'
+  /capsules/{name}/tags/{tag}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+      - name: tag
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+    get:
+      summary: Resolve an owned Capsule tag
+      operationId: getCapsuleTag
+      responses:
+        '200':
+          description: The current owner-scoped Capsule tag pointer.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CapsuleTag' }
+        default:
+          $ref: '#/components/responses/Error'
+    put:
+      summary: Publish an owned Capsule tag
+      operationId: putCapsuleTag
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PutCapsuleTagRequest' }
+      responses:
+        '200':
+          description: The current owner-scoped Capsule tag pointer. Publishing the same digest is idempotent; publishing a different digest retags it.
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CapsuleTag' }
+        default:
+          $ref: '#/components/responses/Error'
   /ssh-keys:
     get:
       summary: List active SSH public keys
@@ -650,7 +695,7 @@ components:
         ref:
           type: string
           minLength: 3
-          pattern: '^owner/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/capsule@sha256:[a-f0-9]{64}$'
+          pattern: '^owner/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127}|@sha256:[a-f0-9]{64})$'
         freshnessPolicy:
           type: string
           enum: [track, review, pin]
@@ -729,7 +774,7 @@ components:
         region: { type: string }
         runtimePreset: { type: string }
         pinnedProfileVersionId: { type: string }
-        capsuleLockId: { type: string }
+        capsuleLockId: { type: string, nullable: true }
         capsuleLock: { $ref: '#/components/schemas/CapsuleLock' }
         autoStopPolicy: { $ref: '#/components/schemas/AutoStopPolicy' }
         runtime: { $ref: '#/components/schemas/Runtime' }
@@ -789,6 +834,19 @@ components:
         grants:
           type: array
           items: { $ref: '#/components/schemas/CapsuleAccessGrant' }
+    PutCapsuleTagRequest:
+      type: object
+      required: [digest]
+      properties:
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+    CapsuleTag:
+      type: object
+      required: [name, tag, digest, updatedAt]
+      properties:
+        name: { type: string }
+        tag: { type: string }
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        updatedAt: { type: string, format: date-time }
     EnvironmentOperation:
       type: object
       required: [environment, operation]
