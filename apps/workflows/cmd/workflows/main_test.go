@@ -29,13 +29,19 @@ func TestBuildServicesWithFullDependenciesBindsAllProductionServices(t *testing.
 		t.Fatalf("construct Environment creation actions: %v", err)
 	}
 	profileResolveActions := workflows.NewProfileResolveActions(&profileResolveRepositoryFake{})
+	guest := unavailableGuestTransport{}
 	services := buildServices(serviceDependencies{
 		polarDeliverer: polarEventDelivererFake{}, polarStore: polarDeliveryStoreFake{}, now: time.Now,
-		environmentCreate: workflows.EnvironmentCreateDefinition(testfixtures.NewProvider(), creationActions, idGenerator{}, time.Now, "image-v1"),
-		profileResolve:    workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolverFake{}, idGenerator{}, time.Now),
-		autoStop:          workflows.AutoStopDefinition(nil, nil),
-		runtimeStart:      workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{}),
-		runtimeStop:       workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{}),
+		environmentCreate: workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
+			Provider: testfixtures.NewProvider(), Actions: creationActions, Capsules: creationActions,
+			SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+			Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
+			IDs: idGenerator{}, Now: time.Now, ImageVersion: "image-v1",
+		}),
+		profileResolve: workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolverFake{}, idGenerator{}, time.Now),
+		autoStop:       workflows.AutoStopDefinition(nil, nil),
+		runtimeStart:   workflows.RuntimeStartDefinition(workflows.RuntimeStartDependencies{}),
+		runtimeStop:    workflows.RuntimeStopDefinition(workflows.RuntimeStopDependencies{}),
 	})
 	names := make([]string, len(services))
 	for index, service := range services {
@@ -81,6 +87,14 @@ func (environmentCreationRepositoryFake) InventoryEnvironmentState(context.Conte
 
 func (environmentCreationRepositoryFake) ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (domain.Runtime, error) {
 	return domain.Runtime{}, nil
+}
+
+func (environmentCreationRepositoryFake) PersistEnvironmentCreateRuntimeTransition(context.Context, string, int64, domain.RuntimeSnapshot) error {
+	return nil
+}
+
+func (environmentCreationRepositoryFake) FinishEnvironmentCreateOperation(context.Context, string, domain.OperationStatus, string, string, time.Time) error {
+	return nil
 }
 
 func (environmentCreationRepositoryFake) CompleteEnvironmentCreation(context.Context, string, time.Time) (domain.EnvironmentCreation, error) {

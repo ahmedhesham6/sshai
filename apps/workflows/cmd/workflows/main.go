@@ -124,11 +124,16 @@ func run(ctx context.Context) error {
 	restateServer := server.NewRestate()
 	for _, service := range buildServices(serviceDependencies{
 		polarDeliverer: polarClient, polarStore: store, now: time.Now,
-		environmentCreate: workflows.EnvironmentCreateDefinition(runtimeProvider, creationActions, idGenerator{}, time.Now, config.imageVersion),
-		profileResolve:    workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolver, idGenerator{}, time.Now),
-		autoStop:          autoStop,
-		runtimeStart:      runtimeStart,
-		runtimeStop:       runtimeStop,
+		environmentCreate: workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
+			Provider: runtimeProvider, Actions: creationActions, Capsules: creationActions,
+			SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+			Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
+			IDs: idGenerator{}, Now: time.Now, ImageVersion: config.imageVersion,
+		}),
+		profileResolve: workflows.ProfileResolveDefinition(profileResolveActions, capsuleResolver, idGenerator{}, time.Now),
+		autoStop:       autoStop,
+		runtimeStart:   runtimeStart,
+		runtimeStop:    runtimeStop,
 	}) {
 		restateServer.Bind(service)
 	}

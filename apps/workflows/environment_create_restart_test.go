@@ -22,7 +22,7 @@ func TestEnvironmentCreateWorkflowResumesAfterHandlerTerminationAtEveryDurableBo
 			actions := newResumableCreationActions(gate)
 			dataVolumes := &resumableDataVolumeProvider{gate: gate, provider: testfixtures.NewProvider()}
 			ids := &resumableIDs{gate: gate, values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
-			environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, actions, ids, time.Now, "image-v1"))
+			environment := testfixtures.StartRestate(t, environmentCreateDefinition(dataVolumes, actions, ids, time.Now, "image-v1"))
 			input := domain.EnvironmentCreateDispatch{
 				OperationID: "operation-" + boundary, EnvironmentID: "environment-" + boundary,
 				Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",

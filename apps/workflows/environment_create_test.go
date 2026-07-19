@@ -7,6 +7,7 @@ package workflows_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/profile"
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	"github.com/ahmedhesham6/sshai/libs/testfixtures"
+	restate "github.com/restatedev/sdk-go"
 	"github.com/restatedev/sdk-go/ingress"
 )
 
@@ -26,7 +28,7 @@ func TestEnvironmentCreateWorkflowRunsDurableProviderAndCompletionActionsOnce(t 
 	completion := &completionFake{persistedProviderID: "persisted-volume-1"}
 	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
 	completedAt := time.Date(2026, time.July, 13, 12, 1, 0, 0, time.UTC)
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(provider, completion, ids, func() time.Time { return completedAt }, "image-v1"))
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(provider, completion, ids, func() time.Time { return completedAt }, "image-v1"))
 	client := workflows.NewClient(environment.Ingress())
 	input := application.EnvironmentCreateWorkflowInput{
 		OperationID: "operation-1", EnvironmentID: "environment-1",
@@ -96,7 +98,7 @@ func TestEnvironmentCreateWorkflowResolvesAndPinsCapsuleStateAfterRuntime(t *tes
 		},
 	}
 	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(provider, capsule, ids, time.Now, "image-v1"))
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(provider, capsule, ids, time.Now, "image-v1"))
 	input := application.EnvironmentCreateWorkflowInput{
 		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
@@ -130,7 +132,7 @@ func TestEnvironmentCreateWorkflowTreatsCapsuleLockConflictAsTerminal(t *testing
 		persistErr: dbstore.ErrCapsuleLockConflict,
 	}
 	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(provider, capsule, ids, time.Now, "image-v1"))
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(provider, capsule, ids, time.Now, "image-v1"))
 	input := application.EnvironmentCreateWorkflowInput{
 		OperationID: "operation-conflict", EnvironmentID: "environment-1",
 		Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
@@ -155,7 +157,7 @@ func TestEnvironmentCreateWorkflowDoesNotResolveCapsuleStateAfterProviderValidat
 		Provider: "aws", ProviderID: "volume-1", EnvironmentID: "environment-other", Region: "us-east-1", AvailabilityZone: "us-east-1a",
 	}}
 	capsule := &capsuleStateFake{completionFake: &completionFake{}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, capsule, &workflowIDs{values: []string{"unused"}}, time.Now, "image-v1"))
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(dataVolumes, capsule, &workflowIDs{values: []string{"unused"}}, time.Now, "image-v1"))
 	input := application.EnvironmentCreateWorkflowInput{
 		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
 	}
@@ -187,8 +189,8 @@ func TestEnvironmentCreateWorkflowDoesNotCompleteAfterInventoryFailure(t *testin
 	dataVolumes := testfixtures.NewProvider()
 	completion := &completionFake{}
 	store := &inventoryFailureStore{completionFake: completion}
-	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1"}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, store, ids, time.Now, "image-v1"))
+	ids := &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(dataVolumes, store, ids, time.Now, "image-v1"))
 	client := workflows.NewClient(environment.Ingress())
 	input := application.EnvironmentCreateWorkflowInput{
 		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
@@ -215,7 +217,7 @@ func TestEnvironmentCreateWorkflowRejectsDivergedProviderResultBeforeInventory(t
 	}}
 	store := &completionFake{}
 	ids := &workflowIDs{values: []string{"unused"}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(dataVolumes, store, ids, time.Now, "image-v1"))
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(dataVolumes, store, ids, time.Now, "image-v1"))
 	client := workflows.NewClient(environment.Ingress())
 	input := application.EnvironmentCreateWorkflowInput{
 		OperationID: "operation-1", EnvironmentID: "environment-1", Region: "us-east-1", AvailabilityZone: "us-east-1a", RuntimePreset: "standard",
@@ -241,7 +243,7 @@ func TestEnvironmentCreateWorkflowTerminatesPermanentProviderFailure(t *testing.
 		provider.NewError(provider.ErrorCodePlacementConflict, "volume belongs to another placement", nil),
 	}}
 	store := &completionFake{}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(
 		dataVolumes, store, &workflowIDs{values: []string{"unused"}}, time.Now, "image-v1",
 	))
 	input := application.EnvironmentCreateWorkflowInput{
@@ -274,7 +276,7 @@ func TestEnvironmentCreateWorkflowRetriesTransientProviderFailure(t *testing.T) 
 		},
 	}
 	store := &completionFake{}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(
 		dataVolumes, store,
 		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}, time.Now, "image-v1",
 	))
@@ -304,7 +306,7 @@ func TestEnvironmentCreateWorkflowRetriesTransientInventoryWithoutRepeatingPrior
 	dataVolumes := testfixtures.NewProvider()
 	completion := &completionFake{}
 	store := &transientInventoryStore{completionFake: completion}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(
 		dataVolumes, store,
 		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}}, time.Now, "image-v1",
 	))
@@ -337,7 +339,7 @@ func TestEnvironmentCreateWorkflowTerminatesPermanentInitialRuntimeFailure(t *te
 	dataVolumes := testfixtures.NewProvider()
 	completion := &completionFake{}
 	store := &runtimeFailureStore{completionFake: completion, failures: []error{permanentActionError{errors.New("Runtime reservation conflicts")}}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(
 		dataVolumes, store,
 		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
 		time.Now, "image-v1",
@@ -368,7 +370,7 @@ func TestEnvironmentCreateWorkflowRetriesTransientInitialRuntimeFailureWithoutRe
 	dataVolumes := testfixtures.NewProvider()
 	completion := &completionFake{}
 	store := &runtimeFailureStore{completionFake: completion, failures: []error{transientActionError{errors.New("database restarting")}}}
-	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinition(
+	environment := testfixtures.StartRestate(t, environmentCreateDefinition(
 		dataVolumes, store,
 		&workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
 		time.Now, "image-v1",
@@ -394,6 +396,323 @@ func TestEnvironmentCreateWorkflowRetriesTransientInitialRuntimeFailureWithoutRe
 	if dataVolumes.DataVolumeCreateCount() != 1 {
 		t.Fatalf("Data Volume mutations after Runtime reservation retry = %d", dataVolumes.DataVolumeCreateCount())
 	}
+}
+
+func TestEnvironmentCreateWorkflowCompletesStepsFourThroughEleven(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	result := harness.run(t, "happy")
+	if result.err != nil {
+		t.Fatalf("complete Environment create: %v", result.err)
+	}
+	if result.output.RuntimeID != "runtime-1" || result.output.DataVolumeProviderID != "volume-1" {
+		t.Fatalf("Environment create output = %#v", result.output)
+	}
+	if harness.provider.ensureRuntimeCalls != 1 || harness.actions.completeCalls != 1 {
+		t.Fatalf("provider/completion calls = ensure:%d complete:%d", harness.provider.ensureRuntimeCalls, harness.actions.completeCalls)
+	}
+	if got := harness.guest.calls; strings.Join(got, ",") != "restore-identity,readiness,seed,materialize,credentials,toolchain" {
+		t.Fatalf("guest step order = %#v", got)
+	}
+	if status := harness.actions.lastRuntime.Status; status != domain.RuntimeReady {
+		t.Fatalf("final Runtime status = %q, want %q", status, domain.RuntimeReady)
+	}
+	if len(harness.actions.outcomes) != 0 {
+		t.Fatalf("successful create recorded terminal outcomes = %#v", harness.actions.outcomes)
+	}
+}
+
+func TestEnvironmentCreateWorkflowProvisionFailureFinalizesWithoutDeletingDataVolume(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	harness.provider.ensureRuntimeErr = provider.NewError(provider.ErrorCodePlacementConflict, "placement conflict", nil)
+	result := harness.run(t, "provision-failure")
+	if result.err == nil {
+		t.Fatal("provision failure completed successfully")
+	}
+	if harness.provider.dataVolumeDeletes != 0 {
+		t.Fatalf("Data Volume deletions = %d, want zero", harness.provider.dataVolumeDeletes)
+	}
+	if len(harness.actions.outcomes) != 1 || harness.actions.outcomes[0].Kind != workflows.EnvironmentCreateOutcomeFailed {
+		t.Fatalf("recorded outcomes = %#v", harness.actions.outcomes)
+	}
+	if harness.actions.lastRuntime.Status != domain.RuntimeError || harness.actions.lastRuntime.ProviderInstanceRef != nil {
+		t.Fatalf("failed provision Runtime = %#v", harness.actions.lastRuntime)
+	}
+}
+
+func TestEnvironmentCreateWorkflowGuestReadinessTimeoutIsTerminal(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	harness.guest.readiness = workflows.RuntimeGuestReadiness{PrivateIPv4: "10.0.0.8"}
+	harness.dependencies.GuestPollInterval = 5 * time.Millisecond
+	harness.dependencies.GuestPollTimeout = 20 * time.Millisecond
+	result := harness.run(t, "guest-timeout")
+	if result.err == nil {
+		t.Fatal("guest readiness timeout completed successfully")
+	}
+	if len(harness.actions.outcomes) != 1 || harness.actions.outcomes[0].Code != workflows.GuestNotReady {
+		t.Fatalf("guest timeout outcome = %#v", harness.actions.outcomes)
+	}
+	if harness.actions.lastRuntime.Status != domain.RuntimeError || harness.provider.dataVolumeDeletes != 0 {
+		t.Fatalf("guest timeout state = Runtime:%#v deletes:%d", harness.actions.lastRuntime, harness.provider.dataVolumeDeletes)
+	}
+}
+
+func TestEnvironmentCreateWorkflowSeedFailureFinalizesOperation(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	harness.guest.seedErr = permanentActionError{errors.New("invalid Project Seed archive")}
+	result := harness.run(t, "seed-failure")
+	if result.err == nil {
+		t.Fatal("Project Seed failure completed successfully")
+	}
+	if len(harness.actions.outcomes) != 1 || harness.actions.outcomes[0].Code != "PROJECT_SEED_INVALID" {
+		t.Fatalf("Project Seed failure outcome = %#v", harness.actions.outcomes)
+	}
+	if harness.actions.persistCapsuleCalls != 0 || harness.provider.dataVolumeDeletes != 0 {
+		t.Fatalf("post-seed mutations = Capsule:%d deletes:%d", harness.actions.persistCapsuleCalls, harness.provider.dataVolumeDeletes)
+	}
+}
+
+func TestEnvironmentCreateWorkflowRecordsRequiresInputOutcome(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	harness.guest.binding = workflows.EnvironmentCredentialBindingOutcome{
+		Status: workflows.EnvironmentCredentialsRequireInput, Code: workflows.CredentialRequired,
+		Message: "repository token is required",
+	}
+	result := harness.run(t, "requires-input")
+	if result.err == nil {
+		t.Fatal("requires_input create completed successfully")
+	}
+	if len(harness.actions.outcomes) != 1 || harness.actions.outcomes[0].Kind != workflows.EnvironmentCreateOutcomeRequiresInput || harness.actions.outcomes[0].Code != workflows.CredentialRequired {
+		t.Fatalf("requires_input outcome = %#v", harness.actions.outcomes)
+	}
+	if harness.actions.completeCalls != 0 || harness.guest.called("toolchain") {
+		t.Fatalf("requires_input continued = complete:%d guest:%#v", harness.actions.completeCalls, harness.guest.calls)
+	}
+}
+
+func TestEnvironmentCreateWorkflowRecordsMaterializationResultsFromGuest(t *testing.T) {
+	harness := newEnvironmentCreateStepsHarness()
+	harness.guest.materializations = []profile.ProfileMaterializationResult{{
+		ID: "editor", LockID: "lock-1", LockDigest: "sha256:lock", CapsuleDigest: "sha256:capsule",
+		ComponentID: "config:editor", ComponentDigest: "sha256:component", Adapter: "claude",
+		AdapterVersion: "v1", Scope: domain.ScopeUser, Mode: profile.MaterializationManaged,
+		Root: profile.MaterializationHome, Target: ".config/editor", Selector: "$", EffectiveCacheKey: "sha256:key",
+	}}
+	result := harness.run(t, "materialization")
+	if result.err != nil {
+		t.Fatalf("materialized create: %v", result.err)
+	}
+	state := harness.actions.persistedCapsule
+	if len(state.ApplyResults) != 1 || len(state.Materializations) != 1 || state.Materializations[0].EffectiveCacheKey != "sha256:key" {
+		t.Fatalf("persisted materialization state = %#v", state)
+	}
+}
+
+type environmentCreateStepsHarness struct {
+	provider     *environmentCreateStepsProvider
+	actions      *environmentCreateStepsActions
+	guest        *environmentCreateStepsGuest
+	dependencies workflows.EnvironmentCreateDependencies
+}
+
+func newEnvironmentCreateStepsHarness() *environmentCreateStepsHarness {
+	providerFake := &environmentCreateStepsProvider{}
+	actions := &environmentCreateStepsActions{capsuleState: workflows.EnvironmentCapsuleState{
+		CapsuleLock:   domain.CapsuleLockSnapshot{ID: "lock-1", EnvironmentID: "environment-1", ProfileVersionID: "version-1"},
+		UpgradePolicy: domain.UpgradeManual,
+	}}
+	guest := &environmentCreateStepsGuest{
+		readiness: workflows.RuntimeGuestReadiness{BootID: "boot-1", PrivateIPv4: "10.0.0.8", DataMounted: true},
+		binding:   workflows.EnvironmentCredentialBindingOutcome{Status: workflows.EnvironmentCredentialsNotRequired},
+	}
+	harness := &environmentCreateStepsHarness{provider: providerFake, actions: actions, guest: guest}
+	harness.dependencies = workflows.EnvironmentCreateDependencies{
+		Provider: providerFake, Actions: actions, Capsules: actions,
+		SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+		Credentials: guest, Toolchain: guest,
+		IDs: &workflowIDs{values: []string{"resource-1", "workspace-1", "home-1", "services-1", "cache-1", "runtime-1"}},
+		Now: time.Now, ImageVersion: "image-v1", ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
+		GuestPollInterval: time.Millisecond, GuestPollTimeout: time.Second,
+	}
+	return harness
+}
+
+type environmentCreateRunResult struct {
+	output workflows.EnvironmentCreateOutput
+	err    error
+}
+
+func (harness *environmentCreateStepsHarness) run(t *testing.T, suffix string) environmentCreateRunResult {
+	t.Helper()
+	environment := testfixtures.StartRestate(t, workflows.EnvironmentCreateDefinitionWithDependencies(harness.dependencies))
+	input := domain.EnvironmentCreateDispatch{
+		OperationID: "operation-" + suffix, EnvironmentID: "environment-1",
+		Region: "eu-central-1", AvailabilityZone: "eu-central-1a", RuntimePreset: "cpu2-mem8",
+	}
+	if err := workflows.NewClient(environment.Ingress()).SendEnvironmentCreate(t.Context(), input); err != nil {
+		t.Fatalf("submit Environment create workflow: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	output, err := ingress.WorkflowHandle[workflows.EnvironmentCreateOutput](
+		environment.Ingress(), workflows.EnvironmentCreateService, input.OperationID,
+	).Attach(ctx)
+	return environmentCreateRunResult{output: output, err: err}
+}
+
+type environmentCreateStepsProvider struct {
+	mu                 sync.Mutex
+	runtime            provider.Runtime
+	ensureRuntimeCalls int
+	ensureRuntimeErr   error
+	dataVolumeDeletes  int
+}
+
+func (fake *environmentCreateStepsProvider) EnsureDataVolume(_ context.Context, request provider.EnsureDataVolumeRequest) (provider.DataVolume, error) {
+	return provider.DataVolume{Provider: "fake", ProviderID: "volume-1", EnvironmentID: request.EnvironmentID, Region: request.Region, AvailabilityZone: request.AvailabilityZone}, nil
+}
+
+func (fake *environmentCreateStepsProvider) EnsureRuntime(_ context.Context, request provider.EnsureRuntimeRequest) (provider.Runtime, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.ensureRuntimeCalls++
+	if fake.ensureRuntimeErr != nil {
+		return provider.Runtime{}, fake.ensureRuntimeErr
+	}
+	if fake.runtime.ProviderID == "" {
+		fake.runtime = provider.Runtime{RuntimeSpec: request.RuntimeSpec, ProviderID: "instance-1", State: provider.RuntimeStatePending}
+	}
+	return fake.runtime, nil
+}
+
+func (fake *environmentCreateStepsProvider) ObserveRuntime(context.Context, provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.runtime.State == provider.RuntimeStatePending {
+		fake.runtime.State = provider.RuntimeStateRunning
+		fake.runtime.PrivateIPv4 = "10.0.0.8"
+	}
+	return fake.runtime, nil
+}
+
+func (fake *environmentCreateStepsProvider) StartRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return fake.ObserveRuntime(ctx, request)
+}
+
+func (fake *environmentCreateStepsProvider) StopRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return fake.ObserveRuntime(ctx, request)
+}
+
+func (fake *environmentCreateStepsProvider) RetireRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return fake.ObserveRuntime(ctx, request)
+}
+
+type environmentCreateStepsActions struct {
+	mu                  sync.Mutex
+	runtimeReservation  domain.RuntimeReservation
+	lastRuntime         domain.RuntimeSnapshot
+	outcomes            []workflows.EnvironmentCreateOperationOutcome
+	completeCalls       int
+	capsuleState        workflows.EnvironmentCapsuleState
+	persistedCapsule    workflows.EnvironmentCapsuleState
+	persistCapsuleCalls int
+}
+
+func (*environmentCreateStepsActions) RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error {
+	return nil
+}
+
+func (*environmentCreateStepsActions) InventoryEnvironmentState(_ context.Context, _ string, reservation domain.EnvironmentStateReservation) (string, error) {
+	return reservation.ProviderID, nil
+}
+
+func (actions *environmentCreateStepsActions) ReserveInitialRuntime(_ context.Context, _ string, reservation domain.RuntimeReservation) (string, error) {
+	actions.runtimeReservation = reservation
+	return reservation.ID, nil
+}
+
+func (actions *environmentCreateStepsActions) PersistEnvironmentCreateRuntimeTransition(_ context.Context, _ string, _ int64, next domain.RuntimeSnapshot) error {
+	actions.mu.Lock()
+	defer actions.mu.Unlock()
+	actions.lastRuntime = next
+	return nil
+}
+
+func (actions *environmentCreateStepsActions) RecordEnvironmentCreateOutcome(_ context.Context, _ string, outcome workflows.EnvironmentCreateOperationOutcome, _ time.Time) error {
+	actions.mu.Lock()
+	defer actions.mu.Unlock()
+	actions.outcomes = append(actions.outcomes, outcome)
+	return nil
+}
+
+func (actions *environmentCreateStepsActions) CompleteEnvironmentCreation(context.Context, string, time.Time) error {
+	actions.completeCalls++
+	return nil
+}
+
+func (actions *environmentCreateStepsActions) ResolvePinnedProfileVersion(context.Context, string, time.Time) (workflows.EnvironmentCapsuleState, error) {
+	return actions.capsuleState, nil
+}
+
+func (actions *environmentCreateStepsActions) PersistEnvironmentCapsuleState(_ context.Context, _ string, state workflows.EnvironmentCapsuleState) error {
+	actions.persistCapsuleCalls++
+	actions.persistedCapsule = state
+	return nil
+}
+
+type environmentCreateStepsGuest struct {
+	mu               sync.Mutex
+	calls            []string
+	readiness        workflows.RuntimeGuestReadiness
+	seedErr          error
+	materializations []profile.ProfileMaterializationResult
+	binding          workflows.EnvironmentCredentialBindingOutcome
+}
+
+func (fake *environmentCreateStepsGuest) record(call string) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.calls = append(fake.calls, call)
+}
+
+func (fake *environmentCreateStepsGuest) called(call string) bool {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, candidate := range fake.calls {
+		if candidate == call {
+			return true
+		}
+	}
+	return false
+}
+
+func (fake *environmentCreateStepsGuest) RestoreEnvironmentSSHIdentity(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	fake.record("restore-identity")
+	return nil
+}
+
+func (fake *environmentCreateStepsGuest) WaitForRuntimeReady(context.Context, workflows.RuntimeGuestReadinessRequest) (workflows.RuntimeGuestReadiness, error) {
+	fake.record("readiness")
+	return fake.readiness, nil
+}
+
+func (fake *environmentCreateStepsGuest) ApplyEnvironmentProjectSeed(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	fake.record("seed")
+	return fake.seedErr
+}
+
+func (fake *environmentCreateStepsGuest) MaterializeEnvironmentCapsule(context.Context, workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+	fake.record("materialize")
+	return fake.materializations, nil
+}
+
+func (fake *environmentCreateStepsGuest) BindEnvironmentCredentials(context.Context, workflows.EnvironmentCreateGuestRequest) (workflows.EnvironmentCredentialBindingOutcome, error) {
+	fake.record("credentials")
+	return fake.binding, nil
+}
+
+func (fake *environmentCreateStepsGuest) ValidateEnvironmentToolchain(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	fake.record("toolchain")
+	return nil
 }
 
 type completionFake struct {
@@ -607,7 +926,130 @@ func (transientActionError) Transient() bool { return true }
 func (ids *workflowIDs) NewID() string {
 	ids.mu.Lock()
 	defer ids.mu.Unlock()
+	if len(ids.values) == 0 {
+		panic("workflowIDs exhausted: reserve-creation-identities requires six deterministic IDs")
+	}
 	value := ids.values[0]
 	ids.values = ids.values[1:]
 	return value
+}
+
+type legacyEnvironmentCreationActions interface {
+	RecordEnvironmentCreateInvocation(context.Context, string, string, time.Time) error
+	InventoryEnvironmentState(context.Context, string, domain.EnvironmentStateReservation) (string, error)
+	ReserveInitialRuntime(context.Context, string, domain.RuntimeReservation) (string, error)
+	CompleteEnvironmentCreation(context.Context, string, time.Time) error
+}
+
+func environmentCreateDefinition(dataVolumes provider.DataVolumeProvider, actions legacyEnvironmentCreationActions, ids workflows.IDGenerator, now func() time.Time, imageVersion string) restate.ServiceDefinition {
+	providerAdapter, ok := dataVolumes.(workflows.EnvironmentCreateProvider)
+	if !ok {
+		providerAdapter = &environmentCreateProviderAdapter{DataVolumeProvider: dataVolumes, runtimes: make(map[string]provider.Runtime)}
+	}
+	wrapped := &environmentCreateActionsAdapter{legacyEnvironmentCreationActions: actions}
+	capsules, ok := actions.(workflows.EnvironmentCreationCapsuleActions)
+	if !ok {
+		capsules = testEnvironmentCapsuleActions{}
+	}
+	guest := testEnvironmentGuest{}
+	return workflows.EnvironmentCreateDefinitionWithDependencies(workflows.EnvironmentCreateDependencies{
+		Provider: providerAdapter, Actions: wrapped, Capsules: capsules,
+		SSHIdentity: guest, GuestReadiness: guest, ProjectSeed: guest, Materializer: guest,
+		Credentials: workflows.NoProjectCredentialBinder{}, Toolchain: guest,
+		IDs: ids, Now: now, ImageVersion: imageVersion,
+		ProviderPollInterval: time.Millisecond, ProviderPollTimeout: time.Second,
+		GuestPollInterval: time.Millisecond, GuestPollTimeout: time.Second,
+	})
+}
+
+type environmentCreateActionsAdapter struct {
+	legacyEnvironmentCreationActions
+	mu       sync.Mutex
+	runtimes map[string]domain.RuntimeSnapshot
+	outcomes []workflows.EnvironmentCreateOperationOutcome
+}
+
+func (actions *environmentCreateActionsAdapter) PersistEnvironmentCreateRuntimeTransition(_ context.Context, _ string, _ int64, next domain.RuntimeSnapshot) error {
+	actions.mu.Lock()
+	defer actions.mu.Unlock()
+	if actions.runtimes == nil {
+		actions.runtimes = make(map[string]domain.RuntimeSnapshot)
+	}
+	actions.runtimes[next.ID] = next
+	return nil
+}
+
+func (actions *environmentCreateActionsAdapter) RecordEnvironmentCreateOutcome(_ context.Context, _ string, outcome workflows.EnvironmentCreateOperationOutcome, _ time.Time) error {
+	actions.mu.Lock()
+	defer actions.mu.Unlock()
+	actions.outcomes = append(actions.outcomes, outcome)
+	return nil
+}
+
+type environmentCreateProviderAdapter struct {
+	provider.DataVolumeProvider
+	mu       sync.Mutex
+	runtimes map[string]provider.Runtime
+}
+
+func (fake *environmentCreateProviderAdapter) EnsureRuntime(_ context.Context, request provider.EnsureRuntimeRequest) (provider.Runtime, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if existing, ok := fake.runtimes[request.RuntimeID]; ok {
+		return existing, nil
+	}
+	runtime := provider.Runtime{RuntimeSpec: request.RuntimeSpec, ProviderID: "instance-" + request.RuntimeID, PrivateIPv4: "10.0.0.8", State: provider.RuntimeStateRunning}
+	fake.runtimes[request.RuntimeID] = runtime
+	return runtime, nil
+}
+
+func (fake *environmentCreateProviderAdapter) ObserveRuntime(_ context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return fake.runtimes[request.RuntimeID], nil
+}
+
+func (fake *environmentCreateProviderAdapter) StartRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return fake.ObserveRuntime(ctx, request)
+}
+
+func (fake *environmentCreateProviderAdapter) StopRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return fake.ObserveRuntime(ctx, request)
+}
+
+func (fake *environmentCreateProviderAdapter) RetireRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
+	return fake.ObserveRuntime(ctx, request)
+}
+
+type testEnvironmentCapsuleActions struct{}
+
+func (testEnvironmentCapsuleActions) ResolvePinnedProfileVersion(_ context.Context, operationID string, _ time.Time) (workflows.EnvironmentCapsuleState, error) {
+	environmentID := strings.Replace(operationID, "operation", "environment", 1)
+	return workflows.EnvironmentCapsuleState{CapsuleLock: domain.CapsuleLockSnapshot{ID: "lock-" + operationID, EnvironmentID: environmentID, ProfileVersionID: "version-1"}, UpgradePolicy: domain.UpgradeManual}, nil
+}
+
+func (testEnvironmentCapsuleActions) PersistEnvironmentCapsuleState(context.Context, string, workflows.EnvironmentCapsuleState) error {
+	return nil
+}
+
+type testEnvironmentGuest struct{}
+
+func (testEnvironmentGuest) RestoreEnvironmentSSHIdentity(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	return nil
+}
+
+func (testEnvironmentGuest) WaitForRuntimeReady(_ context.Context, request workflows.RuntimeGuestReadinessRequest) (workflows.RuntimeGuestReadiness, error) {
+	return workflows.RuntimeGuestReadiness{BootID: "boot-1", PrivateIPv4: request.PrivateIPv4, DataMounted: true}, nil
+}
+
+func (testEnvironmentGuest) ApplyEnvironmentProjectSeed(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	return nil
+}
+
+func (testEnvironmentGuest) MaterializeEnvironmentCapsule(_ context.Context, request workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+	return request.State.ApplyResults, nil
+}
+
+func (testEnvironmentGuest) ValidateEnvironmentToolchain(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	return nil
 }

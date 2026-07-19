@@ -12,6 +12,7 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/capsule/oci"
 	"github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
+	"github.com/ahmedhesham6/sshai/libs/profile"
 	"github.com/google/uuid"
 )
 
@@ -328,6 +329,22 @@ func (unavailableGuestTransport) PrepareRuntimeShutdown(context.Context, workflo
 	return unavailableGuestTransportError{operation: "graceful Runtime shutdown"}
 }
 
+func (unavailableGuestTransport) RestoreEnvironmentSSHIdentity(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	return unavailableGuestTransportError{operation: "Environment SSH identity restoration"}
+}
+
+func (unavailableGuestTransport) ApplyEnvironmentProjectSeed(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	return unavailableGuestTransportError{operation: "Project Seed application"}
+}
+
+func (unavailableGuestTransport) MaterializeEnvironmentCapsule(context.Context, workflows.EnvironmentCapsuleMaterializationRequest) ([]profile.ProfileMaterializationResult, error) {
+	return nil, unavailableGuestTransportError{operation: "Capsule Lock materialization"}
+}
+
+func (unavailableGuestTransport) ValidateEnvironmentToolchain(context.Context, workflows.EnvironmentCreateGuestRequest) error {
+	return unavailableGuestTransportError{operation: "agent and toolchain validation"}
+}
+
 type runtimeStopDispatcher struct {
 	store    *db.Store
 	commands *application.RuntimeCommandService
@@ -363,5 +380,9 @@ var (
 	_ workflows.RuntimeSSHKeyReconciler               = unavailableGuestTransport{}
 	_ workflows.RuntimeManagedConfigurationReconciler = unavailableGuestTransport{}
 	_ workflows.RuntimeGuestShutdownPreparer          = unavailableGuestTransport{}
+	_ workflows.EnvironmentSSHIdentityRestorer        = unavailableGuestTransport{}
+	_ workflows.EnvironmentProjectSeedApplicator      = unavailableGuestTransport{}
+	_ workflows.EnvironmentCapsuleMaterializer        = unavailableGuestTransport{}
+	_ workflows.EnvironmentToolchainValidator         = unavailableGuestTransport{}
 	_ workflows.RuntimeStopDispatcher                 = runtimeStopDispatcher{}
 )

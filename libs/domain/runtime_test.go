@@ -34,6 +34,22 @@ func TestReserveRuntimeStartsAbsentWithImmutableOwnership(t *testing.T) {
 	}
 }
 
+func TestRuntimeMarksProvisionErrorWithoutFabricatingProviderIdentity(t *testing.T) {
+	createdAt := time.Date(2026, time.July, 19, 10, 0, 0, 0, time.UTC)
+	runtime := reservedRuntime(t, createdAt)
+	failed, err := runtime.MarkProvisionError(createdAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("MarkProvisionError(): %v", err)
+	}
+	snapshot := failed.Snapshot()
+	if snapshot.Status != domain.RuntimeError || snapshot.ProviderInstanceRef != nil || snapshot.Version != 2 {
+		t.Fatalf("failed Runtime = %#v", snapshot)
+	}
+	if _, err := domain.RestoreRuntime(snapshot); err != nil {
+		t.Fatalf("RestoreRuntime(failed): %v", err)
+	}
+}
+
 func TestRuntimeProvisionAndStartAdvanceMonotonically(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	runtime := reservedRuntime(t, createdAt)

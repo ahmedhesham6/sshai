@@ -165,6 +165,12 @@ func validateRuntimeState(snapshot RuntimeSnapshot) error {
 	if snapshot.RetiredAt != nil {
 		return errors.New("invalid Runtime: only an absent Runtime may be retired")
 	}
+	if snapshot.Status == RuntimeError && !provider {
+		if snapshot.StartedAt != nil || snapshot.StoppedAt != nil || privateAddress || boot {
+			return errors.New("invalid Runtime: unallocated error Runtime has lifecycle observations")
+		}
+		return nil
+	}
 	if !provider {
 		return errors.New("invalid Runtime: provider instance reference is required")
 	}
@@ -222,6 +228,24 @@ func (runtime Runtime) Provision(providerInstanceRef string, at time.Time) (Runt
 	}
 	next.Status = RuntimeProvisioning
 	next.ProviderInstanceRef = &providerInstanceRef
+	return finalizeRuntimeTransition(next, at)
+}
+
+// MarkProvisionError records an allocation failure for which the provider did
+// not return an instance identity. Failures after allocation use MarkError.
+func (runtime Runtime) MarkProvisionError(at time.Time) (Runtime, error) {
+	current := runtime.Snapshot()
+	if current.Status == RuntimeError && current.ProviderInstanceRef == nil {
+		return runtime, nil
+	}
+	if current.Status != RuntimeAbsent || current.RetiredAt != nil {
+		return Runtime{}, fmt.Errorf("mark Runtime provision error: status is %q", current.Status)
+	}
+	next, err := runtime.transition(at)
+	if err != nil {
+		return Runtime{}, fmt.Errorf("mark Runtime provision error: %w", err)
+	}
+	next.Status = RuntimeError
 	return finalizeRuntimeTransition(next, at)
 }
 
