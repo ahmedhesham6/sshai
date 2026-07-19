@@ -256,9 +256,31 @@ func TestObserverClassifiesUnknownAndCgroupScopedProcesses(t *testing.T) {
 			userSession: 1,
 		},
 		{
+			name: "root-owned process in user subtree is unknown",
+			processes: []guest.ProcessSample{
+				{PID: 10, ParentPID: 1, OwnerUID: 0, Executable: "/usr/bin/make", State: guest.ProcessRunning, CgroupPath: "/user.slice/user-1000.slice/session-1.scope"},
+			},
+			unknown:     1,
+			userSession: 1,
+		},
+		{
+			name: "setuid process in user subtree is unknown",
+			processes: []guest.ProcessSample{
+				{PID: 10, ParentPID: 1, OwnerUID: 0, Executable: "/usr/bin/passwd", State: guest.ProcessWaiting, CgroupPath: "/user.slice/user-1000.slice/session-1.scope"},
+			},
+			unknown:     1,
+			userSession: 1,
+		},
+		{
 			name: "other uid is explicit system baseline",
 			processes: []guest.ProcessSample{
 				{PID: 10, ParentPID: 1, OwnerUID: 999, Executable: "/usr/lib/systemd/systemd-journald", State: guest.ProcessWaiting, CgroupPath: "/system.slice/systemd-journald.service"},
+			},
+		},
+		{
+			name: "root system daemon outside user subtree is baseline",
+			processes: []guest.ProcessSample{
+				{PID: 10, ParentPID: 1, OwnerUID: 0, Executable: "/usr/lib/systemd/systemd-journald", State: guest.ProcessWaiting, CgroupPath: "/system.slice/systemd-journald.service"},
 			},
 		},
 		{

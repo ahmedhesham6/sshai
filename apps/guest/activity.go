@@ -300,7 +300,7 @@ func liveAllowedProcess(process ProcessSample, allowlist map[string]struct{}) bo
 }
 
 func liveTrackedAllowedProcess(process ProcessSample, userUID int, allowlist map[string]struct{}) bool {
-	return process.OwnerUID == userUID && inUserSessionCgroup(process, userUID) && liveAllowedProcess(process, allowlist)
+	return inUserSessionCgroup(process, userUID) && liveAllowedProcess(process, allowlist)
 }
 
 func countUnknownUserProcesses(
@@ -335,14 +335,16 @@ func countUnknownUserProcesses(
 }
 
 func isBaselineProcess(process ProcessSample, userUID int) bool {
-	if process.OwnerUID != userUID {
-		return true
+	if !inUserSessionCgroup(process, userUID) {
+		return process.OwnerUID != userUID
 	}
 
-	// The user manager is the sole user-owned baseline exception, and only at
-	// its exact systemd identity and init scope. Misclassifying an unknown user
-	// process as baseline could auto-stop a busy Runtime, so executable-only or
-	// cgroup-prefix exceptions are intentionally forbidden here.
+	// Cgroup membership attributes processes in the user session subtree to the
+	// user regardless of owner UID. The user manager is the sole baseline
+	// exception there, and only at its exact systemd identity and init scope.
+	// Misclassifying an unknown process as baseline could auto-stop a busy
+	// Runtime, so executable-only or cgroup-prefix exceptions are intentionally
+	// forbidden here.
 	userManagerCgroup := fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service/init.scope", userUID, userUID)
 	if process.CgroupPath != userManagerCgroup {
 		return false
