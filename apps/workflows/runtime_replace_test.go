@@ -43,6 +43,9 @@ func TestRuntimeReplaceStoppedRuntimeReattachesOnlyAfterObservedDetachment(t *te
 	if harness.usage.openCalls != 1 || harness.usage.openInputs[0].RuntimeID != "runtime-2" {
 		t.Fatalf("replacement usage opens = %#v", harness.usage.openInputs)
 	}
+	if harness.actions.inventoryCalls != 1 {
+		t.Fatalf("replacement Provider Resource inventory calls = %d, want 1", harness.actions.inventoryCalls)
+	}
 }
 
 func TestRuntimeReplaceRestoresSSHHostIdentity(t *testing.T) {
@@ -195,10 +198,10 @@ func newRuntimeReplaceHarness(ready bool) *runtimeReplaceHarness {
 	actions := &runtimeReplaceActionsFake{state: RuntimeOperationState{OwnerUserID: "user-1", Runtime: snapshot, DataVolumeProviderID: "volume-1", ComputeUsageIntervalID: usageID}, current: snapshot, rows: map[string]domain.RuntimeSnapshot{"runtime-1": snapshot}}
 	return &runtimeReplaceHarness{
 		actions:  actions,
-		provider: &runtimeReplaceProviderFake{old: provider.Runtime{RuntimeSpec: providerSpec(), ProviderID: "instance-1", PrivateIPv4: "10.0.0.7", State: providerState}},
+		provider: &runtimeReplaceProviderFake{old: provider.Runtime{RuntimeSpec: providerSpec(), Provider: "aws", ProviderID: "instance-1", SystemVolumeProviderID: "volume-system-1", PrivateIPv4: "10.0.0.7", State: providerState}},
 		volume:   &runtimeVolumeFake{expectedOwnerID: "user-1"}, images: &runtimeReplaceImageFake{image: "image-v2"},
 		usage: &runtimeUsageFake{expectedOwnerID: "user-1"}, guest: &runtimeGuestFake{expectedOwnerID: "user-1", readiness: RuntimeGuestReadiness{BootID: "boot-replacement", PrivateIPv4: "10.0.0.9", DataMounted: true}},
-		auto: &runtimeAutoStopFake{}, ids: &runtimeReplaceIDs{values: []string{"runtime-2", "usage-new"}}, clock: time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC),
+		auto: &runtimeAutoStopFake{}, ids: &runtimeReplaceIDs{values: []string{"runtime-2", "resource-runtime-2", "resource-system-2", "usage-new"}}, clock: time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -222,6 +225,7 @@ type runtimeReplaceActionsFake struct {
 	current                     domain.RuntimeSnapshot
 	rows                        map[string]domain.RuntimeSnapshot
 	completeCalls, failureCalls int
+	inventoryCalls              int
 	failureCode, startDecision  string
 }
 
@@ -248,6 +252,14 @@ func (fake *runtimeReplaceActionsFake) PersistRuntimeReplacement(_ context.Conte
 	fake.current, fake.state.Runtime = next.Snapshot(), next.Snapshot()
 	fake.rows[reservation.ID] = next.Snapshot()
 	return next.Snapshot(), nil
+}
+func (fake *runtimeReplaceActionsFake) InventoryReplacementRuntimeResources(_ context.Context, _ string, inventory dbstore.RuntimeProviderResourceInventory) error {
+	if inventory.RuntimeID != fake.current.ID || inventory.RuntimeResourceID != "resource-runtime-2" || inventory.SystemVolumeResourceID != "resource-system-2" ||
+		inventory.RuntimeProviderID != "instance-2" || inventory.SystemVolumeProviderID != "volume-system-2" || inventory.Provider != "aws" || inventory.CreatedAt.IsZero() {
+		return errors.New("invalid replacement Provider Resource inventory")
+	}
+	fake.inventoryCalls++
+	return nil
 }
 func (fake *runtimeReplaceActionsFake) PersistReplacementRuntimeTransition(_ context.Context, _ string, expected int64, next domain.RuntimeSnapshot) error {
 	if fake.current.ID != next.ID || fake.current.Version != expected {
@@ -327,7 +339,7 @@ func (fake *runtimeReplaceProviderFake) EnsureRuntime(_ context.Context, request
 	if fake.ensureErr != nil {
 		return provider.Runtime{}, fake.ensureErr
 	}
-	fake.new = provider.Runtime{RuntimeSpec: request.RuntimeSpec, ProviderID: "instance-2", State: provider.RuntimeStatePending}
+	fake.new = provider.Runtime{RuntimeSpec: request.RuntimeSpec, Provider: "aws", ProviderID: "instance-2", SystemVolumeProviderID: "volume-system-2", State: provider.RuntimeStatePending}
 	return fake.new, nil
 }
 func (fake *runtimeReplaceProviderFake) StartRuntime(context.Context, provider.RuntimeLifecycleRequest) (provider.Runtime, error) {

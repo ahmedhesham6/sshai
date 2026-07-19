@@ -94,9 +94,11 @@ type RuntimeLifecycleRequest struct {
 
 type Runtime struct {
 	RuntimeSpec
-	ProviderID  string
-	PrivateIPv4 string
-	State       RuntimeState
+	Provider               string
+	ProviderID             string
+	SystemVolumeProviderID string
+	PrivateIPv4            string
+	State                  RuntimeState
 }
 
 type RuntimeProvider interface {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -56,6 +57,7 @@ type ec2API interface {
 	DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
 	DescribeVolumes(context.Context, *ec2.DescribeVolumesInput, ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error)
 	DetachVolume(context.Context, *ec2.DetachVolumeInput, ...func(*ec2.Options)) (*ec2.DetachVolumeOutput, error)
+	ModifyInstanceAttribute(context.Context, *ec2.ModifyInstanceAttributeInput, ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error)
 	RunInstances(context.Context, *ec2.RunInstancesInput, ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error)
 	StartInstances(context.Context, *ec2.StartInstancesInput, ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error)
 	StopInstances(context.Context, *ec2.StopInstancesInput, ...func(*ec2.Options)) (*ec2.StopInstancesOutput, error)
@@ -63,11 +65,13 @@ type ec2API interface {
 }
 
 type Provider struct {
-	client      ec2API
-	region      string
-	environment string
-	sizeGiB     int32
-	runtime     RuntimeConfig
+	client              ec2API
+	region              string
+	environment         string
+	sizeGiB             int32
+	runtime             RuntimeConfig
+	runtimePollInterval time.Duration
+	runtimePollTimeout  time.Duration
 }
 
 var _ provider.DataVolumeProvider = (*Provider)(nil)
@@ -97,6 +101,7 @@ func newProvider(client ec2API, adapterConfig Config) (*Provider, error) {
 	return &Provider{
 		client: client, region: adapterConfig.Region, environment: adapterConfig.Environment,
 		sizeGiB: adapterConfig.SizeGiB, runtime: adapterConfig.Runtime,
+		runtimePollInterval: 250 * time.Millisecond, runtimePollTimeout: 2 * time.Minute,
 	}, nil
 }
 

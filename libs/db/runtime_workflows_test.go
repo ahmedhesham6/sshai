@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	dbstore "github.com/ahmedhesham6/sshai/libs/db"
 	"github.com/ahmedhesham6/sshai/libs/domain"
 )
 
@@ -144,6 +145,17 @@ func TestStorePersistsRuntimeReplacementWithoutDeletingHistory(t *testing.T) {
 		('cache-1', 'environment-1', 'cache', 'disposable', '/var/cache/devm', 'resource-data', 'data_volume', 'healthy', $1, $1)`, createdAt); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO provider_resources (
+			id, environment_id, runtime_id, operation_id, provider, region, resource_type, provider_id, metadata, created_at
+		) VALUES
+			('resource-runtime-1', 'environment-1', 'runtime-1', 'operation-create', 'aws', 'us-east-1', 'runtime', 'i-runtime-1', '{}', $1),
+			('resource-system-1', 'environment-1', 'runtime-1', 'operation-create', 'aws', 'us-east-1', 'system_volume', 'volume-system-1', '{}', $1)`, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runtimes SET provider_resource_id = 'resource-runtime-1' WHERE id = 'runtime-1'`); err != nil {
+		t.Fatal(err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +182,9 @@ func TestStorePersistsRuntimeReplacementWithoutDeletingHistory(t *testing.T) {
 	if err := store.PersistRuntimeWorkflowTransition(ctx, "operation-replace", state.Runtime.Version, replacing.Snapshot()); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.PersistRuntimeWorkflowTransition(ctx, "operation-replace", state.Runtime.Version, replacing.Snapshot()); err != nil {
+		t.Fatalf("PersistRuntimeWorkflowTransition(commit-then-lost-response replay): %v", err)
+	}
 	retiredAt := createdAt.Add(4 * time.Hour)
 	retired, err := replacing.Retire(domain.RuntimeStateObservation{ProviderInstanceRef: "i-runtime-1", ExpectedVersion: replacing.Snapshot().Version, ObservedAt: retiredAt})
 	if err != nil {
@@ -183,6 +198,20 @@ func TestStorePersistsRuntimeReplacementWithoutDeletingHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PersistRuntimeReplacement(): %v", err)
 	}
+	replayedReplacement, err := store.PersistRuntimeReplacement(ctx, "operation-replace", "user-1", replacing.Snapshot().Version, retired.Snapshot(), reservation)
+	if err != nil || replayedReplacement.ID != replacement.ID || !replayedReplacement.CreatedAt.Equal(replacement.CreatedAt) {
+		t.Fatalf("PersistRuntimeReplacement(commit-then-lost-response replay) = %#v/%v", replayedReplacement, err)
+	}
+	inventory := dbstore.RuntimeProviderResourceInventory{
+		RuntimeID: "runtime-2", RuntimeResourceID: "resource-runtime-2", SystemVolumeResourceID: "resource-system-2",
+		RuntimeProviderID: "i-runtime-2", SystemVolumeProviderID: "volume-system-2", Provider: "aws", CreatedAt: reservation.CreatedAt,
+	}
+	if err := store.InventoryReplacementRuntimeResources(ctx, "operation-replace", inventory); err != nil {
+		t.Fatalf("InventoryReplacementRuntimeResources(): %v", err)
+	}
+	if err := store.InventoryReplacementRuntimeResources(ctx, "operation-replace", inventory); err != nil {
+		t.Fatalf("InventoryReplacementRuntimeResources(commit-then-lost-response replay): %v", err)
+	}
 	reserved, err := domain.RestoreRuntime(replacement)
 	if err != nil {
 		t.Fatal(err)
@@ -194,8 +223,11 @@ func TestStorePersistsRuntimeReplacementWithoutDeletingHistory(t *testing.T) {
 	if err := store.PersistReplacementRuntimeTransition(ctx, "operation-replace", replacement.Version, provisioned.Snapshot()); err != nil {
 		t.Fatalf("PersistReplacementRuntimeTransition(): %v", err)
 	}
+	if err := store.PersistReplacementRuntimeTransition(ctx, "operation-replace", replacement.Version, provisioned.Snapshot()); err != nil {
+		t.Fatalf("PersistReplacementRuntimeTransition(commit-then-lost-response replay): %v", err)
+	}
 	var currentRuntimeID, oldStatus, newStatus string
-	var runtimeRows, providerRows int
+	var runtimeRows, providerRows, retiredProviderRows int
 	if err := pool.QueryRow(ctx, `SELECT current_runtime_id FROM environments WHERE id = 'environment-1'`).Scan(&currentRuntimeID); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +243,16 @@ func TestStorePersistsRuntimeReplacementWithoutDeletingHistory(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM provider_resources WHERE environment_id = 'environment-1'`).Scan(&providerRows); err != nil {
 		t.Fatal(err)
 	}
-	if currentRuntimeID != "runtime-2" || oldStatus != string(domain.RuntimeAbsent) || newStatus != string(domain.RuntimeProvisioning) || runtimeRows != 2 || providerRows != 1 {
-		t.Fatalf("replacement persistence = current:%q old:%q new:%q Runtime rows:%d Provider Resource rows:%d", currentRuntimeID, oldStatus, newStatus, runtimeRows, providerRows)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM provider_resources WHERE runtime_id = 'runtime-1' AND deleted_at = $1`, retiredAt).Scan(&retiredProviderRows); err != nil {
+		t.Fatal(err)
+	}
+	if currentRuntimeID != "runtime-2" || oldStatus != string(domain.RuntimeAbsent) || newStatus != string(domain.RuntimeProvisioning) || runtimeRows != 2 || providerRows != 5 || retiredProviderRows != 2 {
+		t.Fatalf("replacement persistence = current:%q old:%q new:%q Runtime rows:%d Provider Resource rows:%d retired Provider Resource rows:%d", currentRuntimeID, oldStatus, newStatus, runtimeRows, providerRows, retiredProviderRows)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE environments SET health = 'degraded' WHERE id = 'environment-1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.VerifyRuntimeDataVolumeOwnership(ctx, "user-1", "environment-1", "volume-1"); err != nil {
+		t.Fatalf("healthy durable State Components in degraded Environment must pass verification: %v", err)
 	}
 }

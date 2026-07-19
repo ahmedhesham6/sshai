@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ahmedhesham6/sshai/libs/provider"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,6 +42,10 @@ func (adapter *Provider) EnsureRuntime(ctx context.Context, request provider.Ens
 		observation, err := runtimeObservation(request.RuntimeSpec, instance)
 		if err != nil || observation.State == provider.RuntimeStateTerminated {
 			return observation, err
+		}
+		observation, err = adapter.withSystemVolumeIdentity(ctx, observation)
+		if err != nil {
+			return provider.Runtime{}, err
 		}
 		if err := adapter.validateSoleActiveRuntime(ctx, request.EnvironmentID, observation.ProviderID); err != nil {
 			return provider.Runtime{}, err
@@ -82,7 +87,60 @@ func (adapter *Provider) EnsureRuntime(ctx context.Context, request provider.Ens
 	if err := adapter.ensureDataVolumeAttachment(ctx, request.DataVolumeProviderID, instance, volume); err != nil {
 		return provider.Runtime{}, err
 	}
-	return runtimeObservation(request.RuntimeSpec, instance)
+	observation, err := runtimeObservation(request.RuntimeSpec, instance)
+	if err != nil {
+		return provider.Runtime{}, err
+	}
+	return adapter.withSystemVolumeIdentity(ctx, observation)
+}
+
+func (adapter *Provider) withSystemVolumeIdentity(ctx context.Context, observation provider.Runtime) (provider.Runtime, error) {
+	if observation.SystemVolumeProviderID != "" {
+		return observation, nil
+	}
+	input := &ec2.DescribeVolumesInput{Filters: []types.Filter{
+		{Name: aws.String("tag:" + tagRuntimeID), Values: []string{observation.RuntimeID}},
+		{Name: aws.String("tag:" + tagResource), Values: []string{systemVolumeResource}},
+	}}
+	var volumes []types.Volume
+	for {
+		output, err := adapter.client.DescribeVolumes(ctx, input)
+		if err != nil {
+			return provider.Runtime{}, containError("describe Runtime system volume", err)
+		}
+		volumes = append(volumes, output.Volumes...)
+		if output.NextToken == nil || aws.ToString(output.NextToken) == "" {
+			break
+		}
+		input.NextToken = output.NextToken
+	}
+	if len(volumes) == 0 {
+		return provider.Runtime{}, provider.NewError(provider.ErrorCodeUnavailable, "Runtime system volume identity is not observable yet", nil)
+	}
+	if len(volumes) != 1 {
+		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Runtime system volume identity is not unique", nil)
+	}
+	volume := volumes[0]
+	tags := tagValues(volume.Tags)
+	wantTags := map[string]string{
+		tagEnvironment: adapter.environment, tagEnvironmentID: observation.EnvironmentID,
+		tagManagedBy: managedByValue, tagRegion: observation.Region, tagResource: systemVolumeResource,
+		tagRuntimeID: observation.RuntimeID, tagRuntimeSequence: strconv.FormatInt(observation.Sequence, 10),
+		tagRuntimePreset: observation.RuntimePreset, tagImageVersion: observation.ImageVersion,
+		tagDataVolumeID: observation.DataVolumeProviderID,
+	}
+	for key, value := range wantTags {
+		if tags[key] != value {
+			return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, fmt.Sprintf("Runtime system volume ownership tag %q diverged", key), nil)
+		}
+	}
+	providerID := aws.ToString(volume.VolumeId)
+	if tags[tagOperationID] == "" || providerID == "" || aws.ToString(volume.AvailabilityZone) != observation.AvailabilityZone ||
+		!aws.ToBool(volume.Encrypted) || volume.VolumeType != types.VolumeTypeGp3 || aws.ToInt32(volume.Size) != adapter.runtime.SystemVolumeGiB {
+		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Runtime system volume configuration diverged", nil)
+	}
+	observation.SystemVolumeProviderID = providerID
+	return observation, nil
 }
 
 func (adapter *Provider) StartRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
@@ -139,6 +197,11 @@ func (adapter *Provider) RetireRuntime(ctx context.Context, request provider.Run
 	if observation.State == provider.RuntimeStateTerminated {
 		return observation, nil
 	}
+	if observation.State == provider.RuntimeStateStopping {
+		// Termination was already accepted. The workflow's shared durable-deadline
+		// poller owns the remaining wait to terminated.
+		return observation, nil
+	}
 	if observation.State != provider.RuntimeStateStopped {
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeInvalidRequest, "Runtime must be stopped before retirement", nil)
 	}
@@ -149,11 +212,59 @@ func (adapter *Provider) RetireRuntime(ctx context.Context, request provider.Run
 	switch len(volume.Attachments) {
 	case 0:
 	case 1:
-		if aws.ToString(volume.Attachments[0].InstanceId) != request.ProviderID {
+		attachment := volume.Attachments[0]
+		if aws.ToString(attachment.InstanceId) != request.ProviderID {
 			return provider.Runtime{}, provider.NewError(provider.ErrorCodePlacementConflict, "Data Volume is attached to another Runtime", nil)
 		}
-		if _, err := adapter.client.DetachVolume(ctx, &ec2.DetachVolumeInput{InstanceId: aws.String(request.ProviderID), VolumeId: aws.String(request.DataVolumeProviderID)}); err != nil {
-			return provider.Runtime{}, containError("detach Data Volume", err)
+		if attachment.State != types.VolumeAttachmentStateAttached && attachment.State != types.VolumeAttachmentStateDetaching {
+			return provider.Runtime{}, provider.NewError(provider.ErrorCodeUnavailable, "Data Volume attachment is not ready for retirement", nil)
+		}
+		if aws.ToBool(attachment.DeleteOnTermination) {
+			if attachment.State == types.VolumeAttachmentStateDetaching {
+				return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "detaching Data Volume attachment is still configured for deletion", nil)
+			}
+			if _, err := adapter.client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+				InstanceId: aws.String(request.ProviderID),
+				BlockDeviceMappings: []types.InstanceBlockDeviceMappingSpecification{{
+					DeviceName: attachment.Device,
+					Ebs: &types.EbsInstanceBlockDeviceSpecification{
+						DeleteOnTermination: aws.Bool(false), VolumeId: aws.String(request.DataVolumeProviderID),
+					},
+				}},
+			}); err != nil {
+				return provider.Runtime{}, containError("make Data Volume attachment persistent", err)
+			}
+			if err := adapter.waitForDataVolumeAttachment(ctx, request, func(attachments []types.VolumeAttachment) (bool, error) {
+				if len(attachments) != 1 {
+					return false, nil
+				}
+				if aws.ToString(attachments[0].InstanceId) != request.ProviderID {
+					return false, provider.NewError(provider.ErrorCodePlacementConflict, "Data Volume is attached to another Runtime", nil)
+				}
+				return !aws.ToBool(attachments[0].DeleteOnTermination), nil
+			}, "Data Volume attachment did not become persistent before retirement"); err != nil {
+				return provider.Runtime{}, err
+			}
+		}
+		if attachment.State == types.VolumeAttachmentStateAttached {
+			if _, err := adapter.client.DetachVolume(ctx, &ec2.DetachVolumeInput{InstanceId: aws.String(request.ProviderID), VolumeId: aws.String(request.DataVolumeProviderID)}); err != nil {
+				return provider.Runtime{}, containError("detach Data Volume", err)
+			}
+		}
+		if err := adapter.waitForDataVolumeAttachment(ctx, request, func(attachments []types.VolumeAttachment) (bool, error) {
+			switch len(attachments) {
+			case 0:
+				return true, nil
+			case 1:
+				if aws.ToString(attachments[0].InstanceId) != request.ProviderID {
+					return false, provider.NewError(provider.ErrorCodePlacementConflict, "Data Volume is attached to another Runtime", nil)
+				}
+				return false, nil
+			default:
+				return false, provider.NewError(provider.ErrorCodeResourceDiverged, "Data Volume has multiple attachments", nil)
+			}
+		}, "Data Volume remained attached during retirement"); err != nil {
+			return provider.Runtime{}, err
 		}
 	default:
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "Data Volume has multiple attachments", nil)
@@ -162,6 +273,50 @@ func (adapter *Provider) RetireRuntime(ctx context.Context, request provider.Run
 		return provider.Runtime{}, containError("retire Runtime", err)
 	}
 	return adapter.ObserveRuntime(ctx, request)
+}
+
+func (adapter *Provider) waitForDataVolumeAttachment(
+	ctx context.Context,
+	request provider.RuntimeLifecycleRequest,
+	ready func([]types.VolumeAttachment) (bool, error),
+	timeoutMessage string,
+) error {
+	interval := adapter.runtimePollInterval
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	timeout := adapter.runtimePollTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		volume, err := adapter.dataVolume(pollCtx, request.RuntimeSpec)
+		if err != nil {
+			if pollCtx.Err() != nil && ctx.Err() == nil {
+				return provider.NewError(provider.ErrorCodeResourceDiverged, timeoutMessage, pollCtx.Err())
+			}
+			return err
+		}
+		complete, err := ready(volume.Attachments)
+		if err != nil {
+			return err
+		}
+		if complete {
+			return nil
+		}
+		select {
+		case <-pollCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return provider.NewError(provider.ErrorCodeResourceDiverged, timeoutMessage, pollCtx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func (adapter *Provider) ObserveRuntime(ctx context.Context, request provider.RuntimeLifecycleRequest) (provider.Runtime, error) {
@@ -415,7 +570,15 @@ func runtimeObservation(spec provider.RuntimeSpec, instance types.Instance) (pro
 			return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "running Runtime has no private IPv4 route", nil)
 		}
 	}
+	systemVolumeProviderID := ""
+	for _, mapping := range instance.BlockDeviceMappings {
+		if aws.ToString(mapping.DeviceName) == "/dev/sda1" && mapping.Ebs != nil {
+			systemVolumeProviderID = aws.ToString(mapping.Ebs.VolumeId)
+			break
+		}
+	}
 	return provider.Runtime{
-		RuntimeSpec: spec, ProviderID: providerID, PrivateIPv4: privateIPv4, State: state,
+		RuntimeSpec: spec, Provider: "aws", ProviderID: providerID, SystemVolumeProviderID: systemVolumeProviderID,
+		PrivateIPv4: privateIPv4, State: state,
 	}, nil
 }

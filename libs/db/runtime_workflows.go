@@ -20,6 +20,16 @@ type RuntimeWorkflowState struct {
 	ComputeUsageIntervalID string
 }
 
+type RuntimeProviderResourceInventory struct {
+	RuntimeID              string
+	RuntimeResourceID      string
+	SystemVolumeResourceID string
+	RuntimeProviderID      string
+	SystemVolumeProviderID string
+	Provider               string
+	CreatedAt              time.Time
+}
+
 var ErrRuntimeDataUnhealthy = permanent(errors.New("Runtime persistent data is not healthy"))
 
 func (store *Store) LoadRuntimeWorkflowOperation(ctx context.Context, input domain.RuntimeOperationDispatch, invocationID string, at time.Time) (RuntimeWorkflowState, error) {
@@ -143,7 +153,35 @@ func (store *Store) PersistRuntimeWorkflowTransition(ctx context.Context, operat
 		return fmt.Errorf("persist Runtime transition: %w", err)
 	}
 	if result.RowsAffected() != 1 {
-		return permanent(domain.ErrStaleRuntimeObservation)
+		tx, beginErr := store.pool.Begin(ctx)
+		if beginErr != nil {
+			return fmt.Errorf("persist Runtime transition: begin replay: %w", beginErr)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var targetEnvironmentID, targetRuntimeID string
+		if queryErr := tx.QueryRow(ctx, `
+			SELECT environment_id, runtime_id
+			FROM runtime_operation_targets
+			WHERE operation_id = $1`, operationID).Scan(&targetEnvironmentID, &targetRuntimeID); queryErr != nil {
+			if errors.Is(queryErr, pgx.ErrNoRows) {
+				return permanent(domain.ErrStaleRuntimeObservation)
+			}
+			return fmt.Errorf("persist Runtime transition: load replay owner: %w", queryErr)
+		}
+		stored, loadErr := loadInitialRuntime(ctx, store.queries.WithTx(tx), next.EnvironmentID, next.ID)
+		if loadErr != nil {
+			if errors.Is(loadErr, ErrInitialRuntimeConflict) {
+				return permanent(domain.ErrStaleRuntimeObservation)
+			}
+			return loadErr
+		}
+		if targetEnvironmentID != next.EnvironmentID || targetRuntimeID != next.ID || !samePersistedRuntimeSnapshot(stored.Snapshot(), next) {
+			return permanent(domain.ErrStaleRuntimeObservation)
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return fmt.Errorf("persist Runtime transition: commit replay: %w", commitErr)
+		}
+		return nil
 	}
 	return nil
 }
@@ -219,7 +257,7 @@ func (store *Store) PersistRuntimeReplacement(ctx context.Context, operationID, 
 		if loadErr != nil {
 			return domain.RuntimeSnapshot{}, loadErr
 		}
-		if storedOld.Snapshot().Status != domain.RuntimeAbsent || storedOld.Snapshot().RetiredAt == nil || !sameRuntimeReservation(storedReplacement.Snapshot(), reservation) {
+		if !samePersistedRuntimeSnapshot(storedOld.Snapshot(), retired) || !sameRuntimeReservation(storedReplacement.Snapshot(), reservation) {
 			return domain.RuntimeSnapshot{}, permanent(ErrInitialRuntimeConflict)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -236,6 +274,14 @@ func (store *Store) PersistRuntimeReplacement(ctx context.Context, operationID, 
 	}
 	if err := persistRuntimeTransitionTx(ctx, tx, operationID, expectedVersion, retired); err != nil {
 		return domain.RuntimeSnapshot{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE provider_resources
+		SET deleted_at = $3
+		WHERE environment_id = $1 AND runtime_id = $2
+		  AND resource_type IN ('runtime', 'system_volume')
+		  AND deleted_at IS NULL`, retired.EnvironmentID, retired.ID, retired.RetiredAt); err != nil {
+		return domain.RuntimeSnapshot{}, fmt.Errorf("persist Runtime replacement: retire Provider Resources: %w", err)
 	}
 	replacement := replacementRuntime.Snapshot()
 	if err := queries.InsertInitialRuntime(ctx, dbsql.InsertInitialRuntimeParams{
@@ -292,7 +338,113 @@ func (store *Store) PersistReplacementRuntimeTransition(ctx context.Context, ope
 		return fmt.Errorf("persist replacement Runtime transition: %w", err)
 	}
 	if result.RowsAffected() != 1 {
-		return permanent(domain.ErrStaleRuntimeObservation)
+		tx, beginErr := store.pool.Begin(ctx)
+		if beginErr != nil {
+			return fmt.Errorf("persist replacement Runtime transition: begin replay: %w", beginErr)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var currentRuntimeID string
+		if queryErr := tx.QueryRow(ctx, `
+			SELECT environment.current_runtime_id
+			FROM runtime_operation_targets target
+			JOIN environments environment ON environment.id = target.environment_id
+			WHERE target.operation_id = $1 AND target.environment_id = $2
+			FOR UPDATE OF environment`, operationID, next.EnvironmentID).Scan(&currentRuntimeID); queryErr != nil {
+			if errors.Is(queryErr, pgx.ErrNoRows) {
+				return permanent(domain.ErrStaleRuntimeObservation)
+			}
+			return fmt.Errorf("persist replacement Runtime transition: load replay owner: %w", queryErr)
+		}
+		stored, loadErr := loadInitialRuntime(ctx, store.queries.WithTx(tx), next.EnvironmentID, next.ID)
+		if loadErr != nil {
+			if errors.Is(loadErr, ErrInitialRuntimeConflict) {
+				return permanent(domain.ErrStaleRuntimeObservation)
+			}
+			return loadErr
+		}
+		if currentRuntimeID != next.ID || !samePersistedRuntimeSnapshot(stored.Snapshot(), next) {
+			return permanent(domain.ErrStaleRuntimeObservation)
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return fmt.Errorf("persist replacement Runtime transition: commit replay: %w", commitErr)
+		}
+		return nil
+	}
+	return nil
+}
+
+func (store *Store) InventoryReplacementRuntimeResources(ctx context.Context, operationID string, inventory RuntimeProviderResourceInventory) error {
+	if operationID == "" || inventory.RuntimeID == "" || inventory.RuntimeResourceID == "" || inventory.SystemVolumeResourceID == "" ||
+		inventory.RuntimeProviderID == "" || inventory.SystemVolumeProviderID == "" || inventory.Provider == "" || inventory.CreatedAt.IsZero() {
+		return permanent(errors.New("inventory replacement Runtime resources: complete durable and provider identities are required"))
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("inventory replacement Runtime resources: begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var environmentID, region, operationType string
+	if err := tx.QueryRow(ctx, `
+		SELECT runtime.environment_id, runtime.region, operation.type
+		FROM operations operation
+		JOIN runtime_operation_targets target ON target.operation_id = operation.id
+		JOIN environments environment ON environment.id = target.environment_id
+		JOIN runtimes runtime ON runtime.environment_id = environment.id
+		WHERE operation.id = $1 AND operation.status = 'running'
+		  AND operation.type IN ('runtime.start', 'runtime.replace')
+		  AND environment.current_runtime_id = runtime.id AND runtime.id = $2
+		FOR UPDATE OF environment, runtime`, operationID, inventory.RuntimeID).Scan(&environmentID, &region, &operationType); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return permanent(ErrReferenceNotOwned)
+		}
+		return fmt.Errorf("inventory replacement Runtime resources: lock owner: %w", err)
+	}
+	resources := []struct {
+		id, resourceType, providerID string
+	}{
+		{inventory.RuntimeResourceID, "runtime", inventory.RuntimeProviderID},
+		{inventory.SystemVolumeResourceID, "system_volume", inventory.SystemVolumeProviderID},
+	}
+	for _, resource := range resources {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO provider_resources (
+				id, environment_id, runtime_id, operation_id, operation_type,
+				provider, region, resource_type, provider_id, metadata, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb, $10)
+			ON CONFLICT (id) DO NOTHING`, resource.id, environmentID, inventory.RuntimeID,
+			operationID, operationType, inventory.Provider, region, resource.resourceType,
+			resource.providerID, inventory.CreatedAt); err != nil {
+			return classifyRepositoryError(fmt.Errorf("inventory replacement Runtime resources: insert %s: %w", resource.resourceType, err))
+		}
+		var storedEnvironmentID, storedRuntimeID, storedOperationID, storedOperationType, storedProvider, storedRegion, storedType, storedProviderID string
+		var storedCreatedAt time.Time
+		if err := tx.QueryRow(ctx, `
+			SELECT environment_id, runtime_id, operation_id, operation_type, provider,
+			       region, resource_type, provider_id, created_at
+			FROM provider_resources WHERE id = $1`, resource.id).Scan(
+			&storedEnvironmentID, &storedRuntimeID, &storedOperationID, &storedOperationType,
+			&storedProvider, &storedRegion, &storedType, &storedProviderID, &storedCreatedAt,
+		); err != nil {
+			return fmt.Errorf("inventory replacement Runtime resources: read replay: %w", err)
+		}
+		if storedEnvironmentID != environmentID || storedRuntimeID != inventory.RuntimeID || storedOperationID != operationID ||
+			storedOperationType != operationType || storedProvider != inventory.Provider || storedRegion != region ||
+			storedType != resource.resourceType || storedProviderID != resource.providerID || !databaseTimeEqual(storedCreatedAt, inventory.CreatedAt) {
+			return permanent(ErrIdempotencyConflict)
+		}
+	}
+	result, err := tx.Exec(ctx, `
+		UPDATE runtimes SET provider_resource_id = $3
+		WHERE id = $1 AND environment_id = $2
+		  AND (provider_resource_id IS NULL OR provider_resource_id = $3)`, inventory.RuntimeID, environmentID, inventory.RuntimeResourceID)
+	if err != nil {
+		return fmt.Errorf("inventory replacement Runtime resources: link Runtime: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return permanent(ErrIdempotencyConflict)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return classifyRepositoryError(fmt.Errorf("inventory replacement Runtime resources: commit: %w", err))
 	}
 	return nil
 }
@@ -419,7 +571,6 @@ func (store *Store) VerifyRuntimeDataVolumeOwnership(ctx context.Context, ownerI
 		FROM environments environment
 		JOIN provider_resources resource ON resource.environment_id = environment.id
 		WHERE environment.id = $1 AND environment.owner_user_id = $2
-		  AND environment.health = 'healthy'
 		  AND resource.resource_type = 'data_volume'
 		  AND resource.provider_id = $3 AND resource.deleted_at IS NULL
 		  AND NOT EXISTS (
@@ -438,4 +589,26 @@ func (store *Store) VerifyRuntimeDataVolumeOwnership(ctx context.Context, ownerI
 		return ErrRuntimeDataUnhealthy
 	}
 	return nil
+}
+
+func databaseTimeEqual(first, second time.Time) bool {
+	return first.UTC().Truncate(time.Microsecond).Equal(second.UTC().Truncate(time.Microsecond))
+}
+
+func samePersistedRuntimeSnapshot(first, second domain.RuntimeSnapshot) bool {
+	return first.ID == second.ID && first.EnvironmentID == second.EnvironmentID && first.Sequence == second.Sequence &&
+		first.Status == second.Status && first.RuntimePreset == second.RuntimePreset && first.Region == second.Region &&
+		first.AvailabilityZone == second.AvailabilityZone && first.ImageVersion == second.ImageVersion &&
+		sameOptionalString(first.ProviderInstanceRef, second.ProviderInstanceRef) && sameOptionalString(first.PrivateAddress, second.PrivateAddress) &&
+		sameOptionalString(first.BootID, second.BootID) && sameOptionalTime(first.StartedAt, second.StartedAt) &&
+		sameOptionalTime(first.StoppedAt, second.StoppedAt) && sameOptionalTime(first.RetiredAt, second.RetiredAt) &&
+		databaseTimeEqual(first.CreatedAt, second.CreatedAt) && databaseTimeEqual(first.UpdatedAt, second.UpdatedAt) && first.Version == second.Version
+}
+
+func sameOptionalString(first, second *string) bool {
+	return (first == nil && second == nil) || (first != nil && second != nil && *first == *second)
+}
+
+func sameOptionalTime(first, second *time.Time) bool {
+	return (first == nil && second == nil) || (first != nil && second != nil && databaseTimeEqual(*first, *second))
 }

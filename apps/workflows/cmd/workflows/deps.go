@@ -235,6 +235,10 @@ func (actions *runtimeWorkflowActions) PersistRuntimeReplacement(ctx context.Con
 	return actions.store.PersistRuntimeReplacement(ctx, operationID, ownerUserID, expectedVersion, retired, reservation)
 }
 
+func (actions *runtimeWorkflowActions) InventoryReplacementRuntimeResources(ctx context.Context, operationID string, inventory db.RuntimeProviderResourceInventory) error {
+	return actions.store.InventoryReplacementRuntimeResources(ctx, operationID, inventory)
+}
+
 func (actions *runtimeWorkflowActions) PersistReplacementRuntimeTransition(ctx context.Context, operationID string, expectedVersion int64, next domain.RuntimeSnapshot) error {
 	return actions.store.PersistReplacementRuntimeTransition(ctx, operationID, expectedVersion, next)
 }

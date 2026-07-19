@@ -37,6 +37,13 @@ type RuntimeReplaceOutput struct {
 
 type runtimeReplaceWorkflow struct{ dependencies RuntimeReplaceDependencies }
 
+type runtimeReplacementIdentity struct {
+	RuntimeID              string    `json:"runtimeId"`
+	RuntimeResourceID      string    `json:"runtimeResourceId"`
+	SystemVolumeResourceID string    `json:"systemVolumeResourceId"`
+	CreatedAt              time.Time `json:"createdAt"`
+}
+
 func RuntimeReplaceDefinition(dependencies RuntimeReplaceDependencies) restate.ServiceDefinition {
 	workflow := &runtimeReplaceWorkflow{dependencies: dependencies}
 	return restate.NewWorkflow(RuntimeReplaceService).Handler(RunHandler, restate.NewWorkflowHandler(workflow.Run))
@@ -93,7 +100,11 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 	if err != nil {
 		return RuntimeReplaceOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeReplaceFailed, err.Error(), dependencies.Now)
 	}
-	replacing, err := old.BeginReplacement(dependencies.Now())
+	replacementRequestedAt, err := durableWorkflowTime(ctx, "record-runtime-replacement-requested-at", dependencies.Now)
+	if err != nil {
+		return RuntimeReplaceOutput{}, err
+	}
+	replacing, err := old.BeginReplacement(replacementRequestedAt)
 	if err != nil {
 		return RuntimeReplaceOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeReplaceFailed, err.Error(), dependencies.Now)
 	}
@@ -210,16 +221,19 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 
 	// Step 5 and record-retention half of step 9: reserve a fresh sequence in
 	// the same placement and atomically retire/switch rows without deleting history.
-	replacementID, err := restate.Run(ctx, func(restate.RunContext) (string, error) {
-		return dependencies.IDs.NewID(), nil
+	identity, err := restate.Run(ctx, func(restate.RunContext) (runtimeReplacementIdentity, error) {
+		return runtimeReplacementIdentity{
+			RuntimeID: dependencies.IDs.NewID(), RuntimeResourceID: dependencies.IDs.NewID(),
+			SystemVolumeResourceID: dependencies.IDs.NewID(), CreatedAt: dependencies.Now(),
+		}, nil
 	}, restate.WithName("reserve-replacement-runtime-identity"))
 	if err != nil {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, RuntimeReplaceFailed, err.Error())
 	}
 	reservation := domain.RuntimeReservation{
-		ID: replacementID, EnvironmentID: input.EnvironmentID, Sequence: state.Runtime.Sequence + 1,
+		ID: identity.RuntimeID, EnvironmentID: input.EnvironmentID, Sequence: state.Runtime.Sequence + 1,
 		RuntimePreset: state.Runtime.RuntimePreset, Region: state.Runtime.Region,
-		AvailabilityZone: state.Runtime.AvailabilityZone, ImageVersion: image, CreatedAt: dependencies.Now(),
+		AvailabilityZone: state.Runtime.AvailabilityZone, ImageVersion: image, CreatedAt: identity.CreatedAt,
 	}
 	replacement, err := restate.Run(ctx, func(runCtx restate.RunContext) (domain.RuntimeSnapshot, error) {
 		next, persistErr := dependencies.Actions.PersistRuntimeReplacement(runCtx, input.OperationID, input.OwnerUserID, state.Runtime.Version, retired.Snapshot(), reservation)
@@ -248,11 +262,21 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 	if ensured.Failure != "" {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, ensured.FailureCode, ensured.Failure)
 	}
-	if ensured.Runtime.RuntimeSpec != ensureRequest.RuntimeSpec || ensured.Runtime.ProviderID == "" {
+	if ensured.Runtime.RuntimeSpec != ensureRequest.RuntimeSpec || ensured.Runtime.Provider == "" || ensured.Runtime.ProviderID == "" || ensured.Runtime.SystemVolumeProviderID == "" {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, string(provider.ErrorCodeResourceDiverged), "replacement Runtime provider identity diverged")
 	}
 	if ensured.Runtime.State != provider.RuntimeStatePending && ensured.Runtime.State != provider.RuntimeStateRunning {
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, string(provider.ErrorCodeResourceDiverged), fmt.Sprintf("replacement Runtime provider state is %q", ensured.Runtime.State))
+	}
+	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
+		return classifyDurableError(dependencies.Actions.InventoryReplacementRuntimeResources(runCtx, input.OperationID, dbstore.RuntimeProviderResourceInventory{
+			RuntimeID: replacement.ID, RuntimeResourceID: identity.RuntimeResourceID,
+			SystemVolumeResourceID: identity.SystemVolumeResourceID,
+			RuntimeProviderID:      ensured.Runtime.ProviderID, SystemVolumeProviderID: ensured.Runtime.SystemVolumeProviderID,
+			Provider: ensured.Runtime.Provider, CreatedAt: identity.CreatedAt,
+		}))
+	}, restate.WithName("inventory-replacement-provider-resources")); err != nil {
+		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, RuntimeReplaceFailed, err.Error())
 	}
 	next, err := domain.RestoreRuntime(replacement)
 	if err != nil {
@@ -267,7 +291,11 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 		return RuntimeReplaceOutput{}, failRuntimeReplacement(ctx, dependencies, input.OperationID, RuntimeReplaceFailed, err.Error())
 	}
 	next, _ = domain.RestoreRuntime(replacement)
-	starting, err := next.BeginStart(dependencies.Now())
+	startRequestedAt, err := durableWorkflowTime(ctx, "record-replacement-start-requested-at", dependencies.Now)
+	if err != nil {
+		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, RuntimeReplaceFailed, err.Error())
+	}
+	starting, err := next.BeginStart(startRequestedAt)
 	if err != nil {
 		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, RuntimeReplaceFailed, err.Error())
 	}
@@ -340,7 +368,11 @@ func fulfillRuntimeReplacement(ctx restate.WorkflowContext, dependencies Runtime
 		}
 	}
 	next, _ = domain.RestoreRuntime(replacement)
-	markedReady, err := next.MarkReady(domain.RuntimeReadinessObservation{ProviderInstanceRef: request.ProviderID, BootID: ready.BootID, PrivateAddress: ready.PrivateIPv4, ExpectedVersion: replacement.Version, ObservedAt: dependencies.Now()})
+	readyObservedAt, err := durableWorkflowTime(ctx, "record-replacement-ready-observed-at", dependencies.Now)
+	if err != nil {
+		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, RuntimeReplaceFailed, err.Error())
+	}
+	markedReady, err := next.MarkReady(domain.RuntimeReadinessObservation{ProviderInstanceRef: request.ProviderID, BootID: ready.BootID, PrivateAddress: ready.PrivateIPv4, ExpectedVersion: replacement.Version, ObservedAt: readyObservedAt})
 	if err != nil {
 		return RuntimeReplaceOutput{}, failReplacementRuntimeAndOperation(ctx, dependencies, input.OperationID, replacement, RuntimeReplaceFailed, err.Error())
 	}
@@ -452,6 +484,10 @@ func persistReplacementRuntimeTransition(ctx restate.WorkflowContext, actions Ru
 	}, restate.WithName(name))
 }
 
+func durableWorkflowTime(ctx restate.WorkflowContext, name string, now func() time.Time) (time.Time, error) {
+	return restate.Run(ctx, func(restate.RunContext) (time.Time, error) { return now(), nil }, restate.WithName(name))
+}
+
 func failRuntimeReplacement(ctx restate.WorkflowContext, dependencies RuntimeReplaceDependencies, operationID, code, message string) error {
 	return failRuntimeOperation(ctx, dependencies.Actions, operationID, code, message, dependencies.Now)
 }
@@ -459,7 +495,11 @@ func failRuntimeReplacement(ctx restate.WorkflowContext, dependencies RuntimeRep
 func failReplacementRuntimeAndOperation(ctx restate.WorkflowContext, dependencies RuntimeReplaceDependencies, operationID string, current domain.RuntimeSnapshot, code, message string) error {
 	runtime, err := domain.RestoreRuntime(current)
 	if err == nil && current.ProviderInstanceRef != nil && current.Status != domain.RuntimeError {
-		failed, markErr := runtime.MarkError(domain.RuntimeStateObservation{ProviderInstanceRef: *current.ProviderInstanceRef, ExpectedVersion: current.Version, ObservedAt: dependencies.Now()})
+		failureObservedAt, timeErr := durableWorkflowTime(ctx, "record-replacement-failure-observed-at", dependencies.Now)
+		if timeErr != nil {
+			return timeErr
+		}
+		failed, markErr := runtime.MarkError(domain.RuntimeStateObservation{ProviderInstanceRef: *current.ProviderInstanceRef, ExpectedVersion: current.Version, ObservedAt: failureObservedAt})
 		if markErr == nil {
 			if _, persistErr := persistReplacementRuntimeTransition(ctx, dependencies.Actions, operationID, "mark-replacement-runtime-error", current, failed); persistErr != nil {
 				return persistErr

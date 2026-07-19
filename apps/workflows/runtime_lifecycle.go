@@ -59,6 +59,7 @@ type RuntimeStopActions interface {
 type RuntimeReplaceActions interface {
 	RuntimeLifecycleActions
 	PersistRuntimeReplacement(context.Context, string, string, int64, domain.RuntimeSnapshot, domain.RuntimeReservation) (domain.RuntimeSnapshot, error)
+	InventoryReplacementRuntimeResources(context.Context, string, dbstore.RuntimeProviderResourceInventory) error
 	PersistReplacementRuntimeTransition(context.Context, string, int64, domain.RuntimeSnapshot) error
 }
 
