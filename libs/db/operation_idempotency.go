@@ -7,7 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const operationIdempotencyLockNamespace = "runtime-operation"
+const operationIdempotencyLockNamespace = "user-operation-idempotency"
 
 func lockOperationIdempotencyKey(ctx context.Context, tx pgx.Tx, ownerID, idempotencyKey string) error {
 	if _, err := tx.Exec(ctx, `

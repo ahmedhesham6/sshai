@@ -32,18 +32,22 @@ func (store *Store) ReserveEnvironmentCreation(ctx context.Context, candidate do
 	environment := candidate.Environment().Snapshot()
 	operation := candidate.Operation().Snapshot()
 	ownerID, idempotencyKey := environment.OwnerUserID, operation.IdempotencyKey
-	if _, err := queries.LockEnvironmentCreation(ctx, dbsql.LockEnvironmentCreationParams{
-		OwnerUserID: &ownerID, IdempotencyKey: &idempotencyKey,
-	}); err != nil {
+	if err := lockOperationIdempotencyKey(ctx, tx, ownerID, idempotencyKey); err != nil {
 		return domain.EnvironmentCreation{}, fmt.Errorf("reserve Environment creation: lock idempotency key: %w", err)
 	}
 
-	existing, err := queries.GetEnvironmentCreationByKey(ctx, dbsql.GetEnvironmentCreationByKeyParams{
+	existingOperation, err := queries.GetOperationByIdempotencyKey(ctx, dbsql.GetOperationByIdempotencyKeyParams{
 		OwnerUserID: ownerID, IdempotencyKey: idempotencyKey,
 	})
 	if err == nil {
-		if !sameJSON(existing.OperationInput, operation.Input) {
+		if existingOperation.Type != string(domain.OperationEnvironmentCreate) || !sameJSON(existingOperation.Input, operation.Input) {
 			return domain.EnvironmentCreation{}, ErrIdempotencyConflict
+		}
+		existing, err := queries.GetEnvironmentCreationByKey(ctx, dbsql.GetEnvironmentCreationByKeyParams{
+			OwnerUserID: ownerID, IdempotencyKey: idempotencyKey,
+		})
+		if err != nil {
+			return domain.EnvironmentCreation{}, fmt.Errorf("reserve Environment creation: restore projection: %w", err)
 		}
 		creation, err := restoreEnvironmentCreation(ctx, queries, existing)
 		if err != nil {

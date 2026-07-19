@@ -194,6 +194,51 @@ func TestStoreSerializesConcurrentRuntimeOperationConflicts(t *testing.T) {
 	}
 }
 
+func TestStoreSerializesEnvironmentCreateAndRuntimeOperationIdempotency(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Date(2026, time.July, 19, 14, 0, 0, 0, time.UTC)
+	insertRuntimeOperationState(t, ctx, pool, createdAt.Add(-time.Hour))
+	idempotencyKey := "shared-create-runtime-key-0001"
+	creation := newEnvironmentCreationWithSeed(
+		t, "environment-2", "policy-2", "operation-create", "project-seed-1", "workspace",
+		idempotencyKey, []byte(`{"name":"workspace"}`), createdAt,
+	)
+	runtimeOperation := runtimeOperationCandidate(
+		t, "operation-runtime", "environment-1", domain.OperationRuntimeStart,
+		idempotencyKey, []byte(`{}`), createdAt,
+	)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		_, err := store.ReserveEnvironmentCreation(ctx, creation)
+		results <- err
+	}()
+	go func() {
+		<-start
+		_, err := store.ReserveRuntimeOperation(ctx, runtimeOperation)
+		results <- err
+	}()
+	close(start)
+	first, second := <-results, <-results
+	if !((first == nil && errors.Is(second, dbstore.ErrIdempotencyConflict)) ||
+		(second == nil && errors.Is(first, dbstore.ErrIdempotencyConflict))) {
+		t.Fatalf("concurrent create and Runtime command = %v, %v; want one success and one idempotency conflict", first, second)
+	}
+
+	var operationCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM operations
+		WHERE requested_by_user_id = 'user-1' AND idempotency_key = $1`, idempotencyKey).Scan(&operationCount); err != nil {
+		t.Fatal(err)
+	}
+	if operationCount != 1 {
+		t.Fatalf("Operations with shared idempotency key = %d, want 1", operationCount)
+	}
+}
+
 func TestStoreDoesNotCollapseDistinctLargeJSONIntegers(t *testing.T) {
 	ctx := context.Background()
 	store, pool := openTestStoreAndPool(t, ctx)

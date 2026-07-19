@@ -452,24 +452,6 @@ func (q *Queries) ListPendingEnvironmentCreates(ctx context.Context, limitCount 
 	return items, nil
 }
 
-const lockEnvironmentCreation = `-- name: LockEnvironmentCreation :one
-SELECT pg_advisory_xact_lock(
-    hashtextextended($1 || E'\x1f' || $2, 0)
-)
-`
-
-type LockEnvironmentCreationParams struct {
-	OwnerUserID    *string
-	IdempotencyKey *string
-}
-
-func (q *Queries) LockEnvironmentCreation(ctx context.Context, arg LockEnvironmentCreationParams) (interface{}, error) {
-	row := q.db.QueryRow(ctx, lockEnvironmentCreation, arg.OwnerUserID, arg.IdempotencyKey)
-	var pg_advisory_xact_lock interface{}
-	err := row.Scan(&pg_advisory_xact_lock)
-	return pg_advisory_xact_lock, err
-}
-
 const markEnvironmentCreateOutboxStarted = `-- name: MarkEnvironmentCreateOutboxStarted :execrows
 UPDATE workflow_outbox
 SET started_at = COALESCE(started_at, $1),

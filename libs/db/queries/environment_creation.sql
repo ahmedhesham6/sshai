@@ -1,8 +1,3 @@
--- name: LockEnvironmentCreation :one
-SELECT pg_advisory_xact_lock(
-    hashtextextended(sqlc.arg(owner_user_id) || E'\x1f' || sqlc.arg(idempotency_key), 0)
-);
-
 -- name: GetEnvironmentCreationByKey :one
 SELECT
     e.id AS environment_id,

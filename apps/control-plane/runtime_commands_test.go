@@ -66,6 +66,7 @@ func TestRuntimeCommandHTTPMapsOwnershipAndCommandErrors(t *testing.T) {
 	}{
 		{name: "foreign Environment", missing: true, wantStatus: http.StatusNotFound, wantCode: "ENVIRONMENT_NOT_FOUND"},
 		{name: "active Operation", repository: db.ErrOperationConflict, wantStatus: http.StatusConflict, wantCode: "OPERATION_CONFLICT"},
+		{name: "idempotency key", repository: db.ErrIdempotencyConflict, wantStatus: http.StatusConflict, wantCode: "IDEMPOTENCY_CONFLICT"},
 		{name: "credit policy", repository: application.ErrCreditsPolicyBlocked, wantStatus: http.StatusForbidden, wantCode: "CREDITS_POLICY_BLOCKED"},
 		{name: "invalid Runtime state", repository: domain.ErrRuntimeCommandState, wantStatus: http.StatusUnprocessableEntity, wantCode: "RUNTIME_COMMAND_INVALID_STATE"},
 	} {
