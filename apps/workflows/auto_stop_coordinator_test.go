@@ -161,6 +161,61 @@ func TestAutoStopCoordinatorSuppressesUntilTheRuntimeResumes(t *testing.T) {
 	}
 }
 
+func TestAutoStopCoordinatorResumeStartsNewDispatchCycle(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	policy := mustAutoStopPolicy(t, domain.AutoStopWhenDisconnected, 60)
+	tests := []struct {
+		name                        string
+		observationsWhileSuppressed int
+	}{
+		{name: "stop failed then idle again"},
+		{name: "stop succeeded restart then idle again", observationsWhileSuppressed: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := workflows.AutoStopCoordinator{}
+			started := observe(t, coordinator, workflows.AutoStopCoordinationState{EnvironmentID: "environment-1"}, observation(policy, 1, activity(now, 1)))
+			first := expire(t, coordinator, started.State, workflows.AutoStopExpiry{
+				RuntimeID: "runtime-1", Generation: started.Timer.Generation,
+				Observation: observation(policy, 1, activity(now.Add(time.Minute), 2)),
+			})
+			if first.Stop == nil {
+				t.Fatalf("first dispatch = %#v", first)
+			}
+
+			suppressed, err := coordinator.Suppress(first.State, "runtime-1")
+			if err != nil {
+				t.Fatalf("Suppress(): %v", err)
+			}
+			state := suppressed.State
+			sequence := uint64(3)
+			for range test.observationsWhileSuppressed {
+				ignored := observe(t, coordinator, state, observation(policy, 1, activity(now.Add(time.Duration(sequence)*time.Minute), sequence)))
+				if ignored.Timer != nil {
+					t.Fatalf("suppressed observation scheduled timer: %#v", ignored)
+				}
+				state = ignored.State
+				sequence++
+			}
+			resumed, err := coordinator.Resume(state, "runtime-1")
+			if err != nil {
+				t.Fatalf("Resume(): %v", err)
+			}
+			restarted := observe(t, coordinator, resumed.State, observation(policy, 1, activity(now.Add(time.Duration(sequence)*time.Minute), sequence)))
+			if restarted.Timer == nil || restarted.Timer.Generation <= started.Timer.Generation {
+				t.Fatalf("new dispatch cycle timer = %#v", restarted)
+			}
+			second := expire(t, coordinator, restarted.State, workflows.AutoStopExpiry{
+				RuntimeID: "runtime-1", Generation: restarted.Timer.Generation,
+				Observation: observation(policy, 1, activity(now.Add(time.Duration(sequence+1)*time.Minute), sequence+1)),
+			})
+			if second.Stop == nil || second.Stop.IdempotencyKey == first.Stop.IdempotencyKey {
+				t.Fatalf("second dispatch = %#v; first = %#v", second, first)
+			}
+		})
+	}
+}
+
 func observation(policy domain.AutoStopPolicy, generation uint64, snapshot *domain.AutoStopActivitySnapshot) workflows.AutoStopObservation {
 	processedAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	if snapshot != nil {

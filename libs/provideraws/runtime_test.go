@@ -31,6 +31,11 @@ type acceptedStartEC2 struct {
 	startCalls    int
 }
 
+type terminatedRuntimeEC2 struct {
+	*recordingEC2
+	describeCalls int
+}
+
 func (client *divergentRuntimeEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
 	client.describeCalls++
 	current := ownedInstanceForTest("i-current", "runtime-1")
@@ -55,6 +60,14 @@ func (client *acceptedStartEC2) DescribeInstances(context.Context, *ec2.Describe
 func (client *acceptedStartEC2) StartInstances(context.Context, *ec2.StartInstancesInput, ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {
 	client.startCalls++
 	return &ec2.StartInstancesOutput{}, nil
+}
+
+func (client *terminatedRuntimeEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+	client.describeCalls++
+	instance := ownedInstanceForTest("i-runtime", "runtime-1")
+	instance.State.Name = types.InstanceStateNameTerminated
+	instance.PrivateIpAddress = nil
+	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{instance}}}}, nil
 }
 
 func (client *recordingEC2) DetachVolume(context.Context, *ec2.DetachVolumeInput, ...func(*ec2.Options)) (*ec2.DetachVolumeOutput, error) {
@@ -152,6 +165,39 @@ func TestStartRuntimeReturnsAcceptedPendingWithoutFollowUpObservation(t *testing
 	}
 	if client.startCalls != 1 || client.describeCalls != 1 || started.State != provider.RuntimeStatePending || started.PrivateIPv4 != "" {
 		t.Fatalf("accepted start calls/observation = %d/%d %#v", client.startCalls, client.describeCalls, started)
+	}
+}
+
+func TestRuntimeLifecycleReturnsPreTerminatedObservation(t *testing.T) {
+	tests := []struct {
+		name   string
+		invoke func(*Provider, context.Context, provider.RuntimeLifecycleRequest) (provider.Runtime, error)
+	}{
+		{name: "start", invoke: (*Provider).StartRuntime},
+		{name: "stop", invoke: (*Provider).StopRuntime},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &terminatedRuntimeEC2{recordingEC2: &recordingEC2{}}
+			adapter, err := newProvider(client, Config{
+				Region: "us-east-1", Environment: "development", SizeGiB: 100,
+				Runtime: RuntimeConfig{
+					AMI: "ami-pinned", Presets: map[string]string{"standard": "m7i.xlarge"},
+					SubnetID: "subnet-private", SecurityGroupID: "sg-runtime", SystemVolumeGiB: 24,
+				},
+			})
+			if err != nil {
+				t.Fatalf("newProvider(): %v", err)
+			}
+			request := runtimeRequest("runtime-1", 1, "image-v1", "vol-data")
+			observation, err := test.invoke(adapter, t.Context(), provider.RuntimeLifecycleRequest{RuntimeSpec: request.RuntimeSpec, ProviderID: "i-runtime"})
+			if err != nil {
+				t.Fatalf("%s pre-terminated Runtime: %v", test.name, err)
+			}
+			if client.describeCalls != 1 || observation.State != provider.RuntimeStateTerminated || observation.ProviderID != "i-runtime" || observation.RuntimeSpec != request.RuntimeSpec {
+				t.Fatalf("%s calls/observation = %d/%#v", test.name, client.describeCalls, observation)
+			}
+		})
 	}
 }
 

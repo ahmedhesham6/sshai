@@ -101,6 +101,8 @@ func (adapter *Provider) StartRuntime(ctx context.Context, request provider.Runt
 		return observation, nil
 	case provider.RuntimeStateStopping:
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeUnavailable, "Runtime is still stopping", nil)
+	case provider.RuntimeStateTerminated:
+		return observation, nil
 	default:
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "retired Runtime cannot start", nil)
 	}
@@ -121,6 +123,8 @@ func (adapter *Provider) StopRuntime(ctx context.Context, request provider.Runti
 		return adapter.ObserveRuntime(ctx, request)
 	case provider.RuntimeStatePending:
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeUnavailable, "Runtime is still pending", nil)
+	case provider.RuntimeStateTerminated:
+		return observation, nil
 	default:
 		return provider.Runtime{}, provider.NewError(provider.ErrorCodeResourceDiverged, "retired Runtime cannot stop", nil)
 	}

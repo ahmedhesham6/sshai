@@ -79,17 +79,26 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 	}
 	observed, err := restate.Run(ctx, func(runCtx restate.RunContext) (runtimeProviderOutcome, error) {
 		runtime, err := dependencies.Provider.ObserveRuntime(runCtx, request)
-		return providerOutcome(runtime, err)
+		outcome, outcomeErr := providerOutcome(runtime, err)
+		return timestampProviderOutcome(outcome, outcomeErr, dependencies.Now())
 	}, restate.WithName("verify-stopped-runtime"))
 	if err != nil {
 		return RuntimeStartOutput{}, err
 	}
 	if observed.Failure != "" {
-		return RuntimeStartOutput{}, markRuntimeProviderFailure(ctx, dependencies.Actions, input.OperationID, state.Runtime, observed, dependencies.Now)
+		return RuntimeStartOutput{}, failRuntimeOperationForProviderOutcome(ctx, dependencies.Actions, dependencies.Usage, input.OperationID, state.Runtime, state.ComputeUsageIntervalID, observed, RuntimeStartFailed, "close-compute-usage-after-start-precheck", dbstore.ComputeUsageClosedByProviderReconciliation, dependencies.Now)
 	}
-	if err := validateProviderRuntime(observed.Runtime, request, provider.RuntimeStateStopped); err != nil {
+	if err := validateProviderRuntimeIdentity(observed.Runtime, request); err != nil {
 		return RuntimeStartOutput{}, markRuntimeProviderFailure(ctx, dependencies.Actions, input.OperationID, state.Runtime, providerDivergenceOutcome(err), dependencies.Now)
 	}
+	if observed.Runtime.State != provider.RuntimeStateStopped {
+		outcome := providerStateDivergenceOutcome(observed, fmt.Errorf("Runtime provider observation diverged: state is %q, want %q", observed.Runtime.State, provider.RuntimeStateStopped))
+		return RuntimeStartOutput{}, failRuntimeOperationForProviderOutcome(ctx, dependencies.Actions, dependencies.Usage, input.OperationID, state.Runtime, state.ComputeUsageIntervalID, outcome, RuntimeStartFailed, "close-compute-usage-after-start-precheck", dbstore.ComputeUsageClosedByProviderReconciliation, dependencies.Now)
+	}
+	if err := closeComputeUsageForProviderOutcome(ctx, dependencies.Usage, state.ComputeUsageIntervalID, observed, "close-stale-compute-usage-before-start", dbstore.ComputeUsageClosedByProviderReconciliation); err != nil {
+		return RuntimeStartOutput{}, markRuntimeErrorAndFail(ctx, dependencies.Actions, input.OperationID, state.Runtime, RuntimeStartFailed, err.Error(), dependencies.Now)
+	}
+	state.ComputeUsageIntervalID = ""
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.DataVolumes.VerifyRuntimeDataVolume(runCtx, dataVolumeRequest(input, state)))
 	}, restate.WithName("verify-data-volume")); err != nil {
@@ -154,13 +163,14 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 		return RuntimeStartOutput{}, err
 	}
 	if started.Failure != "" {
-		return RuntimeStartOutput{}, markRuntimeProviderFailure(ctx, dependencies.Actions, input.OperationID, state.Runtime, started, dependencies.Now)
+		return RuntimeStartOutput{}, failRuntimeOperationForProviderOutcome(ctx, dependencies.Actions, dependencies.Usage, input.OperationID, state.Runtime, state.ComputeUsageIntervalID, started, RuntimeStartFailed, "close-compute-usage-after-start-provider", dbstore.ComputeUsageClosedByProviderReconciliation, dependencies.Now)
 	}
-	if err := validateProviderRuntimeIdentity(started.Runtime, request); err != nil || started.Runtime.State != provider.RuntimeStatePending && started.Runtime.State != provider.RuntimeStateRunning {
-		if err == nil {
-			err = fmt.Errorf("Runtime provider observation diverged: state is %q, want %q or %q", started.Runtime.State, provider.RuntimeStatePending, provider.RuntimeStateRunning)
-		}
+	if err := validateProviderRuntimeIdentity(started.Runtime, request); err != nil {
 		return RuntimeStartOutput{}, markRuntimeProviderFailure(ctx, dependencies.Actions, input.OperationID, state.Runtime, providerDivergenceOutcome(err), dependencies.Now)
+	}
+	if started.Runtime.State != provider.RuntimeStatePending && started.Runtime.State != provider.RuntimeStateRunning {
+		outcome := providerStateDivergenceOutcome(started, fmt.Errorf("Runtime provider observation diverged: state is %q, want %q or %q", started.Runtime.State, provider.RuntimeStatePending, provider.RuntimeStateRunning))
+		return RuntimeStartOutput{}, failRuntimeOperationForProviderOutcome(ctx, dependencies.Actions, dependencies.Usage, input.OperationID, state.Runtime, state.ComputeUsageIntervalID, outcome, RuntimeStartFailed, "close-compute-usage-after-start-provider", dbstore.ComputeUsageClosedByProviderReconciliation, dependencies.Now)
 	}
 	usageSeed, err := restate.Run(ctx, func(restate.RunContext) (runtimeComputeUsageSeed, error) {
 		return runtimeComputeUsageSeed{ID: dependencies.IDs.NewID()}, nil
@@ -181,12 +191,13 @@ func (workflow *runtimeStartWorkflow) Run(ctx restate.WorkflowContext, input dom
 	if interval.UserID != input.OwnerUserID || interval.EnvironmentID != input.EnvironmentID || interval.RuntimeID != input.RuntimeID {
 		return RuntimeStartOutput{}, markRuntimeErrorAndFail(ctx, dependencies.Actions, input.OperationID, state.Runtime, RuntimeStartFailed, "Compute Usage Interval ownership diverged", dependencies.Now)
 	}
+	state.ComputeUsageIntervalID = interval.ID
 	running, waitErr := waitForProviderState(ctx, dependencies.Provider, request, started, provider.RuntimeStateRunning, provider.RuntimeStatePending, "wait-runtime-running", dependencies.ProviderPollInterval, dependencies.ProviderPollTimeout, dependencies.Now)
 	if waitErr != nil {
 		return RuntimeStartOutput{}, waitErr
 	}
 	if running.Failure != "" {
-		return RuntimeStartOutput{}, markRuntimeProviderFailure(ctx, dependencies.Actions, input.OperationID, state.Runtime, running, dependencies.Now)
+		return RuntimeStartOutput{}, failRuntimeOperationForProviderOutcome(ctx, dependencies.Actions, dependencies.Usage, input.OperationID, state.Runtime, state.ComputeUsageIntervalID, running, RuntimeStartFailed, "close-compute-usage-after-start-observation", dbstore.ComputeUsageClosedByProviderReconciliation, dependencies.Now)
 	}
 	guestRequest := RuntimeGuestReadinessRequest{
 		OwnerUserID: input.OwnerUserID, EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID,

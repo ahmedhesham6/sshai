@@ -146,16 +146,6 @@ func validateRuntimeOperationInput(input domain.RuntimeOperationDispatch, expect
 	return nil
 }
 
-func validateProviderRuntime(observed provider.Runtime, request provider.RuntimeLifecycleRequest, expected provider.RuntimeState) error {
-	if err := validateProviderRuntimeIdentity(observed, request); err != nil {
-		return err
-	}
-	if observed.State != expected {
-		return fmt.Errorf("Runtime provider observation diverged: state is %q, want %q", observed.State, expected)
-	}
-	return nil
-}
-
 func validateProviderRuntimeIdentity(observed provider.Runtime, request provider.RuntimeLifecycleRequest) error {
 	if observed.RuntimeSpec != request.RuntimeSpec || observed.ProviderID != request.ProviderID {
 		return errors.New("Runtime provider observation identity diverged")
@@ -165,6 +155,13 @@ func validateProviderRuntimeIdentity(observed provider.Runtime, request provider
 
 func providerDivergenceOutcome(err error) runtimeProviderOutcome {
 	return runtimeProviderOutcome{FailureCode: string(provider.ErrorCodeResourceDiverged), Failure: err.Error()}
+}
+
+func providerStateDivergenceOutcome(observed runtimeProviderOutcome, err error) runtimeProviderOutcome {
+	observed.RetryableFailure = false
+	observed.FailureCode = string(provider.ErrorCodeResourceDiverged)
+	observed.Failure = err.Error()
+	return observed
 }
 
 func providerOutcome(runtime provider.Runtime, err error) (runtimeProviderOutcome, error) {
@@ -219,6 +216,44 @@ func markRuntimeProviderFailure(ctx restate.WorkflowContext, actions RuntimeLife
 	return markRuntimeErrorAndFail(ctx, actions, operationID, current, outcome.FailureCode, outcome.Failure, now)
 }
 
+func failRuntimeOperationForProviderOutcome(
+	ctx restate.WorkflowContext,
+	actions RuntimeLifecycleActions,
+	usage ComputeUsageStore,
+	operationID string,
+	current domain.RuntimeSnapshot,
+	intervalID string,
+	outcome runtimeProviderOutcome,
+	fallbackCode, closeActionName string,
+	closureSource dbstore.ComputeUsageClosureSource,
+	now func() time.Time,
+) error {
+	if err := closeComputeUsageForProviderOutcome(ctx, usage, intervalID, outcome, closeActionName, closureSource); err != nil {
+		return markRuntimeErrorAndFail(ctx, actions, operationID, current, fallbackCode, err.Error(), now)
+	}
+	return markRuntimeProviderFailure(ctx, actions, operationID, current, outcome, now)
+}
+
+func closeComputeUsageForProviderOutcome(ctx restate.WorkflowContext, usage ComputeUsageStore, intervalID string, outcome runtimeProviderOutcome, actionName string, closureSource dbstore.ComputeUsageClosureSource) error {
+	computeGone := outcome.Runtime.State == provider.RuntimeStateStopped || outcome.Runtime.State == provider.RuntimeStateTerminated
+	if !computeGone || intervalID == "" {
+		return nil
+	}
+	if outcome.ObservedAt.IsZero() {
+		return errors.New("terminal Runtime provider observation time is required to close Compute Usage")
+	}
+	_, err := restate.Run(ctx, func(runCtx restate.RunContext) (string, error) {
+		transaction, err := usage.CloseComputeUsageInterval(runCtx, dbstore.CloseComputeUsageIntervalInput{
+			IntervalID: intervalID, StoppedAt: outcome.ObservedAt, Source: closureSource,
+		})
+		if err != nil {
+			return "", classifyDurableError(err)
+		}
+		return transaction.ID(), nil
+	}, restate.WithName(actionName))
+	return err
+}
+
 func markRuntimeErrorAndFail(ctx restate.WorkflowContext, actions RuntimeLifecycleActions, operationID string, current domain.RuntimeSnapshot, code, message string, now func() time.Time) error {
 	runtime, err := domain.RestoreRuntime(current)
 	if err != nil {
@@ -258,6 +293,7 @@ func waitForProviderState(
 	stepPrefix string,
 	pollInterval, pollTimeout time.Duration,
 	now func() time.Time,
+	additionalTransitional ...provider.RuntimeState,
 ) (runtimeProviderOutcome, error) {
 	if pollInterval <= 0 {
 		pollInterval = defaultProviderPollInterval
@@ -279,8 +315,12 @@ func waitForProviderState(
 			if observed.Runtime.State == expected {
 				return observed, nil
 			}
-			if observed.Runtime.State != transitional {
-				return providerDivergenceOutcome(fmt.Errorf("Runtime provider observation diverged: state is %q, want %q or %q", observed.Runtime.State, transitional, expected)), nil
+			waiting := observed.Runtime.State == transitional
+			for _, candidate := range additionalTransitional {
+				waiting = waiting || observed.Runtime.State == candidate
+			}
+			if !waiting {
+				return providerStateDivergenceOutcome(observed, fmt.Errorf("Runtime provider observation diverged: state is %q, want %q, %q, or another accepted transitional state", observed.Runtime.State, transitional, expected)), nil
 			}
 		}
 		if !observed.ObservedAt.Before(deadline) {

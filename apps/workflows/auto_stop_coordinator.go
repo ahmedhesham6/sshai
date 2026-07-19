@@ -86,6 +86,7 @@ func (AutoStopCoordinator) Resume(state AutoStopCoordinationState, runtimeID str
 	transition := AutoStopTransition{State: state}
 	if state.SuppressedRuntimeID == runtimeID {
 		transition.State.SuppressedRuntimeID = ""
+		transition.State.DispatchedGeneration = 0
 	}
 	return transition, nil
 }
@@ -139,7 +140,7 @@ func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation 
 		}
 		return transition, nil
 	}
-	if transition.State.TimerPending || transition.State.DispatchedGeneration != 0 {
+	if transition.State.TimerPending || (transition.State.DispatchedGeneration != 0 && transition.State.DispatchedGeneration == transition.State.TimerGeneration) {
 		return transition, nil
 	}
 	transition.State.TimerGeneration++
