@@ -37,7 +37,7 @@ type RuntimeLifecycleActions interface {
 	LoadRuntimeOperation(context.Context, domain.RuntimeOperationDispatch, string, time.Time) (RuntimeOperationState, error)
 	PersistRuntimeTransition(context.Context, string, int64, domain.RuntimeSnapshot) error
 	CompleteRuntimeOperation(context.Context, string, time.Time) error
-	RecordRuntimeFailure(context.Context, string, string, time.Time) error
+	RecordRuntimeFailure(context.Context, string, string, string, time.Time) error
 }
 
 type RuntimeOperationSender interface {
@@ -276,7 +276,7 @@ func failRuntimeOperation(ctx restate.WorkflowContext, actions RuntimeLifecycleA
 		code = "RUNTIME_OPERATION_FAILED"
 	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
-		return classifyDurableError(actions.RecordRuntimeFailure(runCtx, operationID, code, now()))
+		return classifyDurableError(actions.RecordRuntimeFailure(runCtx, operationID, code, message, now()))
 	}, restate.WithName("fail-runtime-operation-"+strings.ToLower(strings.ReplaceAll(code, "_", "-")))); err != nil {
 		return err
 	}

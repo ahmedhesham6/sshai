@@ -2,6 +2,7 @@ package workflows
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 
 	dbstore "github.com/ahmedhesham6/sshai/libs/db"
@@ -13,16 +14,19 @@ import (
 const RuntimeStopService = "RuntimeStop"
 
 type RuntimeStopDependencies struct {
-	Provider             provider.RuntimeProvider
-	Actions              RuntimeStopActions
-	DataVolumes          RuntimeDataVolumeVerifier
-	Snapshots            AutoStopSnapshotSource
-	Guest                RuntimeGuestShutdownPreparer
-	Usage                ComputeUsageStore
-	AutoStop             RuntimeAutoStopController
-	Now                  func() time.Time
-	ProviderPollInterval time.Duration
-	ProviderPollTimeout  time.Duration
+	Provider                   provider.RuntimeProvider
+	Actions                    RuntimeStopActions
+	DataVolumes                RuntimeDataVolumeVerifier
+	Snapshots                  AutoStopSnapshotSource
+	Guest                      RuntimeGuestShutdownPreparer
+	Usage                      ComputeUsageStore
+	AutoStop                   RuntimeAutoStopController
+	Now                        func() time.Time
+	ProviderPollInterval       time.Duration
+	ProviderPollTimeout        time.Duration
+	SnapshotPollTimeout        time.Duration
+	SnapshotPollInitialBackoff time.Duration
+	SnapshotPollMaxBackoff     time.Duration
 }
 
 type RuntimeStopOutput struct {
@@ -113,17 +117,20 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 	failWhileReady := func(code, message string) error {
 		return resumeAutoStopAndFailRuntimeStop(ctx, dependencies, input, state, code, message)
 	}
-	snapshot, err := restate.Run(ctx, func(runCtx restate.RunContext) (AutoStopObservation, error) {
-		freshAfter := dependencies.Now()
-		observation, err := dependencies.Snapshots.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
-			EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID, FreshAfter: freshAfter,
-		})
-		observation.FreshAfter = freshAfter
-		return observation, classifyDurableError(err)
-	}, restate.WithName("request-activity-snapshot"))
-	if err != nil {
-		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, err.Error())
+	freshAfter := dependencies.Now()
+	read, refreshErr := refreshAutoStopSnapshot(ctx, dependencies.Snapshots, AutoStopRefreshRequest{
+		EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID, FreshAfter: freshAfter,
+	}, autoStopSnapshotPolling{
+		timeout: dependencies.SnapshotPollTimeout, initialBackoff: dependencies.SnapshotPollInitialBackoff,
+		maxBackoff: dependencies.SnapshotPollMaxBackoff,
+	}, "request-activity-snapshot")
+	if refreshErr != nil {
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, refreshErr.Error())
 	}
+	if read.ReferenceUnavailable {
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, dbstore.ErrReferenceNotOwned.Error())
+	}
+	snapshot := read.Observation
 	if snapshot.RuntimeID != input.RuntimeID || snapshot.Snapshot == nil || snapshot.Snapshot.RuntimeID != input.RuntimeID {
 		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, "Activity Snapshot belongs to another Runtime")
 	}
@@ -195,67 +202,68 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 	if observed.Failure != "" {
 		return RuntimeStopOutput{}, failRuntimeOperationForProviderOutcome(ctx, dependencies.Actions, dependencies.Usage, input.OperationID, state.Runtime, state.ComputeUsageIntervalID, observed, RuntimeStopFailed, "close-compute-usage-after-stop-observation", dbstore.ComputeUsageClosedByRuntimeStop, dependencies.Now)
 	}
-	var postStopCode, postStopMessage string
-	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
-		return classifyDurableError(dependencies.DataVolumes.VerifyRuntimeDataVolume(runCtx, dataVolumeRequest(input, state)))
-	}, restate.WithName("verify-data-volume")); err != nil {
-		postStopCode, postStopMessage = RuntimeStopFailed, err.Error()
-	}
-	if state.ComputeUsageIntervalID == "" {
-		if postStopCode == "" {
-			postStopCode, postStopMessage = RuntimeStopFailed, "open Compute Usage Interval is required"
-		}
-	} else {
-		if err := closeComputeUsageForProviderOutcome(ctx, dependencies.Usage, state.ComputeUsageIntervalID, observed, "close-compute-usage-after-stop-observation", dbstore.ComputeUsageClosedByRuntimeStop); err != nil && postStopCode == "" {
-			postStopCode, postStopMessage = RuntimeStopFailed, err.Error()
-		}
-	}
-	if !storedStopped {
-		var restoreErr error
-		runtime, restoreErr = domain.RestoreRuntime(state.Runtime)
-		if restoreErr != nil {
-			return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, restoreErr.Error(), dependencies.Now)
-		}
-		markedStopped, transitionErr := runtime.MarkStopped(domain.RuntimeStateObservation{
-			ProviderInstanceRef: request.ProviderID, ExpectedVersion: state.Runtime.Version, ObservedAt: dependencies.Now(),
-		})
-		if transitionErr != nil {
-			return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, transitionErr.Error(), dependencies.Now)
-		}
-		if _, err := persistRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "mark-runtime-stopped", state.Runtime, markedStopped); err != nil {
-			return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
-		}
-	}
-	if postStopCode != "" {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, postStopCode, postStopMessage, dependencies.Now)
-	}
-	if err := completeRuntimeOperation(ctx, dependencies.Actions, input.OperationID, dependencies.Now); err != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+	if err := finalizeObservedStoppedRuntime(ctx, dependencies, input, state, observed, storedStopped); err != nil {
+		return RuntimeStopOutput{}, err
 	}
 	return RuntimeStopOutput{RuntimeID: input.RuntimeID, Reason: input.StopReason}, nil
 }
 
 func completeObservedStoppedRuntime(ctx restate.WorkflowContext, dependencies RuntimeStopDependencies, input domain.RuntimeOperationDispatch, state RuntimeOperationState, observed runtimeProviderOutcome) (RuntimeStopOutput, error) {
+	if err := finalizeObservedStoppedRuntime(ctx, dependencies, input, state, observed, true); err != nil {
+		return RuntimeStopOutput{}, err
+	}
+	return RuntimeStopOutput{RuntimeID: input.RuntimeID, Reason: input.StopReason}, nil
+}
+
+func finalizeObservedStoppedRuntime(ctx restate.WorkflowContext, dependencies RuntimeStopDependencies, input domain.RuntimeOperationDispatch, state RuntimeOperationState, observed runtimeProviderOutcome, storedStopped bool) error {
+	verifyName := "verify-data-volume"
+	closeName := "close-compute-usage-after-stop-observation"
+	if storedStopped {
+		verifyName = "verify-stopped-data-volume"
+		closeName = "close-compute-usage-after-stored-stop-observation"
+	}
 	var postStopErr error
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.DataVolumes.VerifyRuntimeDataVolume(runCtx, dataVolumeRequest(input, state)))
-	}, restate.WithName("verify-stopped-data-volume")); err != nil {
+	}, restate.WithName(verifyName)); err != nil {
 		postStopErr = err
 	}
-	if state.ComputeUsageIntervalID != "" {
-		if err := closeComputeUsageForProviderOutcome(ctx, dependencies.Usage, state.ComputeUsageIntervalID, observed, "close-compute-usage-after-stored-stop-observation", dbstore.ComputeUsageClosedByRuntimeStop); err != nil {
+	if state.ComputeUsageIntervalID == "" {
+		if storedStopped {
+			slog.InfoContext(ctx, "Compute Usage already reconciled for stored stopped Runtime",
+				"operation_id", input.OperationID, "runtime_id", input.RuntimeID)
+		} else if postStopErr == nil {
+			postStopErr = fmt.Errorf("open Compute Usage Interval is required")
+		}
+	} else {
+		if err := closeComputeUsageForProviderOutcome(ctx, dependencies.Usage, state.ComputeUsageIntervalID, observed, closeName, dbstore.ComputeUsageClosedByRuntimeStop); err != nil {
 			if postStopErr == nil {
 				postStopErr = err
 			}
 		}
 	}
+	if !storedStopped {
+		runtime, err := domain.RestoreRuntime(state.Runtime)
+		if err != nil {
+			return failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+		}
+		markedStopped, err := runtime.MarkStopped(domain.RuntimeStateObservation{
+			ProviderInstanceRef: *state.Runtime.ProviderInstanceRef, ExpectedVersion: state.Runtime.Version, ObservedAt: dependencies.Now(),
+		})
+		if err != nil {
+			return failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+		}
+		if _, err := persistRuntimeTransition(ctx, dependencies.Actions, input.OperationID, "mark-runtime-stopped", state.Runtime, markedStopped); err != nil {
+			return failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+		}
+	}
 	if postStopErr != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, postStopErr.Error(), dependencies.Now)
+		return failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, postStopErr.Error(), dependencies.Now)
 	}
 	if err := completeRuntimeOperation(ctx, dependencies.Actions, input.OperationID, dependencies.Now); err != nil {
-		return RuntimeStopOutput{}, failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
+		return failRuntimeOperation(ctx, dependencies.Actions, input.OperationID, RuntimeStopFailed, err.Error(), dependencies.Now)
 	}
-	return RuntimeStopOutput{RuntimeID: input.RuntimeID, Reason: input.StopReason}, nil
+	return nil
 }
 
 func resumeAutoStopAndFailRuntimeStop(ctx restate.WorkflowContext, dependencies RuntimeStopDependencies, input domain.RuntimeOperationDispatch, state RuntimeOperationState, code, message string) error {

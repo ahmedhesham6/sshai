@@ -3,6 +3,7 @@ package application_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,28 @@ func TestRuntimeOperationDispatcherIgnoresStartedOrMissingOperation(t *testing.T
 	}
 	if len(sender.inputs) != 0 || len(outbox.requested) != 1 || outbox.requested[0] != "operation-started" {
 		t.Fatalf("started Runtime dispatch = requested:%#v sent:%#v", outbox.requested, sender.inputs)
+	}
+}
+
+func TestRuntimeOperationDispatcherContinuesAfterPerItemFailure(t *testing.T) {
+	inputs := []domain.RuntimeOperationDispatch{
+		{OperationID: "operation-1", OperationType: domain.OperationRuntimeStart},
+		{OperationID: "operation-2", OperationType: domain.OperationRuntimeStop},
+		{OperationID: "operation-3", OperationType: domain.OperationRuntimeReplace},
+	}
+	outbox := &runtimeOperationOutboxFake{pending: inputs}
+	sender := &runtimeOperationSenderFake{errorsByOperation: map[string]error{
+		"operation-1": errors.New("first unavailable"),
+		"operation-3": errors.New("third unavailable"),
+	}}
+	dispatcher := application.NewRuntimeOperationDispatcher(outbox, sender)
+
+	err := dispatcher.DispatchPendingRuntimeOperations(t.Context(), len(inputs))
+	if err == nil || !strings.Contains(err.Error(), "operation-1") || !strings.Contains(err.Error(), "operation-3") {
+		t.Fatalf("DispatchPendingRuntimeOperations() error = %v, want both item failures", err)
+	}
+	if len(sender.inputs) != len(inputs) || sender.inputs[1].OperationID != "operation-2" {
+		t.Fatalf("dispatch attempts = %#v, want all inputs in order", sender.inputs)
 	}
 }
 
@@ -97,13 +120,17 @@ func (outbox *runtimeOperationOutboxFake) PendingRuntimeOperations(_ context.Con
 }
 
 type runtimeOperationSenderFake struct {
-	inputs []domain.RuntimeOperationDispatch
-	err    error
-	onSend func(domain.RuntimeOperationDispatch)
+	inputs            []domain.RuntimeOperationDispatch
+	err               error
+	errorsByOperation map[string]error
+	onSend            func(domain.RuntimeOperationDispatch)
 }
 
 func (sender *runtimeOperationSenderFake) SendRuntimeOperation(_ context.Context, input domain.RuntimeOperationDispatch) error {
 	sender.inputs = append(sender.inputs, input)
+	if err := sender.errorsByOperation[input.OperationID]; err != nil {
+		return err
+	}
 	if sender.err == nil && sender.onSend != nil {
 		sender.onSend(input)
 	}

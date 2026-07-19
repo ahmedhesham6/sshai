@@ -103,12 +103,18 @@ SELECT runtime_id, sequence, environment_id, observed_at,
        protected_processes, selected_containers, unknown_user_processes
 FROM activity_snapshots
 WHERE runtime_id = $1
+  AND environment_id = $2
 ORDER BY sequence DESC
 LIMIT 1
 `
 
-func (q *Queries) GetLatestActivitySnapshot(ctx context.Context, runtimeID string) (ActivitySnapshot, error) {
-	row := q.db.QueryRow(ctx, getLatestActivitySnapshot, runtimeID)
+type GetLatestActivitySnapshotParams struct {
+	RuntimeID     string
+	EnvironmentID string
+}
+
+func (q *Queries) GetLatestActivitySnapshot(ctx context.Context, arg GetLatestActivitySnapshotParams) (ActivitySnapshot, error) {
+	row := q.db.QueryRow(ctx, getLatestActivitySnapshot, arg.RuntimeID, arg.EnvironmentID)
 	var i ActivitySnapshot
 	err := row.Scan(
 		&i.RuntimeID,
@@ -276,4 +282,17 @@ func (q *Queries) ListPendingAutoStopPolicyRefreshes(ctx context.Context, limitC
 		return nil, err
 	}
 	return items, nil
+}
+
+const pruneActivitySnapshots = `-- name: PruneActivitySnapshots :execrows
+DELETE FROM activity_snapshots
+WHERE observed_at < $1
+`
+
+func (q *Queries) PruneActivitySnapshots(ctx context.Context, retainAfter pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneActivitySnapshots, retainAfter)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

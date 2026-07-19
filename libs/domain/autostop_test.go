@@ -42,6 +42,7 @@ func TestAutoStopPolicyEvaluatesEveryPredicateWithoutCPUHeuristics(t *testing.T)
 		{name: "agents finished despite connection", mode: domain.AutoStopWhenAgentsFinish, mutate: func(snapshot *domain.AutoStopActivitySnapshot) { snapshot.SSHConnections = 1 }, qualifies: true},
 		{name: "Codex waiting is active", mode: domain.AutoStopWhenAgentsFinish, mutate: func(snapshot *domain.AutoStopActivitySnapshot) { snapshot.CodexProcesses = 1 }},
 		{name: "Claude waiting is active", mode: domain.AutoStopWhenAgentsFinish, mutate: func(snapshot *domain.AutoStopActivitySnapshot) { snapshot.ClaudeProcesses = 1 }},
+		{name: "agents finished despite unrelated selected container", mode: domain.AutoStopWhenAgentsFinish, mutate: func(snapshot *domain.AutoStopActivitySnapshot) { snapshot.SelectedContainers = 1 }, qualifies: true},
 		{name: "fully idle", mode: domain.AutoStopWhenFullyIdle, qualifies: true},
 		{name: "fully idle blocks SSH", mode: domain.AutoStopWhenFullyIdle, mutate: func(snapshot *domain.AutoStopActivitySnapshot) { snapshot.SSHConnections = 1 }},
 		{name: "fully idle blocks IDE", mode: domain.AutoStopWhenFullyIdle, mutate: func(snapshot *domain.AutoStopActivitySnapshot) { snapshot.IDEConnections = 1 }},

@@ -124,10 +124,11 @@ func (dispatcher *RuntimeWorkflowDispatcher) DispatchPendingRuntimeOperations(ct
 	if err != nil {
 		return fmt.Errorf("dispatch pending Runtime Operations: read outbox: %w", err)
 	}
+	var failures []error
 	for _, input := range inputs {
 		if err := dispatcher.sender.SendRuntimeOperation(ctx, input); err != nil {
-			return fmt.Errorf("dispatch pending Runtime Operation %q: %w", input.OperationID, err)
+			failures = append(failures, fmt.Errorf("dispatch pending Runtime Operation %q: %w", input.OperationID, err))
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }

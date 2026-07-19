@@ -77,6 +77,7 @@ func run(ctx context.Context) error {
 	autoStopPolicyRefreshRecovery := application.NewAutoStopPolicyRefreshRecovery(autoStopPolicyRefreshDispatcher, 5*time.Second, 100, func(err error) {
 		slog.Error("Auto-stop Policy refresh recovery failed", "error", err)
 	})
+	go runActivitySnapshotPruning(ctx, store, time.Hour, 24*time.Hour, time.Now)
 	go func() {
 		if err := recovery.Run(ctx); err != nil {
 			slog.Error("workflow recovery stopped", "error", err)
@@ -148,6 +149,31 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("serve control plane: %w", err)
 	}
 	return nil
+}
+
+type activitySnapshotPruner interface {
+	PruneActivitySnapshots(context.Context, time.Time) (int64, error)
+}
+
+func runActivitySnapshotPruning(ctx context.Context, pruner activitySnapshotPruner, interval, retention time.Duration, now func() time.Time) {
+	if pruner == nil || interval <= 0 || retention <= 0 || now == nil {
+		slog.Error("Activity Snapshot pruning is not configured")
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if pruned, err := pruner.PruneActivitySnapshots(ctx, now().UTC().Add(-retention)); err != nil {
+			slog.Error("Activity Snapshot pruning failed", "error", err)
+		} else if pruned > 0 {
+			slog.Info("pruned expired Activity Snapshots", "count", pruned)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 type config struct {

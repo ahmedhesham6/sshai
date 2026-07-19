@@ -37,6 +37,17 @@ func TestAutoStopCoordinatorStartsContinuesAndCancelsGraceByGeneration(t *testin
 	}
 }
 
+func TestAutoStopCoordinatorRejectsEmptyObservationIdentityBeforeCoordinationChange(t *testing.T) {
+	coordinator := workflows.AutoStopCoordinator{}
+	_, err := coordinator.Observe(
+		workflows.AutoStopCoordinationState{EnvironmentID: "environment-1"},
+		workflows.AutoStopObservation{},
+	)
+	if err == nil {
+		t.Fatal("Observe() error = nil, want missing Runtime and policy generation validation error")
+	}
+}
+
 func TestAutoStopCoordinatorResetsTimerOnPolicyAndRuntimeChanges(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	coordinator := workflows.AutoStopCoordinator{}

@@ -69,15 +69,24 @@ func sameActivitySnapshot(first, second domain.AutoStopActivitySnapshot) bool {
 }
 
 func (store *Store) LatestAutoStopSnapshot(ctx context.Context, environmentID, runtimeID string) (AutoStopSnapshotState, error) {
+	state, err := store.LoadAutoStopSnapshotState(ctx, environmentID, runtimeID)
+	if err != nil {
+		return AutoStopSnapshotState{}, err
+	}
+	state.Snapshot, err = store.LatestActivitySnapshot(ctx, environmentID, runtimeID)
+	return state, err
+}
+
+func (store *Store) LoadAutoStopSnapshotState(ctx context.Context, environmentID, runtimeID string) (AutoStopSnapshotState, error) {
 	if environmentID == "" || runtimeID == "" {
-		return AutoStopSnapshotState{}, errors.New("load latest Activity Snapshot: Environment and Runtime are required")
+		return AutoStopSnapshotState{}, errors.New("load Auto-stop Snapshot state: Environment and Runtime are required")
 	}
 	policy, err := store.queries.GetAutoStopPolicyState(ctx, environmentID)
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && (policy.CurrentRuntimeID == nil || *policy.CurrentRuntimeID != runtimeID) {
 		return AutoStopSnapshotState{}, ErrReferenceNotOwned
 	}
 	if err != nil {
-		return AutoStopSnapshotState{}, fmt.Errorf("load latest Activity Snapshot: load Policy: %w", err)
+		return AutoStopSnapshotState{}, fmt.Errorf("load Auto-stop Snapshot state: load Policy: %w", err)
 	}
 	state := AutoStopSnapshotState{
 		RuntimeID: runtimeID,
@@ -87,19 +96,9 @@ func (store *Store) LatestAutoStopSnapshot(ctx context.Context, environmentID, r
 		},
 		PolicyGeneration: uint64(policy.Generation),
 	}
-	row, err := store.queries.GetLatestActivitySnapshot(ctx, runtimeID)
-	if err == nil {
-		snapshot, restoreErr := activitySnapshotFromRow(row)
-		if restoreErr != nil {
-			return AutoStopSnapshotState{}, restoreErr
-		}
-		state.Snapshot = &snapshot
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return AutoStopSnapshotState{}, fmt.Errorf("load latest Activity Snapshot: load Snapshot: %w", err)
-	}
 	operationTypes, err := store.queries.ListActiveAutoStopOperationTypes(ctx, environmentID)
 	if err != nil {
-		return AutoStopSnapshotState{}, fmt.Errorf("load latest Activity Snapshot: load conflicts: %w", err)
+		return AutoStopSnapshotState{}, fmt.Errorf("load Auto-stop Snapshot state: load conflicts: %w", err)
 	}
 	for _, operationType := range operationTypes {
 		switch domain.OperationType(operationType) {
@@ -114,6 +113,37 @@ func (store *Store) LatestAutoStopSnapshot(ctx context.Context, environmentID, r
 		}
 	}
 	return state, nil
+}
+
+func (store *Store) LatestActivitySnapshot(ctx context.Context, environmentID, runtimeID string) (*domain.AutoStopActivitySnapshot, error) {
+	if environmentID == "" || runtimeID == "" {
+		return nil, errors.New("read latest Activity Snapshot: Environment and Runtime are required")
+	}
+	row, err := store.queries.GetLatestActivitySnapshot(ctx, dbsql.GetLatestActivitySnapshotParams{
+		RuntimeID: runtimeID, EnvironmentID: environmentID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read latest Activity Snapshot: %w", err)
+	}
+	snapshot, err := activitySnapshotFromRow(row)
+	if err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
+func (store *Store) PruneActivitySnapshots(ctx context.Context, retainAfter time.Time) (int64, error) {
+	if retainAfter.IsZero() {
+		return 0, errors.New("prune Activity Snapshots: retention boundary is required")
+	}
+	pruned, err := store.queries.PruneActivitySnapshots(ctx, timestamp(retainAfter))
+	if err != nil {
+		return 0, fmt.Errorf("prune Activity Snapshots: %w", err)
+	}
+	return pruned, nil
 }
 
 func (store *Store) RuntimeStopDispatchOwner(ctx context.Context, environmentID, runtimeID string) (string, error) {

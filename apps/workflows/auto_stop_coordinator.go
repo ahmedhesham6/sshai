@@ -92,6 +92,9 @@ func (AutoStopCoordinator) Resume(state AutoStopCoordinationState, runtimeID str
 }
 
 func (AutoStopCoordinator) Observe(state AutoStopCoordinationState, observation AutoStopObservation) (AutoStopTransition, error) {
+	if _, err := restoreAutoStopPolicy(state.EnvironmentID, observation); err != nil {
+		return AutoStopTransition{}, err
+	}
 	transition := AutoStopTransition{State: state}
 	if coordinationChanged(state, observation) {
 		transition.Cancelled = state.TimerPending

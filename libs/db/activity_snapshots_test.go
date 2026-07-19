@@ -50,3 +50,32 @@ func TestStorePersistsAndLoadsLatestAutoStopActivitySnapshot(t *testing.T) {
 		t.Fatalf("foreign Runtime Snapshot error = %v", err)
 	}
 }
+
+func TestStorePrunesActivitySnapshotsBeforeRetentionBoundary(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	insertRuntimeOperationState(t, ctx, pool, createdAt)
+	boundary := createdAt.Add(24 * time.Hour)
+	for _, snapshot := range []domain.AutoStopActivitySnapshot{
+		{RuntimeID: "runtime-1", Sequence: 1, ObservedAt: boundary.Add(-time.Second)},
+		{RuntimeID: "runtime-1", Sequence: 2, ObservedAt: boundary},
+		{RuntimeID: "runtime-1", Sequence: 3, ObservedAt: boundary.Add(time.Second)},
+	} {
+		if err := store.StoreActivitySnapshot(ctx, "environment-1", snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pruned, err := store.PruneActivitySnapshots(ctx, boundary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM activity_snapshots WHERE runtime_id = 'runtime-1'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 1 || remaining != 2 {
+		t.Fatalf("pruned/remaining = %d/%d, want 1/2", pruned, remaining)
+	}
+}

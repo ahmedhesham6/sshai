@@ -147,29 +147,33 @@ func (store *Store) PersistRuntimeWorkflowTransition(ctx context.Context, operat
 }
 
 func (store *Store) CompleteRuntimeWorkflowOperation(ctx context.Context, operationID string, at time.Time) error {
-	return store.finishRuntimeWorkflowOperation(ctx, operationID, domain.OperationSucceeded, "", at)
+	return store.finishRuntimeWorkflowOperation(ctx, operationID, domain.OperationSucceeded, "", "", at)
 }
 
-func (store *Store) RecordRuntimeWorkflowFailure(ctx context.Context, operationID, code string, at time.Time) error {
+func (store *Store) RecordRuntimeWorkflowFailure(ctx context.Context, operationID, code, message string, at time.Time) error {
 	if code == "" {
 		code = "RUNTIME_OPERATION_FAILED"
 	}
-	return store.finishRuntimeWorkflowOperation(ctx, operationID, domain.OperationFailed, code, at)
+	if message == "" {
+		message = code
+	}
+	return store.finishRuntimeWorkflowOperation(ctx, operationID, domain.OperationFailed, code, message, at)
 }
 
-func (store *Store) finishRuntimeWorkflowOperation(ctx context.Context, operationID string, status domain.OperationStatus, code string, at time.Time) error {
+func (store *Store) finishRuntimeWorkflowOperation(ctx context.Context, operationID string, status domain.OperationStatus, code, message string, at time.Time) error {
 	if operationID == "" || at.IsZero() {
 		return permanent(errors.New("finish Runtime workflow Operation: Operation and completion time are required"))
 	}
-	var result pgtype.Text
+	var errorCode, errorMessage pgtype.Text
 	if code != "" {
-		result = pgtype.Text{String: code, Valid: true}
+		errorCode = pgtype.Text{String: code, Valid: true}
+		errorMessage = pgtype.Text{String: message, Valid: true}
 	}
 	command, err := store.pool.Exec(ctx, `
 		UPDATE operations
-		SET status = $2, error_code = $3, error_message = $3, completed_at = $4
+		SET status = $2, error_code = $3, error_message = $4, completed_at = $5
 		WHERE id = $1 AND type IN ('runtime.start', 'runtime.stop', 'runtime.replace')
-		  AND status IN ('queued', 'running')`, operationID, string(status), result, at)
+		  AND status IN ('queued', 'running')`, operationID, string(status), errorCode, errorMessage, at)
 	if err != nil {
 		return fmt.Errorf("finish Runtime workflow Operation: %w", err)
 	}

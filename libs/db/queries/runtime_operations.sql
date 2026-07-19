@@ -1,8 +1,3 @@
--- name: LockRuntimeOperationIdempotency :one
-SELECT pg_advisory_xact_lock(
-    hashtextextended('runtime-operation' || chr(31) || sqlc.arg(owner_user_id)::text || chr(31) || sqlc.arg(idempotency_key)::text, 0)
-);
-
 -- name: GetOperationByIdempotencyKey :one
 SELECT id, environment_id, type, status, requested_by_user_id, idempotency_key,
        restate_invocation_id, input, created_at, completed_at

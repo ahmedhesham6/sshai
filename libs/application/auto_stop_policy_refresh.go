@@ -55,12 +55,13 @@ func (dispatcher *AutoStopPolicyRefreshDispatcher) DispatchPendingAutoStopPolicy
 	if err != nil {
 		return fmt.Errorf("dispatch pending Auto-stop Policy refreshes: read outbox: %w", err)
 	}
+	var failures []error
 	for _, refresh := range refreshes {
 		if err := dispatcher.dispatch(ctx, refresh); err != nil {
-			return err
+			failures = append(failures, err)
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func (dispatcher *AutoStopPolicyRefreshDispatcher) dispatch(ctx context.Context, refresh domain.AutoStopPolicyRefresh) error {

@@ -29,6 +29,7 @@ SELECT runtime_id, sequence, environment_id, observed_at,
        protected_processes, selected_containers, unknown_user_processes
 FROM activity_snapshots
 WHERE runtime_id = sqlc.arg(runtime_id)
+  AND environment_id = sqlc.arg(environment_id)
 ORDER BY sequence DESC
 LIMIT 1;
 
@@ -72,3 +73,7 @@ ORDER BY type;
 SELECT owner_user_id, current_runtime_id
 FROM environments
 WHERE id = sqlc.arg(environment_id);
+
+-- name: PruneActivitySnapshots :execrows
+DELETE FROM activity_snapshots
+WHERE observed_at < sqlc.arg(retain_after);

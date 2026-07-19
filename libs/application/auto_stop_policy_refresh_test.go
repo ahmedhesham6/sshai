@@ -3,6 +3,7 @@ package application_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,28 @@ func TestAutoStopPolicyRefreshRecoveryClosesCommitDispatchCrashWindow(t *testing
 	}
 	if len(outbox.pending) != 0 || len(outbox.acknowledged) != 1 || outbox.acknowledged[0] != pending {
 		t.Fatalf("recovered refresh: pending=%#v acknowledged=%#v", outbox.pending, outbox.acknowledged)
+	}
+}
+
+func TestAutoStopPolicyRefreshDispatcherContinuesAfterPerItemFailure(t *testing.T) {
+	refreshes := []domain.AutoStopPolicyRefresh{
+		{EnvironmentID: "environment-1", Generation: 1},
+		{EnvironmentID: "environment-2", Generation: 2},
+		{EnvironmentID: "environment-3", Generation: 3},
+	}
+	outbox := &autoStopPolicyRefreshOutboxFake{pending: append([]domain.AutoStopPolicyRefresh(nil), refreshes...)}
+	sender := &autoStopPolicyRefreshSenderFake{errorsByEnvironment: map[string]error{
+		"environment-1": errors.New("first unavailable"),
+		"environment-3": errors.New("third unavailable"),
+	}}
+	dispatcher := application.NewAutoStopPolicyRefreshDispatcher(outbox, sender)
+
+	err := dispatcher.DispatchPendingAutoStopPolicyRefreshes(t.Context(), len(refreshes))
+	if err == nil || !strings.Contains(err.Error(), "environment-1") || !strings.Contains(err.Error(), "environment-3") {
+		t.Fatalf("DispatchPendingAutoStopPolicyRefreshes() error = %v, want both item failures", err)
+	}
+	if len(sender.environments) != len(refreshes) || len(outbox.acknowledged) != 1 || outbox.acknowledged[0] != refreshes[1] {
+		t.Fatalf("dispatches/acknowledgements = %#v/%#v, want every dispatch and only successful acknowledgement", sender.environments, outbox.acknowledged)
 	}
 }
 
@@ -74,11 +97,17 @@ func (fake *autoStopPolicyRefreshOutboxFake) AcknowledgeAutoStopPolicyRefresh(_ 
 }
 
 type autoStopPolicyRefreshSenderFake struct {
-	keys []string
-	err  error
+	keys                []string
+	environments        []string
+	err                 error
+	errorsByEnvironment map[string]error
 }
 
-func (fake *autoStopPolicyRefreshSenderFake) SendAutoStopPolicyRefresh(_ context.Context, _ string, key string) error {
+func (fake *autoStopPolicyRefreshSenderFake) SendAutoStopPolicyRefresh(_ context.Context, environmentID string, key string) error {
 	fake.keys = append(fake.keys, key)
+	fake.environments = append(fake.environments, environmentID)
+	if err := fake.errorsByEnvironment[environmentID]; err != nil {
+		return err
+	}
 	return fake.err
 }

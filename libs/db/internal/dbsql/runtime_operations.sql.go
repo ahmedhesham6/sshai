@@ -367,21 +367,3 @@ func (q *Queries) ListPendingRuntimeOperations(ctx context.Context, limitCount i
 	}
 	return items, nil
 }
-
-const lockRuntimeOperationIdempotency = `-- name: LockRuntimeOperationIdempotency :one
-SELECT pg_advisory_xact_lock(
-    hashtextextended('runtime-operation' || chr(31) || $1::text || chr(31) || $2::text, 0)
-)
-`
-
-type LockRuntimeOperationIdempotencyParams struct {
-	OwnerUserID    string
-	IdempotencyKey string
-}
-
-func (q *Queries) LockRuntimeOperationIdempotency(ctx context.Context, arg LockRuntimeOperationIdempotencyParams) (interface{}, error) {
-	row := q.db.QueryRow(ctx, lockRuntimeOperationIdempotency, arg.OwnerUserID, arg.IdempotencyKey)
-	var pg_advisory_xact_lock interface{}
-	err := row.Scan(&pg_advisory_xact_lock)
-	return pg_advisory_xact_lock, err
-}
