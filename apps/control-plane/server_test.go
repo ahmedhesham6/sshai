@@ -176,6 +176,34 @@ func TestCreateProjectSeedMapsIdempotencyConflict(t *testing.T) {
 	}
 }
 
+func TestPublicCommandsRejectReservedSystemIdempotencyKeys(t *testing.T) {
+	body := []byte(`{"repositoryUrl":"https://github.com/example/project.git","baseRevision":"abc123","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifestDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)
+	for _, key := range []string{domain.SystemIdempotencyKeyPrefix, domain.SystemIdempotencyKeyPrefix + "runtime.stop:auto_stop:environment-1"} {
+		t.Run(key, func(t *testing.T) {
+			repository := &projectSeedHTTPRepositoryFake{}
+			handler := controlplane.NewHandler(controlplane.Config{
+				RegisterProjectSeed: application.NewRegisterProjectSeedService(repository, &successfulUploadVerifier{}, &idsFake{values: []string{"seed-1"}}, time.Now),
+				Verifier:            verifierFake{}, Users: &usersFake{}, UserIDs: &idsFake{values: []string{"user-1"}},
+				RequestIDs: &idsFake{values: []string{"request-reserved"}}, DefaultRegion: "us-east-1", Now: time.Now,
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/project-seeds", bytes.NewReader(body))
+			request.Header.Set("Authorization", "Bearer valid-token")
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", key)
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte(`"code":"INVALID_REQUEST"`)) {
+				t.Fatalf("reserved key response = status:%d body:%s", response.Code, response.Body.String())
+			}
+			if repository.seed.Snapshot().ID != "" {
+				t.Fatal("reserved key reached command service")
+			}
+		})
+	}
+}
+
 func TestCreateProjectSeedMapsSafeCommandErrors(t *testing.T) {
 	body := []byte(`{"repositoryUrl":"https://github.com/example/project.git","baseRevision":"abc123","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifestDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)
 	for _, scenario := range []struct {

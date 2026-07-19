@@ -1,6 +1,12 @@
 -- +goose Up
 ALTER TABLE auto_stop_policies
-    ADD COLUMN generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0);
+    ADD COLUMN generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
+    ADD COLUMN refresh_acknowledged_generation BIGINT NOT NULL DEFAULT 0
+        CHECK (refresh_acknowledged_generation >= 0 AND refresh_acknowledged_generation <= generation);
+
+CREATE INDEX auto_stop_policies_pending_refresh_key
+    ON auto_stop_policies (environment_id)
+    WHERE refresh_acknowledged_generation < generation;
 
 CREATE TABLE activity_snapshots (
     runtime_id TEXT NOT NULL,
@@ -18,9 +24,9 @@ CREATE TABLE activity_snapshots (
     FOREIGN KEY (environment_id, runtime_id) REFERENCES runtimes (environment_id, id)
 );
 
-CREATE INDEX activity_snapshots_latest_runtime_key
-    ON activity_snapshots (runtime_id, sequence DESC);
-
 -- +goose Down
 DROP TABLE activity_snapshots;
-ALTER TABLE auto_stop_policies DROP COLUMN generation;
+DROP INDEX auto_stop_policies_pending_refresh_key;
+ALTER TABLE auto_stop_policies
+    DROP COLUMN refresh_acknowledged_generation,
+    DROP COLUMN generation;

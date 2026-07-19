@@ -210,6 +210,17 @@ type runtimeCommandHTTPRepositoryFake struct {
 	calls           int
 }
 
+func (fake *runtimeCommandHTTPRepositoryFake) ReplayRuntimeOperation(_ context.Context, operation domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error) {
+	if err := requireOwner("ReplayRuntimeOperation", operation.Snapshot().RequestedByUserID, fake.expectedOwnerID); err != nil {
+		return domain.EnvironmentRuntimeOperation{}, false, err
+	}
+	if fake.replay.Snapshot().ID == "" {
+		return domain.EnvironmentRuntimeOperation{}, false, nil
+	}
+	command, err := domain.RestoreEnvironmentRuntimeOperation(fake.environment, fake.runtime, fake.replay)
+	return command, true, err
+}
+
 func (fake *runtimeCommandHTTPRepositoryFake) ReserveRuntimeOperation(_ context.Context, operation domain.Operation) (domain.EnvironmentRuntimeOperation, error) {
 	fake.calls++
 	if err := requireOwner("ReserveRuntimeOperation", operation.Snapshot().RequestedByUserID, fake.expectedOwnerID); err != nil {
@@ -281,7 +292,7 @@ func (runtimeCommandBalanceHTTPFake) CreditBalance(_ context.Context, ownerID st
 
 type autoStopRefreshFake struct{}
 
-func (autoStopRefreshFake) SendAutoStopPolicyRefresh(context.Context, string, string) error {
+func (autoStopRefreshFake) DispatchAutoStopPolicyRefresh(context.Context, string) error {
 	return nil
 }
 

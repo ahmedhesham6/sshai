@@ -11,22 +11,44 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acknowledgeAutoStopPolicyRefresh = `-- name: AcknowledgeAutoStopPolicyRefresh :execrows
+UPDATE auto_stop_policies
+SET refresh_acknowledged_generation = GREATEST(refresh_acknowledged_generation, $1)
+WHERE environment_id = $2
+  AND generation >= $1
+`
+
+type AcknowledgeAutoStopPolicyRefreshParams struct {
+	Generation    int64
+	EnvironmentID string
+}
+
+func (q *Queries) AcknowledgeAutoStopPolicyRefresh(ctx context.Context, arg AcknowledgeAutoStopPolicyRefreshParams) (int64, error) {
+	result, err := q.db.Exec(ctx, acknowledgeAutoStopPolicyRefresh, arg.Generation, arg.EnvironmentID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getActivitySnapshot = `-- name: GetActivitySnapshot :one
 SELECT runtime_id, sequence, environment_id, observed_at,
        ssh_connections, ide_connections, codex_processes, claude_processes,
        protected_processes, selected_containers, unknown_user_processes
 FROM activity_snapshots
 WHERE runtime_id = $1
-  AND sequence = $2
+  AND environment_id = $2
+  AND sequence = $3
 `
 
 type GetActivitySnapshotParams struct {
-	RuntimeID string
-	Sequence  int64
+	RuntimeID     string
+	EnvironmentID string
+	Sequence      int64
 }
 
 func (q *Queries) GetActivitySnapshot(ctx context.Context, arg GetActivitySnapshotParams) (ActivitySnapshot, error) {
-	row := q.db.QueryRow(ctx, getActivitySnapshot, arg.RuntimeID, arg.Sequence)
+	row := q.db.QueryRow(ctx, getActivitySnapshot, arg.RuntimeID, arg.EnvironmentID, arg.Sequence)
 	var i ActivitySnapshot
 	err := row.Scan(
 		&i.RuntimeID,
@@ -101,6 +123,25 @@ func (q *Queries) GetLatestActivitySnapshot(ctx context.Context, runtimeID strin
 		&i.SelectedContainers,
 		&i.UnknownUserProcesses,
 	)
+	return i, err
+}
+
+const getPendingAutoStopPolicyRefresh = `-- name: GetPendingAutoStopPolicyRefresh :one
+SELECT environment_id, generation
+FROM auto_stop_policies
+WHERE environment_id = $1
+  AND refresh_acknowledged_generation < generation
+`
+
+type GetPendingAutoStopPolicyRefreshRow struct {
+	EnvironmentID string
+	Generation    int64
+}
+
+func (q *Queries) GetPendingAutoStopPolicyRefresh(ctx context.Context, environmentID string) (GetPendingAutoStopPolicyRefreshRow, error) {
+	row := q.db.QueryRow(ctx, getPendingAutoStopPolicyRefresh, environmentID)
+	var i GetPendingAutoStopPolicyRefreshRow
+	err := row.Scan(&i.EnvironmentID, &i.Generation)
 	return i, err
 }
 
@@ -197,6 +238,39 @@ func (q *Queries) ListActiveAutoStopOperationTypes(ctx context.Context, environm
 			return nil, err
 		}
 		items = append(items, type_)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPendingAutoStopPolicyRefreshes = `-- name: ListPendingAutoStopPolicyRefreshes :many
+SELECT environment_id, generation
+FROM auto_stop_policies
+WHERE refresh_acknowledged_generation < generation
+ORDER BY environment_id
+LIMIT $1
+`
+
+type ListPendingAutoStopPolicyRefreshesRow struct {
+	EnvironmentID string
+	Generation    int64
+}
+
+func (q *Queries) ListPendingAutoStopPolicyRefreshes(ctx context.Context, limitCount int32) ([]ListPendingAutoStopPolicyRefreshesRow, error) {
+	rows, err := q.db.Query(ctx, listPendingAutoStopPolicyRefreshes, limitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPendingAutoStopPolicyRefreshesRow{}
+	for rows.Next() {
+		var i ListPendingAutoStopPolicyRefreshesRow
+		if err := rows.Scan(&i.EnvironmentID, &i.Generation); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

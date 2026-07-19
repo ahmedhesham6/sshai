@@ -105,7 +105,7 @@ func run(ctx context.Context) error {
 
 	profileResolveActions := workflows.NewProfileResolveActions(&profileResolveStateStore{Store: store})
 	runtimeActions := &runtimeWorkflowActions{store: store, now: time.Now}
-	snapshots := autoStopSnapshotSource{store: store}
+	snapshots := newAutoStopSnapshotSource(store)
 	dataVolumes := runtimeDataVolumeVerifier{store: store}
 	guest := unavailableGuestTransport{}
 	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)

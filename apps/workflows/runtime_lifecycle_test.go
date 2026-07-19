@@ -448,6 +448,25 @@ func TestRuntimeStopFailureReleasesAutoStopSuppression(t *testing.T) {
 	}
 }
 
+func TestRuntimeStopRejectsSnapshotThatRemainsStaleAfterBoundedRefresh(t *testing.T) {
+	harness := newRuntimeWorkflowHarness(true)
+	harness.guest.snapshotLag = time.Minute
+	environment := testfixtures.StartRestate(t, RuntimeStopDefinition(harness.stopDependencies()))
+	input := runtimeDispatch(domain.OperationRuntimeStop, domain.RuntimeStopManual)
+	if err := NewClient(environment.Ingress()).SendRuntimeOperation(t.Context(), input); err != nil {
+		t.Fatalf("send Runtime stop: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := ingress.WorkflowHandle[RuntimeStopOutput](environment.Ingress(), RuntimeStopService, input.OperationID).Attach(ctx)
+	if err == nil || !strings.Contains(err.Error(), RuntimeStopFailed) {
+		t.Fatalf("Runtime stop error = %v", err)
+	}
+	if harness.actions.runtimeStatus() != domain.RuntimeReady || harness.auto.suppressCalls != 1 || harness.auto.resumeCalls != 1 || harness.guest.shutdownCalls != 0 {
+		t.Fatalf("stale Snapshot status/suppress/resume/shutdown = %q/%d/%d/%d", harness.actions.runtimeStatus(), harness.auto.suppressCalls, harness.auto.resumeCalls, harness.guest.shutdownCalls)
+	}
+}
+
 func TestRuntimeStopClosesUsageAtObservedStoppedTime(t *testing.T) {
 	stoppedAt := time.Date(2026, time.July, 18, 12, 5, 0, 0, time.UTC)
 	harness := newRuntimeWorkflowHarness(true)
@@ -855,6 +874,7 @@ type runtimeGuestFake struct {
 	managedCalls              int
 	readiness                 RuntimeGuestReadiness
 	snapshotErr               error
+	snapshotLag               time.Duration
 }
 
 func (fake *runtimeGuestFake) WaitForRuntimeReady(_ context.Context, request RuntimeGuestReadinessRequest) (RuntimeGuestReadiness, error) {
@@ -892,7 +912,7 @@ func (fake *runtimeGuestFake) RefreshAutoStop(_ context.Context, request AutoSto
 	}
 	return AutoStopObservation{
 		RuntimeID: request.RuntimeID,
-		Snapshot:  &domain.AutoStopActivitySnapshot{RuntimeID: request.RuntimeID, Sequence: 1, ObservedAt: request.FreshAfter},
+		Snapshot:  &domain.AutoStopActivitySnapshot{RuntimeID: request.RuntimeID, Sequence: 1, ObservedAt: request.FreshAfter.Add(-fake.snapshotLag)},
 	}, nil
 }
 

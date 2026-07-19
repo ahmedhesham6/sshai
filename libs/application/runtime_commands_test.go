@@ -77,6 +77,38 @@ func TestRuntimeCommandServiceReservesStartBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestRuntimeCommandServiceReplaysStartBeforeCreditAdmission(t *testing.T) {
+	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
+	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
+	historical, err := domain.QueueOperation(domain.OperationRequest{
+		ID: "operation-historical", EnvironmentID: "environment-1", Type: domain.OperationRuntimeStart,
+		RequestedByUserID: "user-1", IdempotencyKey: "request-1", Input: []byte(`{}`), CreatedAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &runtimeCommandRepositoryFake{environment: environment, runtime: runtime, operation: historical, replay: true}
+	dispatcher := &runtimeCommandDispatcherFake{}
+	balance := &runtimeCommandBalanceFake{err: errors.New("current balance is below admission threshold")}
+	service := application.NewRuntimeCommandService(repository, dispatcher, balance, &idsFake{values: []string{"operation-unused"}}, func() time.Time { return now })
+
+	command, err := service.StartRuntime(t.Context(), application.RuntimeCommandInput{
+		OwnerUserID: "user-1", EnvironmentID: "environment-1", IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatalf("StartRuntime() replay: %v", err)
+	}
+	if got := command.Operation().Snapshot().ID; got != "operation-historical" {
+		t.Fatalf("replayed Operation ID = %q", got)
+	}
+	if balance.calls != 0 || repository.reserveCalls != 0 || repository.replayCalls != 1 {
+		t.Fatalf("replay side effects = balance:%d replay:%d reserve:%d", balance.calls, repository.replayCalls, repository.reserveCalls)
+	}
+	if len(dispatcher.operationIDs) != 1 || dispatcher.operationIDs[0] != "operation-historical" {
+		t.Fatalf("replay dispatches = %#v", dispatcher.operationIDs)
+	}
+}
+
 func TestRuntimeCommandServicePersistsAutoStopAuditEvidence(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 15, 0, 0, 0, time.UTC)
 	environment, runtime := stoppedEnvironmentRuntime(t, now.Add(-time.Hour))
@@ -180,14 +212,27 @@ func TestRuntimeCommandServiceUsesClosedCanonicalCommands(t *testing.T) {
 }
 
 type runtimeCommandRepositoryFake struct {
-	environment domain.Environment
-	runtime     domain.Runtime
-	operation   domain.Operation
-	calls       int
+	environment  domain.Environment
+	runtime      domain.Runtime
+	operation    domain.Operation
+	replay       bool
+	replayCalls  int
+	reserveCalls int
+	calls        int
+}
+
+func (repository *runtimeCommandRepositoryFake) ReplayRuntimeOperation(_ context.Context, _ domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error) {
+	repository.replayCalls++
+	if !repository.replay {
+		return domain.EnvironmentRuntimeOperation{}, false, nil
+	}
+	command, err := domain.RestoreEnvironmentRuntimeOperation(repository.environment, repository.runtime, repository.operation)
+	return command, true, err
 }
 
 func (repository *runtimeCommandRepositoryFake) ReserveRuntimeOperation(_ context.Context, operation domain.Operation) (domain.EnvironmentRuntimeOperation, error) {
 	repository.calls++
+	repository.reserveCalls++
 	if repository.operation.Snapshot().ID == "" {
 		repository.operation = operation
 	}
@@ -205,9 +250,11 @@ type runtimeCommandBalanceFake struct {
 	expectedOwnerID string
 	credits         int64
 	err             error
+	calls           int
 }
 
 func (fake *runtimeCommandBalanceFake) CreditBalance(_ context.Context, ownerID string) (db.CreditBalanceProjection, error) {
+	fake.calls++
 	if fake.expectedOwnerID != "" && ownerID != fake.expectedOwnerID {
 		return db.CreditBalanceProjection{}, errors.New("unexpected Credit Balance owner")
 	}

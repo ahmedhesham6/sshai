@@ -63,6 +63,66 @@ func TestCapsuleResolverAdapterRejectsUnconfiguredAdapter(t *testing.T) {
 	}
 }
 
+func TestAutoStopSnapshotSourceWaitsForRequestedFreshness(t *testing.T) {
+	now := time.Date(2026, time.July, 19, 15, 0, 0, 0, time.UTC)
+	policy := domain.AutoStopPolicySnapshot{
+		ID: "policy-1", EnvironmentID: "environment-1", Mode: domain.AutoStopWhenFullyIdle, GracePeriodSeconds: 60,
+	}
+	stale := dbstore.AutoStopSnapshotState{
+		RuntimeID: "runtime-1", Policy: policy, PolicyGeneration: 1,
+		Snapshot: &domain.AutoStopActivitySnapshot{RuntimeID: "runtime-1", Sequence: 7, ObservedAt: now.Add(-time.Minute)},
+	}
+	fresh := dbstore.AutoStopSnapshotState{
+		RuntimeID: "runtime-1", Policy: policy, PolicyGeneration: 1,
+		Snapshot: &domain.AutoStopActivitySnapshot{RuntimeID: "runtime-1", Sequence: 8, ObservedAt: now.Add(time.Second)},
+	}
+	tests := []struct {
+		name         string
+		states       []dbstore.AutoStopSnapshotState
+		pollTimeout  time.Duration
+		wantSequence uint64
+		wantCalls    int
+	}{
+		{name: "slow arriving fresh Snapshot", states: []dbstore.AutoStopSnapshotState{stale, stale, fresh}, pollTimeout: 100 * time.Millisecond, wantSequence: 8, wantCalls: 3},
+		{name: "bounded wait returns stale Snapshot", states: []dbstore.AutoStopSnapshotState{stale}, pollTimeout: 5 * time.Millisecond, wantSequence: 7, wantCalls: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &autoStopSnapshotStoreFake{states: test.states}
+			source := newAutoStopSnapshotSource(store)
+			source.pollTimeout = test.pollTimeout
+			source.pollInitialBackoff = time.Millisecond
+			source.pollMaxBackoff = 2 * time.Millisecond
+			observation, err := source.RefreshAutoStop(t.Context(), workflows.AutoStopRefreshRequest{
+				EnvironmentID: "environment-1", RuntimeID: "runtime-1", AfterSnapshotSequence: 7, FreshAfter: now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if observation.Snapshot == nil || observation.Snapshot.Sequence != test.wantSequence {
+				t.Fatalf("RefreshAutoStop() Snapshot = %#v", observation.Snapshot)
+			}
+			if store.calls < test.wantCalls {
+				t.Fatalf("LatestAutoStopSnapshot() calls = %d, want at least %d", store.calls, test.wantCalls)
+			}
+		})
+	}
+}
+
+type autoStopSnapshotStoreFake struct {
+	states []dbstore.AutoStopSnapshotState
+	calls  int
+}
+
+func (fake *autoStopSnapshotStoreFake) LatestAutoStopSnapshot(context.Context, string, string) (dbstore.AutoStopSnapshotState, error) {
+	index := fake.calls
+	fake.calls++
+	if index >= len(fake.states) {
+		index = len(fake.states) - 1
+	}
+	return fake.states[index], nil
+}
+
 // TestPinnedProfileVersionResolverResolvesPinnedVersionIntoALock exercises the
 // happy path of pinnedProfileVersionResolver: the pin query locates the
 // Environment and pinned Profile Version, LoadProfileVersion supplies Capsule

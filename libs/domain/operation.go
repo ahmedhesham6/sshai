@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const SystemIdempotencyKeyPrefix = "system:"
+
 type OperationType string
 
 const (

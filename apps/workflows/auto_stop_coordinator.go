@@ -197,7 +197,7 @@ func (coordinator AutoStopCoordinator) Expire(state AutoStopCoordinationState, e
 	transition.State = next
 	transition.Stop = &RuntimeStopRequest{
 		EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID, Reason: domain.RuntimeStopAutoStop,
-		IdempotencyKey: fmt.Sprintf("runtime.stop:%s:%s:%s:%d", domain.RuntimeStopAutoStop, state.EnvironmentID, state.RuntimeID, expiry.Generation),
+		IdempotencyKey: fmt.Sprintf("%sruntime.stop:%s:%s:%s:%d", domain.SystemIdempotencyKeyPrefix, domain.RuntimeStopAutoStop, state.EnvironmentID, state.RuntimeID, expiry.Generation),
 		AuditEvidence: &domain.RuntimeStopAuditEvidence{
 			Policy: expiry.Observation.Policy, PolicyGeneration: expiry.Observation.PolicyGeneration,
 			QualifyingSnapshots: []domain.AutoStopActivitySnapshot{graceStart, graceExpiry},

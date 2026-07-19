@@ -67,11 +67,15 @@ func run(ctx context.Context) error {
 	workflowClient := workflows.NewClient(ingress.NewClient(config.restateIngressURL))
 	dispatcher := application.NewEnvironmentCreateDispatcher(store, workflowClient)
 	runtimeDispatcher := application.NewRuntimeOperationDispatcher(store, workflowClient)
+	autoStopPolicyRefreshDispatcher := application.NewAutoStopPolicyRefreshDispatcher(store, workflowClient)
 	recovery := application.NewWorkflowRecovery(dispatcher, 5*time.Second, 100, func(err error) {
 		slog.Error("workflow recovery failed", "error", err)
 	})
 	runtimeRecovery := application.NewRuntimeWorkflowRecovery(runtimeDispatcher, 5*time.Second, 100, func(err error) {
 		slog.Error("Runtime workflow recovery failed", "error", err)
+	})
+	autoStopPolicyRefreshRecovery := application.NewAutoStopPolicyRefreshRecovery(autoStopPolicyRefreshDispatcher, 5*time.Second, 100, func(err error) {
+		slog.Error("Auto-stop Policy refresh recovery failed", "error", err)
 	})
 	go func() {
 		if err := recovery.Run(ctx); err != nil {
@@ -81,6 +85,11 @@ func run(ctx context.Context) error {
 	go func() {
 		if err := runtimeRecovery.Run(ctx); err != nil {
 			slog.Error("Runtime workflow recovery stopped", "error", err)
+		}
+	}()
+	go func() {
+		if err := autoStopPolicyRefreshRecovery.Run(ctx); err != nil {
+			slog.Error("Auto-stop Policy refresh recovery stopped", "error", err)
 		}
 	}()
 	ids := uuidGenerator{}
@@ -117,7 +126,7 @@ func run(ctx context.Context) error {
 		map[string]string{config.defaultRegion: config.defaultAvailabilityZone},
 	)
 	runtimeCommands := application.NewRuntimeCommandService(store, runtimeDispatcher, store, ids, time.Now)
-	autoStopPolicies := application.NewAutoStopPolicyService(store, workflowClient, ids, time.Now)
+	autoStopPolicies := application.NewAutoStopPolicyService(store, autoStopPolicyRefreshDispatcher, ids, time.Now)
 	registerProjectSeed := application.NewRegisterProjectSeedService(store, uploads, ids, time.Now)
 	profiles := application.NewProfileService(store, uploads, ids, time.Now)
 	sshKeys := application.NewSSHKeyService(store, ids, time.Now)

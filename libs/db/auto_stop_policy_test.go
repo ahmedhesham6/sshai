@@ -37,6 +37,23 @@ func TestStoreUpdatesAutoStopPolicyWithHonestSynchronousOperation(t *testing.T) 
 			}
 		})
 	}
+	refresh, pending, err := store.PendingAutoStopPolicyRefresh(ctx, "environment-1")
+	if err != nil || !pending || refresh.Generation != 2 {
+		t.Fatalf("pending Policy refresh = %#v pending:%t error:%v", refresh, pending, err)
+	}
+	if err := store.AcknowledgeAutoStopPolicyRefresh(ctx, refresh.EnvironmentID, refresh.Generation); err != nil {
+		t.Fatalf("AcknowledgeAutoStopPolicyRefresh(): %v", err)
+	}
+	if _, pending, err := store.PendingAutoStopPolicyRefresh(ctx, "environment-1"); err != nil || pending {
+		t.Fatalf("acknowledged Policy refresh pending:%t error:%v", pending, err)
+	}
+	if _, applied, err := store.UpdateAutoStopPolicy(ctx, "user-1", policy, synchronousPolicyOperation(t, "operation-policy-2", "request-policy-0002", createdAt.Add(time.Minute))); err != nil || !applied {
+		t.Fatalf("second UpdateAutoStopPolicy() applied:%t error:%v", applied, err)
+	}
+	refresh, pending, err = store.PendingAutoStopPolicyRefresh(ctx, "environment-1")
+	if err != nil || !pending || refresh.Generation != 3 {
+		t.Fatalf("next pending Policy refresh = %#v pending:%t error:%v", refresh, pending, err)
+	}
 
 	var mode string
 	var grace int
@@ -51,7 +68,7 @@ func TestStoreUpdatesAutoStopPolicyWithHonestSynchronousOperation(t *testing.T) 
 	if mode != string(domain.AutoStopWhenFullyIdle) || grace != 300 || invocationID != nil {
 		t.Fatalf("stored Policy/Operation = mode:%q grace:%d invocation:%v", mode, grace, invocationID)
 	}
-	_, err := pool.Exec(ctx, `
+	_, err = pool.Exec(ctx, `
 		INSERT INTO operations (
 			id, environment_id, type, status, requested_by_user_id, idempotency_key,
 			input, created_at, completed_at

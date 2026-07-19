@@ -37,18 +37,18 @@ type AutoStopPolicyRepository interface {
 	UpdateAutoStopPolicy(context.Context, string, domain.AutoStopPolicy, domain.Operation) (domain.Operation, bool, error)
 }
 
-type AutoStopPolicyRefreshSender interface {
-	SendAutoStopPolicyRefresh(context.Context, string, string) error
+type AutoStopPolicyRefreshDelivery interface {
+	DispatchAutoStopPolicyRefresh(context.Context, string) error
 }
 
 type AutoStopPolicyService struct {
 	repository AutoStopPolicyRepository
-	refresh    AutoStopPolicyRefreshSender
+	refresh    AutoStopPolicyRefreshDelivery
 	ids        IDGenerator
 	now        func() time.Time
 }
 
-func NewAutoStopPolicyService(repository AutoStopPolicyRepository, refresh AutoStopPolicyRefreshSender, ids IDGenerator, now func() time.Time) *AutoStopPolicyService {
+func NewAutoStopPolicyService(repository AutoStopPolicyRepository, refresh AutoStopPolicyRefreshDelivery, ids IDGenerator, now func() time.Time) *AutoStopPolicyService {
 	return &AutoStopPolicyService{repository: repository, refresh: refresh, ids: ids, now: now}
 }
 
@@ -91,7 +91,7 @@ func (service *AutoStopPolicyService) UpdateAutoStopPolicy(ctx context.Context, 
 	if err != nil {
 		return AutoStopPolicyUpdate{}, fmt.Errorf("update Auto-stop Policy: %w", err)
 	}
-	if err := service.refresh.SendAutoStopPolicyRefresh(ctx, input.EnvironmentID, "auto-stop-policy-refresh:"+persisted.Snapshot().ID); err != nil {
+	if err := service.refresh.DispatchAutoStopPolicyRefresh(ctx, input.EnvironmentID); err != nil {
 		return AutoStopPolicyUpdate{}, fmt.Errorf("update Auto-stop Policy: signal coordinator refresh: %w", err)
 	}
 	return AutoStopPolicyUpdate{policy: policy, operation: persisted, applied: applied}, nil

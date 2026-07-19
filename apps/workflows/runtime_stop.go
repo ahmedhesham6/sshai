@@ -114,9 +114,11 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 		return resumeAutoStopAndFailRuntimeStop(ctx, dependencies, input, state, code, message)
 	}
 	snapshot, err := restate.Run(ctx, func(runCtx restate.RunContext) (AutoStopObservation, error) {
+		freshAfter := dependencies.Now()
 		observation, err := dependencies.Snapshots.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
-			EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID, FreshAfter: dependencies.Now(),
+			EnvironmentID: input.EnvironmentID, RuntimeID: input.RuntimeID, FreshAfter: freshAfter,
 		})
+		observation.FreshAfter = freshAfter
 		return observation, classifyDurableError(err)
 	}, restate.WithName("request-activity-snapshot"))
 	if err != nil {
@@ -124,6 +126,9 @@ func (workflow *runtimeStopWorkflow) Run(ctx restate.WorkflowContext, input doma
 	}
 	if snapshot.RuntimeID != input.RuntimeID || snapshot.Snapshot == nil || snapshot.Snapshot.RuntimeID != input.RuntimeID {
 		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, "Activity Snapshot belongs to another Runtime")
+	}
+	if snapshot.FreshAfter.IsZero() || snapshot.Snapshot.ObservedAt.Before(snapshot.FreshAfter) {
+		return RuntimeStopOutput{}, failWhileReady(RuntimeStopFailed, "Activity Snapshot is stale")
 	}
 	if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
 		return classifyDurableError(dependencies.Actions.RecordRuntimeStopSnapshot(runCtx, input.OperationID, snapshot))

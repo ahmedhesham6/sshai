@@ -42,7 +42,9 @@ func (store *Store) StoreActivitySnapshot(ctx context.Context, environmentID str
 		return fmt.Errorf("store Activity Snapshot: insert: %w", err)
 	}
 	if inserted == 0 {
-		row, err := store.queries.GetActivitySnapshot(ctx, dbsql.GetActivitySnapshotParams{RuntimeID: snapshot.RuntimeID, Sequence: int64(snapshot.Sequence)})
+		row, err := store.queries.GetActivitySnapshot(ctx, dbsql.GetActivitySnapshotParams{
+			RuntimeID: snapshot.RuntimeID, Sequence: int64(snapshot.Sequence), EnvironmentID: environmentID,
+		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrReferenceNotOwned
 		}

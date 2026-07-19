@@ -60,7 +60,7 @@ func TestAutoStopPolicyServiceRecordsHonestSynchronousSuccess(t *testing.T) {
 		operation.RestateInvocationID != nil || operation.CompletedAt == nil || !operation.CompletedAt.Equal(fixedAutoStopNow()) {
 		t.Fatalf("synchronous Operation = %#v", operation)
 	}
-	if refresh.calls != 1 || refresh.environmentID != "environment-1" || refresh.idempotencyKey != "auto-stop-policy-refresh:operation-1" {
+	if refresh.calls != 1 || refresh.environmentID != "environment-1" {
 		t.Fatalf("coordinator refresh = %#v", refresh)
 	}
 }
@@ -78,15 +78,13 @@ func (repository *autoStopPolicyRepositoryFake) UpdateAutoStopPolicy(_ context.C
 }
 
 type autoStopPolicyRefreshFake struct {
-	calls          int
-	environmentID  string
-	idempotencyKey string
+	calls         int
+	environmentID string
 }
 
-func (fake *autoStopPolicyRefreshFake) SendAutoStopPolicyRefresh(_ context.Context, environmentID, idempotencyKey string) error {
+func (fake *autoStopPolicyRefreshFake) DispatchAutoStopPolicyRefresh(_ context.Context, environmentID string) error {
 	fake.calls++
 	fake.environmentID = environmentID
-	fake.idempotencyKey = idempotencyKey
 	return nil
 }
 

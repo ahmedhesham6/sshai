@@ -41,6 +41,9 @@ func TestStorePersistsAndLoadsLatestAutoStopActivitySnapshot(t *testing.T) {
 	if err := store.StoreActivitySnapshot(ctx, "environment-1", conflict); !errors.Is(err, dbstore.ErrIdempotencyConflict) {
 		t.Fatalf("conflicting Snapshot replay error = %v", err)
 	}
+	if err := store.StoreActivitySnapshot(ctx, "environment-foreign", second); !errors.Is(err, dbstore.ErrReferenceNotOwned) {
+		t.Fatalf("foreign Environment Snapshot replay error = %v", err)
+	}
 	if err := store.StoreActivitySnapshot(ctx, "environment-1", domain.AutoStopActivitySnapshot{
 		RuntimeID: "runtime-old", Sequence: 1, ObservedAt: createdAt,
 	}); !errors.Is(err, dbstore.ErrReferenceNotOwned) {

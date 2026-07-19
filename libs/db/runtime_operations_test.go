@@ -30,6 +30,10 @@ func TestStoreReservesRuntimeOperationWithExactIdempotencyIdentity(t *testing.T)
 	}
 
 	replay := runtimeOperationCandidate(t, "operation-unused", "environment-1", domain.OperationRuntimeStart, "request-1", []byte(`{}`), createdAt.Add(2*time.Hour))
+	lookedUp, present, err := store.ReplayRuntimeOperation(ctx, replay)
+	if err != nil || !present || lookedUp.Operation().Snapshot().ID != "operation-1" {
+		t.Fatalf("ReplayRuntimeOperation() = %#v present:%t error:%v", lookedUp.Operation().Snapshot(), present, err)
+	}
 	replayed, err := store.ReserveRuntimeOperation(ctx, replay)
 	if err != nil || replayed.Operation().Snapshot().ID != "operation-1" {
 		t.Fatalf("replay = %#v error:%v", replayed.Operation().Snapshot(), err)

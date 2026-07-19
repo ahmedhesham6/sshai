@@ -2,9 +2,12 @@ package workflows
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/ahmedhesham6/sshai/libs/db"
 	restate "github.com/restatedev/sdk-go"
 	"github.com/restatedev/sdk-go/ingress"
 )
@@ -49,6 +52,11 @@ type RuntimeStopDispatcher interface {
 type autoStopObject struct {
 	source     AutoStopSnapshotSource
 	dispatcher RuntimeStopDispatcher
+}
+
+type autoStopSnapshotRead struct {
+	Observation          AutoStopObservation
+	ReferenceUnavailable bool
 }
 
 func AutoStopDefinition(source AutoStopSnapshotSource, dispatcher RuntimeStopDispatcher) restate.ServiceDefinition {
@@ -136,15 +144,25 @@ func (object *autoStopObject) Refresh(ctx restate.ObjectContext, _ AutoStopRefre
 	if err != nil {
 		return AutoStopTransition{}, err
 	}
-	observation, err := restate.Run(ctx, func(runCtx restate.RunContext) (AutoStopObservation, error) {
-		return object.source.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
+	read, err := restate.Run(ctx, func(runCtx restate.RunContext) (autoStopSnapshotRead, error) {
+		observation, err := object.source.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
 			EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID,
 			FreshAfter: processedAt.Add(-autoStopStaleThreshold),
 		})
+		if errors.Is(err, db.ErrReferenceNotOwned) {
+			return autoStopSnapshotRead{ReferenceUnavailable: true}, nil
+		}
+		return autoStopSnapshotRead{Observation: observation}, err
 	}, restate.WithName("refresh-auto-stop-policy"))
 	if err != nil {
 		return AutoStopTransition{}, err
 	}
+	if read.ReferenceUnavailable {
+		transition := abandonAutoStopRuntime(state)
+		restate.Set(ctx, autoStopStateKey, transition.State)
+		return transition, nil
+	}
+	observation := read.Observation
 	observation.FreshAfter = processedAt.Add(-autoStopStaleThreshold)
 	observation.ProcessedAt = processedAt
 	transition, err := (AutoStopCoordinator{}).Observe(state, observation)
@@ -164,7 +182,7 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 	if !currentAutoStopTimer(state, timer) {
 		return AutoStopTransition{State: state}, nil
 	}
-	observation, err := restate.Run(ctx, func(runCtx restate.RunContext) (AutoStopObservation, error) {
+	read, err := restate.Run(ctx, func(runCtx restate.RunContext) (autoStopSnapshotRead, error) {
 		freshAfter := time.Now().UTC()
 		observation, err := object.source.RefreshAutoStop(runCtx, AutoStopRefreshRequest{
 			EnvironmentID: state.EnvironmentID, RuntimeID: state.RuntimeID,
@@ -172,11 +190,20 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 		})
 		observation.FreshAfter = freshAfter
 		observation.ProcessedAt = time.Now().UTC()
-		return observation, err
+		if errors.Is(err, db.ErrReferenceNotOwned) {
+			return autoStopSnapshotRead{ReferenceUnavailable: true}, nil
+		}
+		return autoStopSnapshotRead{Observation: observation}, err
 	}, restate.WithName("refresh-activity-snapshot"))
 	if err != nil {
 		return AutoStopTransition{}, err
 	}
+	if read.ReferenceUnavailable {
+		transition := abandonAutoStopRuntime(state)
+		restate.Set(ctx, autoStopStateKey, transition.State)
+		return transition, nil
+	}
+	observation := read.Observation
 	transition, evaluationErr := (AutoStopCoordinator{}).Expire(state, AutoStopExpiry{
 		RuntimeID: timer.RuntimeID, Generation: timer.Generation, Observation: observation,
 	})
@@ -185,10 +212,26 @@ func (object *autoStopObject) Expire(ctx restate.ObjectContext, timer AutoStopTi
 	}
 	if transition.Stop != nil {
 		request := *transition.Stop
-		if err := restate.RunVoid(ctx, func(runCtx restate.RunContext) error {
-			return object.dispatcher.DispatchRuntimeStop(runCtx, request)
-		}, restate.WithName("dispatch-runtime-stop")); err != nil {
+		conflict, err := restate.Run(ctx, func(runCtx restate.RunContext) (bool, error) {
+			err := object.dispatcher.DispatchRuntimeStop(runCtx, request)
+			if errors.Is(err, db.ErrIdempotencyConflict) {
+				return true, nil
+			}
+			return false, err
+		}, restate.WithName("dispatch-runtime-stop"))
+		if err != nil {
 			return AutoStopTransition{}, err
+		}
+		if conflict {
+			slog.WarnContext(ctx, "automatic Runtime stop idempotency conflict ended dispatch cycle",
+				"environment_id", request.EnvironmentID, "runtime_id", request.RuntimeID,
+				"timer_generation", transition.State.TimerGeneration, "idempotency_key", request.IdempotencyKey)
+			transition.Stop = nil
+			transition.Cancelled = true
+			transition.State.TimerPending = false
+			transition.State.DispatchedGeneration = 0
+			transition.State.GraceStartedAt = time.Time{}
+			transition.State.GraceStartSnapshot = nil
 		}
 	}
 	restate.Set(ctx, autoStopStateKey, transition.State)
@@ -208,6 +251,25 @@ func (object *autoStopObject) schedule(ctx restate.ObjectContext, timer *AutoSto
 
 func currentAutoStopTimer(state AutoStopCoordinationState, timer AutoStopTimer) bool {
 	return state.TimerPending && state.RuntimeID == timer.RuntimeID && state.TimerGeneration == timer.Generation
+}
+
+func abandonAutoStopRuntime(state AutoStopCoordinationState) AutoStopTransition {
+	transition := AutoStopTransition{State: state, Cancelled: state.TimerPending}
+	if state.TimerPending {
+		transition.State.TimerGeneration++
+	}
+	transition.State.RuntimeID = ""
+	transition.State.PolicyID = ""
+	transition.State.PolicyMode = ""
+	transition.State.PolicyGraceSeconds = 0
+	transition.State.PolicyGeneration = 0
+	transition.State.TimerPending = false
+	transition.State.LastSnapshotSequence = 0
+	transition.State.DispatchedGeneration = 0
+	transition.State.SuppressedRuntimeID = ""
+	transition.State.GraceStartedAt = time.Time{}
+	transition.State.GraceStartSnapshot = nil
+	return transition
 }
 
 func (client *Client) SendAutoStopObservation(ctx context.Context, environmentID string, input AutoStopObservation, idempotencyKey string) error {

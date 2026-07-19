@@ -38,7 +38,27 @@ SELECT runtime_id, sequence, environment_id, observed_at,
        protected_processes, selected_containers, unknown_user_processes
 FROM activity_snapshots
 WHERE runtime_id = sqlc.arg(runtime_id)
+  AND environment_id = sqlc.arg(environment_id)
   AND sequence = sqlc.arg(sequence);
+
+-- name: GetPendingAutoStopPolicyRefresh :one
+SELECT environment_id, generation
+FROM auto_stop_policies
+WHERE environment_id = sqlc.arg(environment_id)
+  AND refresh_acknowledged_generation < generation;
+
+-- name: ListPendingAutoStopPolicyRefreshes :many
+SELECT environment_id, generation
+FROM auto_stop_policies
+WHERE refresh_acknowledged_generation < generation
+ORDER BY environment_id
+LIMIT sqlc.arg(limit_count);
+
+-- name: AcknowledgeAutoStopPolicyRefresh :execrows
+UPDATE auto_stop_policies
+SET refresh_acknowledged_generation = GREATEST(refresh_acknowledged_generation, sqlc.arg(generation))
+WHERE environment_id = sqlc.arg(environment_id)
+  AND generation >= sqlc.arg(generation);
 
 -- name: ListActiveAutoStopOperationTypes :many
 SELECT type

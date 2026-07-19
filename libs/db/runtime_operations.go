@@ -15,6 +15,22 @@ import (
 
 var ErrOperationConflict = errors.New("Environment already has an active Operation")
 
+func (store *Store) ReplayRuntimeOperation(ctx context.Context, candidate domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error) {
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, false, fmt.Errorf("replay Runtime Operation: begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, present, err := replayRuntimeOperation(ctx, store.queries.WithTx(tx), candidate)
+	if err != nil || !present {
+		return domain.EnvironmentRuntimeOperation{}, present, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.EnvironmentRuntimeOperation{}, false, fmt.Errorf("replay Runtime Operation: commit: %w", err)
+	}
+	return command, true, nil
+}
+
 func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domain.Operation) (domain.EnvironmentRuntimeOperation, error) {
 	tx, err := store.pool.Begin(ctx)
 	if err != nil {
@@ -27,35 +43,18 @@ func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domai
 		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: lock idempotency key: %w", err)
 	}
 
-	existing, err := queries.GetOperationByIdempotencyKey(ctx, dbsql.GetOperationByIdempotencyKeyParams{
-		OwnerUserID: operation.RequestedByUserID, IdempotencyKey: operation.IdempotencyKey,
-	})
-	if err == nil {
-		if existing.EnvironmentID != operation.EnvironmentID || existing.Type != string(operation.Type) || !sameJSON(existing.Input, operation.Input) {
-			return domain.EnvironmentRuntimeOperation{}, ErrIdempotencyConflict
-		}
-		restored, err := restoreOperation(existing)
-		if err != nil {
-			return domain.EnvironmentRuntimeOperation{}, err
-		}
-		targetID, err := queries.GetRuntimeOperationTarget(ctx, existing.ID)
-		if err != nil {
-			return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: read target: %w", err)
-		}
-		command, err := loadRuntimeOperation(ctx, queries, restored, &targetID, true)
-		if err != nil {
-			return domain.EnvironmentRuntimeOperation{}, err
-		}
+	command, present, err := replayRuntimeOperation(ctx, queries, candidate)
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, err
+	}
+	if present {
 		if err := tx.Commit(ctx); err != nil {
 			return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: commit replay: %w", err)
 		}
 		return command, nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: read idempotency key: %w", err)
-	}
 
-	command, err := loadRuntimeOperation(ctx, queries, candidate, nil, false)
+	command, err = loadRuntimeOperation(ctx, queries, candidate, nil, false)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.EnvironmentRuntimeOperation{}, ErrReferenceNotOwned
 	}
@@ -88,6 +87,35 @@ func (store *Store) ReserveRuntimeOperation(ctx context.Context, candidate domai
 		return domain.EnvironmentRuntimeOperation{}, fmt.Errorf("reserve Runtime Operation: commit: %w", err)
 	}
 	return command, nil
+}
+
+func replayRuntimeOperation(ctx context.Context, queries *dbsql.Queries, candidate domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error) {
+	operation := candidate.Snapshot()
+	existing, err := queries.GetOperationByIdempotencyKey(ctx, dbsql.GetOperationByIdempotencyKeyParams{
+		OwnerUserID: operation.RequestedByUserID, IdempotencyKey: operation.IdempotencyKey,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.EnvironmentRuntimeOperation{}, false, nil
+	}
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, false, fmt.Errorf("replay Runtime Operation: read idempotency key: %w", err)
+	}
+	if existing.EnvironmentID != operation.EnvironmentID || existing.Type != string(operation.Type) || !sameJSON(existing.Input, operation.Input) {
+		return domain.EnvironmentRuntimeOperation{}, false, ErrIdempotencyConflict
+	}
+	restored, err := restoreOperation(existing)
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, false, err
+	}
+	targetID, err := queries.GetRuntimeOperationTarget(ctx, existing.ID)
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, false, fmt.Errorf("replay Runtime Operation: read target: %w", err)
+	}
+	command, err := loadRuntimeOperation(ctx, queries, restored, &targetID, true)
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, false, err
+	}
+	return command, true, nil
 }
 
 func loadRuntimeOperation(ctx context.Context, queries *dbsql.Queries, operation domain.Operation, targetRuntimeID *string, replay bool) (domain.EnvironmentRuntimeOperation, error) {
