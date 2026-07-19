@@ -10,7 +10,10 @@ import (
 	"github.com/ahmedhesham6/sshai/libs/domain"
 )
 
-var ErrInvalidRuntimeCommand = errors.New("invalid Runtime command")
+var (
+	ErrInvalidRuntimeCommand = errors.New("invalid Runtime command")
+	ErrCreditsPolicyBlocked  = errors.New("credit policy blocks Runtime start")
+)
 
 type RuntimeCommandInput struct {
 	OwnerUserID    string

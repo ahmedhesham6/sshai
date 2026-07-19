@@ -116,6 +116,89 @@ func TestStoreHistoricalRuntimeOperationReplayKeepsOriginalTarget(t *testing.T) 
 	}
 }
 
+func TestStoreRuntimeOperationIdempotencyReplayIgnoresCurrentLifecycle(t *testing.T) {
+	tests := []struct {
+		name      string
+		lifecycle domain.EnvironmentLifecycle
+	}{
+		{name: "active Environment", lifecycle: domain.EnvironmentActive},
+		{name: "deleting Environment", lifecycle: domain.EnvironmentDeleting},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, pool := openTestStoreAndPool(t, ctx)
+			createdAt := time.Date(2026, time.July, 13, 16, 0, 0, 0, time.UTC)
+			insertRuntimeOperationState(t, ctx, pool, createdAt)
+			candidate := runtimeOperationCandidate(t, "operation-1", "environment-1", domain.OperationRuntimeStart, "request-1", []byte(`{}`), createdAt.Add(time.Hour))
+			if _, err := store.ReserveRuntimeOperation(ctx, candidate); err != nil {
+				t.Fatalf("reserve Runtime Operation: %v", err)
+			}
+			completedAt := createdAt.Add(2 * time.Hour)
+			if _, err := pool.Exec(ctx, `
+				UPDATE operations
+				SET status = 'succeeded', restate_invocation_id = 'invocation-1', completed_at = $1
+				WHERE id = 'operation-1'`, completedAt); err != nil {
+				t.Fatalf("complete Runtime Operation: %v", err)
+			}
+			if test.lifecycle != domain.EnvironmentActive {
+				insertRuntimeOperationEnvironmentState(t, ctx, pool, createdAt)
+				if _, err := pool.Exec(ctx, `
+					UPDATE environments
+					SET lifecycle = $1, updated_at = $2, version = version + 1
+					WHERE id = 'environment-1'`, string(test.lifecycle), completedAt.Add(time.Minute)); err != nil {
+					t.Fatalf("move Environment to %q: %v", test.lifecycle, err)
+				}
+			}
+
+			replayed, err := store.ReserveRuntimeOperation(ctx, runtimeOperationCandidate(
+				t, "operation-unused", "environment-1", domain.OperationRuntimeStart,
+				"request-1", []byte(`{}`), completedAt.Add(time.Hour),
+			))
+			if err != nil {
+				t.Fatalf("replay historical Runtime Operation: %v", err)
+			}
+			if got := replayed.Operation().Snapshot().ID; got != "operation-1" {
+				t.Fatalf("replayed Operation ID = %q, want historical Operation", got)
+			}
+			if got := replayed.Environment().Snapshot().Lifecycle; got != test.lifecycle {
+				t.Fatalf("current Environment lifecycle = %q, want %q", got, test.lifecycle)
+			}
+		})
+	}
+}
+
+func insertRuntimeOperationEnvironmentState(t *testing.T, ctx context.Context, pool *pgxpool.Pool, createdAt time.Time) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin Environment State inventory: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	statements := []string{
+		`INSERT INTO operations (id, environment_id, type, status, requested_by_user_id, idempotency_key, restate_invocation_id, input, created_at, completed_at)
+		 VALUES ('operation-create-state', 'environment-1', 'environment.create', 'succeeded', 'user-1', 'request-create-state', 'invocation-create-state', '{}', $1, $1)`,
+		`INSERT INTO provider_resources (id, environment_id, operation_id, provider, region, resource_type, provider_id, metadata, created_at)
+		 VALUES ('resource-state', 'environment-1', 'operation-create-state', 'aws', 'us-east-1', 'data_volume', 'volume-state', '{}', $1)`,
+		`INSERT INTO state_components (id, environment_id, kind, durability, mount_path, backend_resource_id, backend_resource_type, health, created_at, updated_at)
+		 VALUES ('state-workspace', 'environment-1', 'workspace', 'durable', '/workspace', 'resource-state', 'data_volume', 'healthy', $1, $1)`,
+		`INSERT INTO state_components (id, environment_id, kind, durability, mount_path, backend_resource_id, backend_resource_type, health, created_at, updated_at)
+		 VALUES ('state-home', 'environment-1', 'home', 'durable', '/home/dev', 'resource-state', 'data_volume', 'healthy', $1, $1)`,
+		`INSERT INTO state_components (id, environment_id, kind, durability, mount_path, backend_resource_id, backend_resource_type, health, created_at, updated_at)
+		 VALUES ('state-services', 'environment-1', 'services', 'durable', '/var/lib/docker', 'resource-state', 'data_volume', 'healthy', $1, $1)`,
+		`INSERT INTO state_components (id, environment_id, kind, durability, mount_path, backend_resource_id, backend_resource_type, health, created_at, updated_at)
+		 VALUES ('state-cache', 'environment-1', 'cache', 'disposable', '/var/cache/devm', 'resource-state', 'data_volume', 'healthy', $1, $1)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(ctx, statement, createdAt); err != nil {
+			t.Fatalf("inventory Environment State: %v", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit Environment State inventory: %v", err)
+	}
+}
+
 func TestStoreSerializesConcurrentRuntimeOperationReservation(t *testing.T) {
 	ctx := context.Background()
 	store, pool := openTestStoreAndPool(t, ctx)
@@ -191,6 +274,51 @@ func TestStoreSerializesConcurrentRuntimeOperationConflicts(t *testing.T) {
 			}
 			t.Fatalf("concurrent conflict errors = %v, %v; want one nil and one %v", first, second, test.want)
 		})
+	}
+}
+
+func TestStoreSerializesEnvironmentCreateAndRuntimeOperationIdempotency(t *testing.T) {
+	ctx := context.Background()
+	store, pool := openTestStoreAndPool(t, ctx)
+	createdAt := time.Date(2026, time.July, 19, 14, 0, 0, 0, time.UTC)
+	insertRuntimeOperationState(t, ctx, pool, createdAt.Add(-time.Hour))
+	idempotencyKey := "shared-create-runtime-key-0001"
+	creation := newEnvironmentCreationWithSeed(
+		t, "environment-2", "policy-2", "operation-create", "project-seed-1", "workspace",
+		idempotencyKey, []byte(`{"name":"workspace"}`), createdAt,
+	)
+	runtimeOperation := runtimeOperationCandidate(
+		t, "operation-runtime", "environment-1", domain.OperationRuntimeStart,
+		idempotencyKey, []byte(`{}`), createdAt,
+	)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		_, err := store.ReserveEnvironmentCreation(ctx, creation)
+		results <- err
+	}()
+	go func() {
+		<-start
+		_, err := store.ReserveRuntimeOperation(ctx, runtimeOperation)
+		results <- err
+	}()
+	close(start)
+	first, second := <-results, <-results
+	if !((first == nil && errors.Is(second, dbstore.ErrIdempotencyConflict)) ||
+		(second == nil && errors.Is(first, dbstore.ErrIdempotencyConflict))) {
+		t.Fatalf("concurrent create and Runtime command = %v, %v; want one success and one idempotency conflict", first, second)
+	}
+
+	var operationCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM operations
+		WHERE requested_by_user_id = 'user-1' AND idempotency_key = $1`, idempotencyKey).Scan(&operationCount); err != nil {
+		t.Fatal(err)
+	}
+	if operationCount != 1 {
+		t.Fatalf("Operations with shared idempotency key = %d, want 1", operationCount)
 	}
 }
 
