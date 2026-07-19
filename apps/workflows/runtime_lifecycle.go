@@ -31,6 +31,7 @@ type RuntimeOperationState struct {
 	Runtime                domain.RuntimeSnapshot `json:"runtime"`
 	DataVolumeProviderID   string                 `json:"dataVolumeProviderId"`
 	ComputeUsageIntervalID string                 `json:"computeUsageIntervalId,omitempty"`
+	OperationInput         []byte                 `json:"operationInput,omitempty"`
 }
 
 type RuntimeLifecycleActions interface {
@@ -414,6 +415,8 @@ func (client *Client) SendRuntimeOperation(ctx context.Context, input domain.Run
 		service = RuntimeStopService
 	case domain.OperationRuntimeReplace:
 		service = RuntimeReplaceService
+	case domain.OperationProfileApply:
+		service = ProfileApplyService
 	default:
 		return fmt.Errorf("send Runtime Operation: unsupported type %q", input.OperationType)
 	}

@@ -63,7 +63,7 @@ func (command EnvironmentRuntimeOperation) Runtime() Runtime         { return co
 func (command EnvironmentRuntimeOperation) Operation() Operation     { return command.operation }
 
 func (operationType OperationType) runtimeCommand() bool {
-	return operationType == OperationRuntimeStart || operationType == OperationRuntimeStop || operationType == OperationRuntimeReplace
+	return operationType == OperationRuntimeStart || operationType == OperationRuntimeStop || operationType == OperationRuntimeReplace || operationType == OperationProfileApply
 }
 
 func (operationType OperationType) acceptsRuntimeState(runtimeStatus RuntimeStatus, operationStatus OperationStatus) bool {
@@ -74,6 +74,8 @@ func (operationType OperationType) acceptsRuntimeState(runtimeStatus RuntimeStat
 		return runtimeStatus == RuntimeReady || runtimeStatus == RuntimeStopped || runtimeStatus == RuntimeStopping && operationStatus == OperationRunning
 	case OperationRuntimeReplace:
 		return runtimeStatus == RuntimeReady || runtimeStatus == RuntimeStopped || runtimeStatus == RuntimeError || runtimeStatus == RuntimeReplacing && operationStatus == OperationRunning
+	case OperationProfileApply:
+		return runtimeStatus == RuntimeReady
 	default:
 		return false
 	}

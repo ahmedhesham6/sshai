@@ -22,6 +22,14 @@ type RuntimeCommandInput struct {
 	IdempotencyKey string
 }
 
+type ProfileApplyCommandInput struct {
+	OwnerUserID         string
+	EnvironmentID       string
+	ProfileVersionID    string
+	ApprovedReviewItems []string
+	IdempotencyKey      string
+}
+
 type RuntimeOperationRepository interface {
 	ReplayRuntimeOperation(context.Context, domain.Operation) (domain.EnvironmentRuntimeOperation, bool, error)
 	ReserveRuntimeOperation(context.Context, domain.Operation) (domain.EnvironmentRuntimeOperation, error)
@@ -100,6 +108,32 @@ func (service *RuntimeCommandService) StopRuntimeWithReason(ctx context.Context,
 
 func (service *RuntimeCommandService) ReplaceRuntime(ctx context.Context, input RuntimeCommandInput) (domain.EnvironmentRuntimeOperation, error) {
 	return service.commandRuntime(ctx, input, domain.OperationRuntimeReplace, []byte(`{}`))
+}
+
+func (service *RuntimeCommandService) ApplyProfile(ctx context.Context, input ProfileApplyCommandInput) (domain.EnvironmentRuntimeOperation, error) {
+	if service == nil || !canonicalIdentity(input.ProfileVersionID) {
+		return domain.EnvironmentRuntimeOperation{}, ErrInvalidRuntimeCommand
+	}
+	seen := make(map[string]struct{}, len(input.ApprovedReviewItems))
+	for _, item := range input.ApprovedReviewItems {
+		if !canonicalIdentity(item) {
+			return domain.EnvironmentRuntimeOperation{}, ErrInvalidRuntimeCommand
+		}
+		if _, duplicate := seen[item]; duplicate {
+			return domain.EnvironmentRuntimeOperation{}, ErrInvalidRuntimeCommand
+		}
+		seen[item] = struct{}{}
+	}
+	canonicalInput, err := json.Marshal(struct {
+		ProfileVersionID    string   `json:"profileVersionId"`
+		ApprovedReviewItems []string `json:"approvedReviewItems,omitempty"`
+	}{ProfileVersionID: input.ProfileVersionID, ApprovedReviewItems: append([]string(nil), input.ApprovedReviewItems...)})
+	if err != nil {
+		return domain.EnvironmentRuntimeOperation{}, err
+	}
+	return service.commandRuntime(ctx, RuntimeCommandInput{
+		OwnerUserID: input.OwnerUserID, EnvironmentID: input.EnvironmentID, IdempotencyKey: input.IdempotencyKey,
+	}, domain.OperationProfileApply, canonicalInput)
 }
 
 func (service *RuntimeCommandService) commandRuntime(ctx context.Context, input RuntimeCommandInput, operationType domain.OperationType, canonicalInput []byte) (domain.EnvironmentRuntimeOperation, error) {

@@ -226,7 +226,7 @@ JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.operation_id = $1
   AND outbox.started_at IS NULL
   AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at <= statement_timestamp())
-  AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace')
+  AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace', 'profile.apply')
 `
 
 type GetPendingRuntimeOperationRow struct {
@@ -350,7 +350,7 @@ JOIN runtime_operation_targets target
  AND target.operation_type = outbox.kind
 JOIN operations operation ON operation.id = outbox.operation_id
 WHERE outbox.started_at IS NULL
-  AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace')
+  AND outbox.kind IN ('runtime.start', 'runtime.stop', 'runtime.replace', 'profile.apply')
   AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at <= statement_timestamp())
 ORDER BY outbox.dispatch_attempts, outbox.next_attempt_at NULLS FIRST, outbox.created_at, outbox.operation_id
 LIMIT $1

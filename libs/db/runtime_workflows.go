@@ -18,6 +18,7 @@ type RuntimeWorkflowState struct {
 	Runtime                domain.RuntimeSnapshot
 	DataVolumeProviderID   string
 	ComputeUsageIntervalID string
+	OperationInput         []byte
 }
 
 type RuntimeProviderResourceInventory struct {
@@ -122,7 +123,7 @@ func (store *Store) LoadRuntimeWorkflowOperation(ctx context.Context, input doma
 	if err := tx.Commit(ctx); err != nil {
 		return RuntimeWorkflowState{}, fmt.Errorf("load Runtime workflow Operation: commit: %w", err)
 	}
-	state := RuntimeWorkflowState{OwnerUserID: input.OwnerUserID, Runtime: command.Runtime().Snapshot(), DataVolumeProviderID: dataVolumeProviderID}
+	state := RuntimeWorkflowState{OwnerUserID: input.OwnerUserID, Runtime: command.Runtime().Snapshot(), DataVolumeProviderID: dataVolumeProviderID, OperationInput: append([]byte(nil), operation.Snapshot().Input...)}
 	if usageIntervalID != nil {
 		state.ComputeUsageIntervalID = *usageIntervalID
 	}
@@ -496,7 +497,7 @@ func (store *Store) finishRuntimeWorkflowOperation(ctx context.Context, operatio
 	command, err := store.pool.Exec(ctx, `
 		UPDATE operations
 		SET status = $2, error_code = $3, error_message = $4, completed_at = $5
-		WHERE id = $1 AND type IN ('runtime.start', 'runtime.stop', 'runtime.replace')
+		WHERE id = $1 AND type IN ('runtime.start', 'runtime.stop', 'runtime.replace', 'profile.apply')
 		  AND status IN ('queued', 'running')`, operationID, string(status), errorCode, errorMessage, at)
 	if err != nil {
 		return fmt.Errorf("finish Runtime workflow Operation: %w", err)

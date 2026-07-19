@@ -61,6 +61,7 @@ type EnvironmentCreateOperationOutcome struct {
 type EnvironmentCapsuleState struct {
 	CapsuleLock      domain.CapsuleLockSnapshot             `json:"capsuleLock"`
 	UpgradePolicy    domain.UpgradePolicy                   `json:"upgradePolicy"`
+	Approvals        map[string]profile.ApprovalMarker      `json:"approvals,omitempty"`
 	ApplyResults     []profile.ProfileMaterializationResult `json:"applyResults,omitempty"`
 	Materializations []profile.InstalledMaterialization     `json:"materializations,omitempty"`
 }

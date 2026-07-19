@@ -143,7 +143,7 @@ func (transport *configuredGuestTransport) EnsureEnvironmentCapsuleMaterialized(
 	return transport.client.ApplyMaterialization(ctx, guestcontrol.MaterializationRequest{
 		Target: guestTarget(request.Guest.RuntimeGuestReadinessRequest), Lock: request.State.CapsuleLock,
 		OwnerID: request.Guest.OwnerUserID, Intent: profile.IntentReconcile,
-		Installed: request.State.Materializations, ReadGrants: grants,
+		Installed: request.State.Materializations, Approvals: request.State.Approvals, ReadGrants: grants,
 	})
 }
 
