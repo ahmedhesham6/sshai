@@ -107,11 +107,14 @@ func run(ctx context.Context) error {
 		store, dispatcher, ids, time.Now,
 		map[string]string{config.defaultRegion: config.defaultAvailabilityZone},
 	)
+	runtimeCommands := application.NewRuntimeCommandService(store, runtimeWorkflowUnavailable{}, ids, time.Now)
+	autoStopPolicies := application.NewAutoStopPolicyService(store, ids, time.Now)
 	registerProjectSeed := application.NewRegisterProjectSeedService(store, uploads, ids, time.Now)
 	profiles := application.NewProfileService(store, uploads, ids, time.Now)
 	sshKeys := application.NewSSHKeyService(store, ids, time.Now)
 	handler := controlplane.NewHandler(controlplane.Config{
-		CreateEnvironment: createEnvironment, RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
+		CreateEnvironment: createEnvironment, RuntimeCommands: runtimeCommands, AutoStopPolicies: autoStopPolicies,
+		RegisterProjectSeed: registerProjectSeed, Profiles: profiles, Uploads: uploads, SSHKeys: sshKeys,
 		Verifier: verifier, Users: store, CapsulePresigner: capsulePresigner, CapsuleOwnership: controlplane.NewS3CapsuleOwnership(capsuleClient, config.capsuleBucket), CapsuleBucket: config.capsuleBucket, CapsuleAccessTTL: 15 * time.Minute,
 		UserIDs: ids, RequestIDs: ids, DefaultRegion: config.defaultRegion, Now: time.Now,
 		EnvironmentReads: store, OperationReads: store, ProfileReads: store, BillingReads: store,
@@ -172,3 +175,9 @@ func valueOrDefault(name, fallback string) string {
 type uuidGenerator struct{}
 
 func (uuidGenerator) NewID() string { return uuid.NewString() }
+
+type runtimeWorkflowUnavailable struct{}
+
+func (runtimeWorkflowUnavailable) DispatchRuntimeOperation(context.Context, string) error {
+	return errors.New("Runtime workflow dispatch is not configured")
+}

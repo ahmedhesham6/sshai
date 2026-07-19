@@ -304,6 +304,15 @@ func (workflow *completingWorkflowFake) DispatchEnvironmentCreate(_ context.Cont
 	if err != nil {
 		return err
 	}
+	environment := creation.Environment().Snapshot()
+	creation, _, err = creation.ReserveInitialRuntime(domain.RuntimeReservation{
+		ID: "runtime-1", EnvironmentID: environment.ID, Sequence: 1,
+		RuntimePreset: environment.RuntimePreset, Region: environment.Region,
+		AvailabilityZone: environment.AvailabilityZone, ImageVersion: "image-1", CreatedAt: workflow.now,
+	})
+	if err != nil {
+		return err
+	}
 	completed, err := creation.Complete(workflow.now)
 	if err != nil {
 		return err

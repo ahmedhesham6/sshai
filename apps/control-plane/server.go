@@ -80,6 +80,8 @@ type BillingReader interface {
 
 type Config struct {
 	CreateEnvironment   *application.CreateEnvironmentService
+	RuntimeCommands     *application.RuntimeCommandService
+	AutoStopPolicies    *application.AutoStopPolicyService
 	RegisterProjectSeed *application.RegisterProjectSeedService
 	Profiles            *application.ProfileService
 	Uploads             *application.UploadIntentService
@@ -103,6 +105,8 @@ type Config struct {
 type server struct {
 	contracts.Unimplemented
 	createEnvironment   *application.CreateEnvironmentService
+	runtimeCommands     *application.RuntimeCommandService
+	autoStopPolicies    *application.AutoStopPolicyService
 	registerProjectSeed *application.RegisterProjectSeedService
 	profiles            *application.ProfileService
 	uploads             *application.UploadIntentService
@@ -121,6 +125,7 @@ type server struct {
 func NewHandler(config Config) http.Handler {
 	api := &server{
 		createEnvironment: config.CreateEnvironment, registerProjectSeed: config.RegisterProjectSeed,
+		runtimeCommands: config.RuntimeCommands, autoStopPolicies: config.AutoStopPolicies,
 		profiles: config.Profiles, uploads: config.Uploads, sshKeys: config.SSHKeys,
 		capsulePresigner: config.CapsulePresigner, capsuleOwnership: config.CapsuleOwnership,
 		capsuleBucket: config.CapsuleBucket, capsuleAccessTTL: config.CapsuleAccessTTL,
